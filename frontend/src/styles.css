@@ -1,0 +1,86 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  background: #0f172a;
+  color: #e2e8f0;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  z-index: 1000;
+}
+
+.panel label {
+  display: flex;
+  flex-direction: column;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #94a3b8;
+}
+
+.panel input[type="datetime-local"] {
+  margin-top: 3px;
+  padding: 6px 10px;
+  font-size: 14px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 4px;
+}
+
+.panel button {
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  background: #2563eb;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.panel button:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.panel button:disabled {
+  background: #475569;
+  cursor: not-allowed;
+}
+
+.panel .stats {
+  margin-left: auto;
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.panel .stats.error {
+  color: #f87171;
+}
+
+.map {
+  flex: 1 1 auto;
+  min-height: 0;
+  background: #1e293b;
+}

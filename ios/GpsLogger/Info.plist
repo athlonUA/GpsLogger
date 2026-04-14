@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>GpsLogger records your location in the background to log your trip.</string>
+
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>GpsLogger records your current position to log your trip.</string>
+
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>location</string>
+    </array>
+
+    <!--
+        Dev-only: allow plain HTTP to a LAN backend (e.g. http://192.168.x.x:3000).
+        For production, remove this block and use HTTPS.
+    -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,30 @@
+node_modules
+dist
+build
+*.log
+.env
+.env.local
+.env.*.local
+.DS_Store
+
+# iOS / Xcode — .xcodeproj is derived from ios/project.yml via xcodegen.
+*.xcodeproj
+*.xcodeproj/xcuserdata
+*.xcworkspace/xcuserdata
+DerivedData
+*.hmap
+*.ipa
+*.dSYM.zip
+
+# xcodegen-generated Info plist
+ios/GpsLogger/Info-generated.plist
+
+# local state
+pgdata
+
+# Claude Code / tooling scratch
+.claude/
+.playwright-mcp/
+
+# test output
+e2e-*.png

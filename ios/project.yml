@@ -1,0 +1,61 @@
+name: GpsLogger
+
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+
+targets:
+  GpsLogger:
+    type: application
+    platform: iOS
+
+    sources:
+      - path: GpsLogger
+        excludes:
+          # Reference plist; xcodegen synthesizes the real one from the
+          # info.properties block below.
+          - Info.plist
+
+    info:
+      path: GpsLogger/Info-generated.plist
+      properties:
+        CFBundleDisplayName: GpsLogger
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSLocationAlwaysAndWhenInUseUsageDescription: "GpsLogger records your location in the background to log your trip."
+        NSLocationWhenInUseUsageDescription: "GpsLogger records your current position to log your trip."
+        UIBackgroundModes:
+          - location
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+
+    entitlements:
+      path: GpsLogger/GpsLogger.entitlements
+      properties: {}
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.GpsLogger
+        TARGETED_DEVICE_FAMILY: "1,2"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        # Simulator build — skip signing altogether. Physical-device builds
+        # need real signing done in Xcode / via a free Apple ID profile.
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGN_IDENTITY: ""

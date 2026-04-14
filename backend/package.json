@@ -1,0 +1,20 @@
+{
+  "name": "gpslogger-backend",
+  "version": "1.0.0",
+  "description": "Minimal GPS points ingestion + query API",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pg": "^8.13.0"
+  }
+}
