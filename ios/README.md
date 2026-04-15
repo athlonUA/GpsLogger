@@ -194,15 +194,21 @@ refuse to sign for a real device.
     horizontal_accuracy, vertical_accuracy, altitude, speed, speed_accuracy,
     course, course_accuracy, decision)` — debug/observability table capturing
     every raw `CLLocation` that enters `LocationTracker.didUpdateLocations`
-    together with the filter's decision. Never uploaded. Retained for
-    **14 days** via `cleanupDiagnostics` on every launch. Used for post-hoc
-    classification of GPS anomalies (GNSS vs network fallback vs sensor
-    fusion drift) — see `QA.md` for extraction instructions.
-- **Sync**: a `Timer` (the only timer in the app) fires every 30 s, pulls up
-  to 100 rows from `points`, POSTs them to `/points` with the device ID
-  stamped on each payload element (from the injected `SyncService.deviceId`,
-  not per-row), and deletes the rows on a 2xx response. Failures stay in the
-  DB for the next tick.
+    together with the filter's decision. **Uploaded** on the same 30 s sync
+    cadence as `points` (see below); the authoritative store is the backend
+    Postgres table. Local rows are deleted on successful 2xx; a 3-day
+    retention window in `cleanupDiagnostics` covers prolonged backend
+    outages. See `QA.md` for how to query the backend after an anomaly.
+- **Sync**: a `Timer` (the only timer in the app) fires every 30 s and runs
+  two independent drains:
+  - `points` → `POST /points` — drives the visible trace. Pulls up to 100
+    rows, stamps the device ID on each payload element (from the injected
+    `SyncService.deviceId`, not per-row), and deletes on 2xx.
+  - `fix_diagnostics` → `POST /diagnostics` — mirror shape of the points
+    drain. Each channel has its own in-flight guard so one slow response
+    cannot stall the other.
+  Failures stay in the local DB for the next tick — no partial delete,
+  no retry storms.
 - **Counter**: lives in memory. Seeded once at launch from `SELECT COUNT(*)`,
   then increment/decrement only — no further `COUNT` queries.
 - **Backend URL override**: `Config.apiBaseURL` reads UserDefaults at every

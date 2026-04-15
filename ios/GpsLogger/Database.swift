@@ -14,10 +14,31 @@ struct LocalPoint {
     let createdAt: String   // stored and uploaded verbatim as ISO 8601 UTC
 }
 
-/// Raw CLLocation snapshot + filter decision for post-hoc diagnosis of GPS
-/// anomalies. Decoupled from CoreLocation so `Database` stays Foundation-only.
+/// Raw CLLocation snapshot + filter decision — input to
+/// `Database.logDiagnostic`. Decoupled from CoreLocation so `Database` stays
+/// Foundation-only.
 struct FixDiagnostic {
     let fixTimestamp: Date
+    let latitude: Double
+    let longitude: Double
+    let horizontalAccuracy: Double
+    let verticalAccuracy: Double
+    let altitude: Double
+    let speed: Double
+    let speedAccuracy: Double
+    let course: Double
+    let courseAccuracy: Double
+    let decision: String
+}
+
+/// A `fix_diagnostics` row as returned by `Database.fetchDiagnosticsBatch`.
+/// Mirrors `LocalPoint`: carries the row id (for later delete-on-success)
+/// and stores timestamps as the same ISO 8601 strings used on the wire, so
+/// they can be serialised into the upload payload without re-formatting.
+struct LocalFixDiagnostic {
+    let id: Int64
+    let loggedAt: String
+    let fixTimestamp: String
     let latitude: Double
     let longitude: Double
     let horizontalAccuracy: Double
@@ -255,8 +276,94 @@ final class Database {
         }
     }
 
-    /// Prune diagnostic rows older than `days` from now. Cheap via the
-    /// `idx_fix_diagnostics_logged_at` index; safe to call on every launch.
+    /// Pull the next batch of diagnostic rows pending upload. Same shape as
+    /// `fetchBatch` for `points`: cursor by id ascending, delete-by-id on
+    /// successful upload. Rows survive restart; on backend downtime they
+    /// accumulate up to the retention window.
+    func fetchDiagnosticsBatch(limit: Int) -> [LocalFixDiagnostic] {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+
+            let sql = """
+                SELECT id, logged_at, fix_timestamp, latitude, longitude,
+                       horizontal_accuracy, vertical_accuracy, altitude,
+                       speed, speed_accuracy, course, course_accuracy, decision
+                FROM fix_diagnostics
+                ORDER BY id ASC
+                LIMIT ?;
+                """
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return []
+            }
+            sqlite3_bind_int(stmt, 1, Int32(limit))
+
+            var result: [LocalFixDiagnostic] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let id = sqlite3_column_int64(stmt, 0)
+                let loggedAt = Self.readText(stmt, 1)
+                let fixTs = Self.readText(stmt, 2)
+                let lat = sqlite3_column_double(stmt, 3)
+                let lng = sqlite3_column_double(stmt, 4)
+                let hAcc = sqlite3_column_double(stmt, 5)
+                let vAcc = sqlite3_column_double(stmt, 6)
+                let alt = sqlite3_column_double(stmt, 7)
+                let spd = sqlite3_column_double(stmt, 8)
+                let sAcc = sqlite3_column_double(stmt, 9)
+                let crs = sqlite3_column_double(stmt, 10)
+                let cAcc = sqlite3_column_double(stmt, 11)
+                let decision = Self.readText(stmt, 12)
+
+                result.append(LocalFixDiagnostic(
+                    id: id,
+                    loggedAt: loggedAt,
+                    fixTimestamp: fixTs,
+                    latitude: lat,
+                    longitude: lng,
+                    horizontalAccuracy: hAcc,
+                    verticalAccuracy: vAcc,
+                    altitude: alt,
+                    speed: spd,
+                    speedAccuracy: sAcc,
+                    course: crs,
+                    courseAccuracy: cAcc,
+                    decision: decision
+                ))
+            }
+            return result
+        }
+    }
+
+    /// Delete diagnostic rows after a successful backend upload. Mirrors
+    /// `delete(ids:)` for `points`.
+    func deleteDiagnostics(ids: [Int64]) {
+        guard !ids.isEmpty else { return }
+        queue.sync {
+            let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+            let sql = "DELETE FROM fix_diagnostics WHERE id IN (\(placeholders));"
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                print("[db] diagnostic delete prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+                return
+            }
+            for (i, id) in ids.enumerated() {
+                sqlite3_bind_int64(stmt, Int32(i + 1), id)
+            }
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                print("[db] diagnostic delete step failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+    }
+
+    private static func readText(_ stmt: OpaquePointer?, _ col: Int32) -> String {
+        guard let cstr = sqlite3_column_text(stmt, col) else { return "" }
+        return String(cString: cstr)
+    }
+
+    /// Prune diagnostic rows older than `days` from now. Safety net for
+    /// prolonged backend outages — under normal operation rows are removed
+    /// within a sync tick of being written, so this rarely has work to do.
     func cleanupDiagnostics(olderThanDays days: Int) {
         let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
         let iso = ISO8601Formatter.shared.string(from: cutoff)

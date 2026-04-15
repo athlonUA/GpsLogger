@@ -19,11 +19,12 @@ import Foundation
 final class AppContainer {
     static let shared = AppContainer()
 
-    /// Retention window for `fix_diagnostics`. Kept here rather than in
-    /// `Config` because it's debug/observability plumbing, not a user-facing
-    /// knob. Two weeks is long enough to cover a full walking cycle of the
-    /// user and any one-off anomaly without letting the table unbounded.
-    private static let diagnosticRetentionDays = 14
+    /// Local retention window for `fix_diagnostics`, as a safety net against
+    /// prolonged backend outages. Under normal operation rows are deleted
+    /// within a single 30 s sync tick of being written, so this almost never
+    /// has work to do — 3 days is enough headroom to survive a weekend of
+    /// backend downtime without letting the local DB balloon.
+    private static let diagnosticRetentionDays = 3
 
     let database: Database
     let appState: AppState

@@ -42,7 +42,9 @@ node --test test/
 ```
 
 Covers `validate.js` — the pure input-validation layer that sits in front of every
-DB write and read:
+DB write and read.
+
+**`validateBatch` (POST /points):**
 
 - valid single-point batch
 - valid multi-point batch
@@ -54,7 +56,27 @@ DB write and read:
 - rejects missing/invalid `created_at`
 - rejects missing/empty `device_id`, non-string `device_id`, `device_id` longer than 128 chars
 - rejects `null` element
-- range: requires `device_id`, parses optional `from`/`to`, rejects invalid dates, rejects `from > to`
+
+**`validateDiagnosticsBatch` (POST /diagnostics):**
+
+- valid single-row batch
+- valid multi-row batch
+- **accepts negative sentinels** (`speed = -1`, `vertical_accuracy = -1`,
+  `course = -1`, etc.) — these are CoreLocation's documented values for
+  "no data" and are exactly what we need to preserve for post-hoc analysis
+- rejects non-array body / empty / oversized
+- rejects `null` element
+- rejects out-of-range `latitude` / `longitude`
+- rejects missing/invalid `logged_at`, `fix_timestamp`
+- rejects missing / non-finite numeric fields (`horizontal_accuracy`,
+  `vertical_accuracy`, `altitude`, `speed`, `speed_accuracy`, `course`,
+  `course_accuracy`) — NaN/Infinity/string/missing all return 400
+- rejects missing/empty/oversized `decision` (max 64 chars)
+- rejects missing/empty/oversized/non-string `device_id`
+
+**`validateRange` (GET /points):**
+
+- requires `device_id`, parses optional `from`/`to`, rejects invalid dates, rejects `from > to`
 
 The DB layer itself is intentionally thin (parameterized inserts and a single
 filter+sort select) and is exercised end-to-end via the smoke tests below.
@@ -87,6 +109,46 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3000/points \
 # bad request — missing device_id on GET
 curl -sS -o /dev/null -w '%{http_code}\n' \
     'http://localhost:3000/points?from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z'
+# → 400
+
+# diagnostics — healthy GNSS row
+curl -fsS -X POST http://localhost:3000/diagnostics \
+    -H 'Content-Type: application/json' \
+    -d '[
+      {
+        "logged_at": "2026-04-15T17:45:00.000Z",
+        "fix_timestamp": "2026-04-15T17:45:00.000Z",
+        "latitude": 39.46975, "longitude": -0.37739,
+        "horizontal_accuracy": 8.2, "vertical_accuracy": 4.5, "altitude": 15.3,
+        "speed": 1.3, "speed_accuracy": 0.4,
+        "course": 92.0, "course_accuracy": 5.0,
+        "decision": "accept",
+        "device_id": "demo"
+      }
+    ]'
+# → {"inserted":1}
+
+# diagnostics — Wi-Fi / cell-tower fallback row (negative sentinels must pass)
+curl -fsS -X POST http://localhost:3000/diagnostics \
+    -H 'Content-Type: application/json' \
+    -d '[
+      {
+        "logged_at": "2026-04-15T17:46:01.000Z",
+        "fix_timestamp": "2026-04-15T17:46:01.000Z",
+        "latitude": 39.48, "longitude": -0.31,
+        "horizontal_accuracy": 42.0, "vertical_accuracy": -1, "altitude": 0,
+        "speed": -1, "speed_accuracy": -1,
+        "course": -1, "course_accuracy": -1,
+        "decision": "discard:nonGpsSource",
+        "device_id": "demo"
+      }
+    ]'
+# → {"inserted":1}
+
+# bad request — invalid latitude in diagnostics
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3000/diagnostics \
+    -H 'Content-Type: application/json' \
+    -d '[{"logged_at":"2026-04-15T17:45:00Z","fix_timestamp":"2026-04-15T17:45:00Z","latitude":999,"longitude":0,"horizontal_accuracy":1,"vertical_accuracy":1,"altitude":0,"speed":0,"speed_accuracy":0,"course":0,"course_accuracy":0,"decision":"accept","device_id":"demo"}]'
 # → 400
 ```
 
@@ -194,41 +256,68 @@ All scenarios assume:
   status reverts to "Enter device ID to begin". A reload now shows the
   empty initial state.
 
-## Extracting the fix_diagnostics table from a device
+## Inspecting fix_diagnostics after an anomaly
 
-`fix_diagnostics` is a debug table in `Documents/gpslogger.sqlite` that
-records every raw `CLLocation` (fields: `horizontal_accuracy`,
+`fix_diagnostics` records every raw `CLLocation` that entered
+`LocationTracker.didUpdateLocations` (fields: `horizontal_accuracy`,
 `vertical_accuracy`, `altitude`, `speed`, `speed_accuracy`, `course`,
-`course_accuracy`) together with the `LocationFilter` decision for that fix.
-Retention: 14 days, pruned on every launch. Not uploaded to the backend.
+`course_accuracy`) together with the `LocationFilter` decision for that
+fix. Rows are written to the device's local SQLite, uploaded by
+`SyncService` on the same 30 s cadence as `/points`, and deleted locally
+after a successful 2xx. **The authoritative store is the backend Postgres
+`fix_diagnostics` table** — the local SQLite copy is only a staging buffer
+with a 3-day safety-net retention.
 
-To inspect it after a real-world anomaly:
+Workflow after a real-world anomaly:
 
-1. **Xcode → Window → Devices and Simulators** (or `⇧⌘2`).
-2. Select your iPhone in the left sidebar.
-3. In the **Installed Apps** list, select `GpsLogger`, click the gear icon,
-   pick **Download Container…**, and save the `.xcappdata` bundle locally.
-4. Right-click the bundle → **Show Package Contents**, then navigate to
-   `AppData/Documents/gpslogger.sqlite`.
-5. Open with any SQLite tool:
-   ```bash
-   sqlite3 /path/to/gpslogger.sqlite
-   .mode column
-   .headers on
-   SELECT logged_at, horizontal_accuracy, vertical_accuracy, speed, decision
-     FROM fix_diagnostics
-     WHERE fix_timestamp BETWEEN '2026-04-15T15:45:00Z' AND '2026-04-15T15:52:00Z'
-     ORDER BY fix_timestamp;
-   ```
+```bash
+# Enter the backend Postgres container and query the window of interest.
+# 5434 on the host is mapped to 5432 in the container; inside the db
+# container psql is free to connect locally.
+docker exec -it gpslogger-db-1 psql -U postgres -d gpslogger
+```
 
-Signatures to look for when classifying an anomaly:
+```sql
+-- Paste inside psql. Replace the device_id and timestamps with yours.
+SELECT fix_timestamp,
+       horizontal_accuracy,
+       vertical_accuracy,
+       altitude,
+       speed,
+       speed_accuracy,
+       course,
+       decision
+  FROM fix_diagnostics
+ WHERE device_id = '<your-device-uuid>'
+   AND fix_timestamp BETWEEN '2026-04-15T15:44:00Z'
+                         AND '2026-04-15T15:53:00Z'
+ ORDER BY fix_timestamp ASC;
+```
 
-| `speed` | `vertical_accuracy` | `horizontal_accuracy` | Likely source |
+Or one-shot from the host:
+
+```bash
+docker exec gpslogger-db-1 psql -U postgres -d gpslogger -c \
+  "SELECT fix_timestamp, horizontal_accuracy, vertical_accuracy, speed, decision \
+     FROM fix_diagnostics \
+    WHERE device_id = '<your-device-uuid>' \
+      AND fix_timestamp BETWEEN '2026-04-15T15:44:00Z' AND '2026-04-15T15:53:00Z' \
+    ORDER BY fix_timestamp;"
+```
+
+### Signatures to classify an anomaly
+
+| `speed` | `vertical_accuracy` | `horizontal_accuracy` during window | Likely source |
 |---|---|---|---|
-| `-1` | `-1` | 30–65 m | Wi-Fi / cell-tower fallback (network positioning) |
-| `≥ 0` | `> 0` | stuck at 5–15 m while coordinates drift | CoreLocation sensor-fusion drift bug |
-| `≥ 0` | `> 0` | growing with distance from real position | Regular GPS degradation |
-| `≥ 0` | `> 0` | normal | Multipath / transient glitch |
+| `-1` | `-1` | 30–65 m, flat plateau | Wi-Fi / cell-tower fallback (network positioning). Filter should have marked rows `discard:nonGpsSource`. |
+| `≥ 0` | `> 0` | stuck at 5–15 m while coordinates drift | CoreLocation sensor-fusion drift bug — filter can't catch this, needs a plateau detector. |
+| `≥ 0` | `> 0` | growing with distance from real position | Regular GPS degradation — the 50 m `poorAccuracy` gate should have clipped the worst. |
+| `≥ 0` | `> 0` | normal | Multipath / transient glitch — spike buffer should have handled it. |
+
+If the bad rows show `decision = 'discard:nonGpsSource'` they never made it
+into `points`; the fix is already doing its job and the anomaly should not
+be visible on the map. If they show `decision = 'accept'` with one of the
+other signatures, we need a different defense.
 
 ## Regressions to watch for
 
