@@ -229,16 +229,31 @@ VITE_API_URL=http://localhost:3000
 See [`ios/README.md`](ios/README.md) for full Xcode setup steps (project creation,
 Info.plist keys, background-mode capability, free Apple ID signing).
 
-Short version:
+Short version (xcodegen-based build from the CLI):
 
-1. Create an iOS **App** project in Xcode named `GpsLogger`.
-2. Drag all files from `ios/GpsLogger/` into the project target.
-3. Add `NSLocationAlwaysAndWhenInUseUsageDescription`,
-   `NSLocationWhenInUseUsageDescription`, and
-   `NSAppTransportSecurity → NSAllowsArbitraryLoads = YES` to Info.
-4. Enable **Background Modes → Location updates**.
-5. Edit `Config.swift` and set `apiBaseURL` to your Mac's LAN IP.
-6. Sign with your personal team, run on device, trust the dev profile.
+1. `cp ios/GpsLogger.xcconfig.example ios/GpsLogger.xcconfig`
+2. Edit `ios/GpsLogger.xcconfig` and fill in two values:
+   - `DEVELOPMENT_TEAM` — your Apple Team ID
+     (`security find-identity -p codesigning -v`).
+   - `API_BASE_URL` — your Mac's LAN IP (`ipconfig getifaddr en0`),
+     e.g. `http:/$()/192.168.1.129:3000`. The `$()` is an empty
+     variable expansion that escapes `//` from xcconfig comment
+     parsing — after expansion the value is the plain URL
+     `http://192.168.1.129:3000`. iPhone and Mac must share the same
+     Wi-Fi.
+3. `cd ios && xcodegen generate`
+4. Open the generated `GpsLogger.xcodeproj` in Xcode, pick your
+   iPhone in the device picker, hit **Run**. First time: on the
+   iPhone, go to Settings → General → VPN & Device Management and
+   trust the developer profile.
+5. Verify the URL landed in the build:
+   ```
+   plutil -p ~/Library/Developer/Xcode/DerivedData/GpsLogger-*/Build/Products/Debug-iphoneos/GpsLogger.app/Info.plist | grep API_BASE_URL
+   ```
+
+See [`ios/README.md`](ios/README.md) for full details on the xcodegen +
+CLI install path via `devicectl`, the free Apple ID 7-day provisioning
+lifetime, and the `Config.apiBaseURL` resolution chain.
 
 ## Architecture summary
 

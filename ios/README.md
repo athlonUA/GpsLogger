@@ -28,7 +28,7 @@ ios/
     ├── DeviceIdentity.swift       ← Keychain-backed UUID (UserDefaults fallback)
     ├── SyncService.swift          ← sync timer + HTTP upload
     ├── Database.swift             ← raw sqlite3 wrapper
-    ├── Config.swift               ← backend URL & tunables
+    ├── Config.swift               ← tunables + apiBaseURL resolver (xcconfig → Info.plist → fallback)
     ├── GpsLogger.entitlements
     └── Info.plist                 ← reference plist with required keys
 ```
@@ -88,41 +88,95 @@ Check: **Location updates**
 
 ### 5. Set the backend URL
 
-Edit `Config.swift`. The committed default is:
+`Config.apiBaseURL` resolves the backend base URL at every call site in
+this order:
 
-```swift
-static let apiBaseURL = URL(string: "http://localhost:3000")!
+1. **`UserDefaults["apiBaseURL"]`** — runtime override via
+   `defaults write`, useful for re-pointing the running app between
+   hosts without a rebuild.
+2. **`Info.plist["API_BASE_URL"]`** — baked into the `.app` bundle at
+   build time from the **gitignored** `ios/GpsLogger.xcconfig` via
+   `$(API_BASE_URL)` substitution (see `project.yml` info.properties).
+   This is the path a physical-device build relies on in normal
+   operation.
+3. **`http://localhost:3000`** — simulator fallback wired into
+   `Config.defaultApiBaseURL`. The simulator shares the Mac's network
+   stack, so no configuration is needed there.
+
+**Physical iPhone setup.** Edit `ios/GpsLogger.xcconfig` (create it from
+`GpsLogger.xcconfig.example` on first run) and add your Mac's LAN IP:
+
+```
+DEVELOPMENT_TEAM = YOUR_APPLE_TEAM_ID
+API_BASE_URL = http:/$()/192.168.1.129:3000
 ```
 
-- **iOS Simulator**: leave as-is — the simulator shares the Mac's network stack.
-- **Physical iPhone**: replace with your Mac's LAN IP
-  (**System Settings → Network → Wi-Fi → Details → TCP/IP**), e.g.
-  `http://192.168.1.25:3000`. iPhone and Mac must share the same Wi-Fi.
+> **Quirk**: xcconfig treats `//` as the start of a line comment, so a
+> literal `http://` must be escaped as `http:/$()/`. The `$()` is an
+> empty variable expansion that breaks up the `//` sequence — after
+> xcconfig parsing, the value is `http://192.168.1.129:3000` exactly
+> as you'd expect.
 
-### 6. Local signing config (for CLI builds via xcodegen + xcodebuild)
+Find your Mac's LAN IP via either of:
 
-If you build from the command line rather than clicking Run in Xcode, the
-signing team ID lives in a **gitignored** xcconfig file so nothing personal
-ends up in the repo:
+```bash
+ipconfig getifaddr en0
+# or: System Settings → Network → Wi-Fi → Details → TCP/IP
+```
+
+Then re-run `xcodegen generate` inside `ios/` and rebuild. The iPhone
+and the Mac must share the same Wi-Fi.
+
+**Verify the build carries the URL** before deploying:
+
+```bash
+plutil -p ~/Library/Developer/Xcode/DerivedData/GpsLogger-*/Build/Products/Debug-iphoneos/GpsLogger.app/Info.plist \
+    | grep API_BASE_URL
+# → "API_BASE_URL" => "http://192.168.1.129:3000"
+```
+
+If you see `http://$(API_BASE_URL)` or the literal `$()` artefact in
+the output, the xcconfig wasn't picked up — re-run `xcodegen generate`
+and make sure `GpsLogger.xcconfig` is present (not just the
+`.example` template).
+
+### 6. Local personal config (signing team + backend URL)
+
+Everything personal lives in a single **gitignored** file,
+`ios/GpsLogger.xcconfig`, which you create once from the committed
+template:
 
 ```bash
 cd ios
 cp GpsLogger.xcconfig.example GpsLogger.xcconfig
-# edit GpsLogger.xcconfig and replace YOUR_APPLE_TEAM_ID
+# then edit GpsLogger.xcconfig
 xcodegen generate
 ```
 
-To find your team ID:
+Two settings to fill in:
 
-```bash
-security find-identity -p codesigning -v
-#   1) <hash> "Apple Development: you@example.com (TEAM_ID)"
-```
+- **`DEVELOPMENT_TEAM`** — your Apple Developer Team ID, used by
+  `xcodebuild` to sign for a real device. Find it via:
+  ```bash
+  security find-identity -p codesigning -v
+  #   1) <hash> "Apple Development: you@example.com (TEAM_ID)"
+  ```
+  (or Xcode → Settings → Accounts → *Team ID* column).
 
-(or Xcode → Settings → Accounts → *Team ID* column).
+- **`API_BASE_URL`** — your Mac's LAN IP + backend port, for the
+  physical-device build (see section 5 above). Remember the
+  `http:/$()/` escape for the `//` sequence.
 
-Without this file, `xcodegen generate` still works, but `xcodebuild` will
-refuse to sign for a real device.
+The iOS target's `configFiles` in `project.yml` points Debug and
+Release at this file, and `project.yml`'s info.properties block
+references `$(API_BASE_URL)` so it lands in the bundled `Info.plist`.
+After editing the xcconfig, always re-run `xcodegen generate` to
+refresh the `.xcodeproj`.
+
+Without this file, `xcodegen generate` still works, but `xcodebuild`
+will refuse to sign for a real device, and the built bundle will fall
+back to `http://localhost:3000` — which only reaches the backend on
+the simulator.
 
 ### 7. Deploy to your iPhone (free Apple ID)
 
@@ -211,17 +265,28 @@ refuse to sign for a real device.
   no retry storms.
 - **Counter**: lives in memory. Seeded once at launch from `SELECT COUNT(*)`,
   then increment/decrement only — no further `COUNT` queries.
-- **Backend URL override**: `Config.apiBaseURL` reads UserDefaults at every
-  call site, so you can re-point the app between hosts without a rebuild via
-  `defaults write` for the `apiBaseURL` key.
+- **Backend URL resolution**: `Config.apiBaseURL` is read at every call
+  site and tries, in order, `UserDefaults["apiBaseURL"]` (runtime
+  override), `Info.plist["API_BASE_URL"]` (baked in at build time from
+  the gitignored `GpsLogger.xcconfig`, see section 5 of the setup
+  above), and finally the simulator-friendly `http://localhost:3000`
+  fallback. Changing the UserDefaults value takes effect on the next
+  sync tick without a restart; changing the xcconfig requires a
+  rebuild.
 
 ## Troubleshooting
 
 - **Status dot is gray** — location permission was denied or not granted.
   Open **Settings → GpsLogger → Location** and set to **Always**.
-- **Counter goes up but never down** — backend is unreachable. Check
-  `Config.apiBaseURL` (or the `apiBaseURL` UserDefaults override) and that
-  Mac and iPhone share the same Wi-Fi.
+- **Counter goes up but never down** — backend is unreachable. Check,
+  in order: the Mac's docker-compose backend is running
+  (`curl -fsS http://localhost:3000/health`); the `API_BASE_URL` in
+  `ios/GpsLogger.xcconfig` matches the current LAN IP of the Mac
+  (run `ipconfig getifaddr en0`); the built bundle actually picked it
+  up (`plutil -p … | grep API_BASE_URL`); iPhone and Mac are on the
+  same Wi-Fi. After any change to the xcconfig you must re-run
+  `xcodegen generate` and rebuild — editing the file alone is not
+  enough.
 - **Counter doesn't move while sitting still** — expected. The 10 m distance
   filter and `StationaryDetector` actively suppress jitter clusters. Walk
   more than 30 m to resume.
