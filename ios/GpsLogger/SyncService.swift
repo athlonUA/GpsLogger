@@ -2,17 +2,24 @@ import Foundation
 
 /// Periodically drains the local DB and POSTs batches to the backend.
 /// A timer is allowed here — it is used ONLY for sync, never for location collection.
+///
+/// Device identity is owned here and stamped onto every upload payload, not
+/// written into each row in the local `points` table. The ID is resolved once
+/// at bootstrap (`DeviceIdentity.get()`), injected via `init`, and reused for
+/// every request.
 final class SyncService {
     private let database: Database
     private let appState: AppState
+    private let deviceId: String
     private let session: URLSession
 
     private var timer: Timer?
     private var inFlight = false
 
-    init(database: Database, appState: AppState, session: URLSession = .shared) {
+    init(database: Database, appState: AppState, deviceId: String, session: URLSession = .shared) {
         self.database = database
         self.appState = appState
+        self.deviceId = deviceId
         self.session = session
     }
 
@@ -68,7 +75,7 @@ final class SyncService {
                 "latitude": p.latitude,
                 "longitude": p.longitude,
                 "created_at": p.createdAt,
-                "device_id": p.deviceId,
+                "device_id": self.deviceId,
             ]
         }
 

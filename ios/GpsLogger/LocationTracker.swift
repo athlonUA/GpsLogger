@@ -5,16 +5,17 @@ import Combine
 /// Thin wrapper around CLLocationManager.
 ///
 /// - No timers. Points are stored purely in response to CoreLocation callbacks.
-/// - Raw CLLocation samples pass through `LocationFilter` first (accuracy
-///   gate, min-distance gate, relaxed-speed gate, spike buffer — see
+/// - Raw CLLocation samples pass through `LocationFilter` first (validity,
+///   source discrimination, accuracy, speed, spike buffer — see
 ///   `LocationFilter.swift`), then through `StationaryDetector`, which
 ///   suppresses stationary-jitter clusters without touching the coordinates
 ///   themselves.
 /// - Always-on: `start()` is invoked once during container bootstrap and the
 ///   tracker runs for the full app lifetime. There is no user-facing Stop;
 ///   CoreLocation only ceases when the OS terminates the process.
-/// - Every inserted point is stamped with the stable device ID obtained at
-///   bootstrap.
+/// - Device identity is owned by `SyncService` and stamped on the upload
+///   payload, not on individual rows — it's a property of the install, not
+///   of each fix.
 final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var isTracking = false
     @Published private(set) var authStatus: CLAuthorizationStatus
@@ -22,21 +23,23 @@ final class LocationTracker: NSObject, ObservableObject {
     private let manager = CLLocationManager()
     private let database: Database
     private let appState: AppState
-    private let deviceId: String
 
     private var filter = LocationFilter()
     private var stationary = StationaryDetector()
 
-    init(database: Database, appState: AppState, deviceId: String) {
+    init(database: Database, appState: AppState) {
         self.database = database
         self.appState = appState
-        self.deviceId = deviceId
         self.authStatus = manager.authorizationStatus
         super.init()
 
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyBest
-        manager.activityType = .automotiveNavigation
+        // `.fitness` is Apple's hint for walking/running/cycling. The previous
+        // value (`.automotiveNavigation`) was a semantic mismatch for a
+        // pedestrian tracker and biased CoreLocation's fusion engine toward
+        // vehicle motion models in degraded-signal environments.
+        manager.activityType = .fitness
         manager.distanceFilter = Config.minDistanceMeters
         manager.pausesLocationUpdatesAutomatically = false
         manager.allowsBackgroundLocationUpdates = true
@@ -71,8 +74,7 @@ final class LocationTracker: NSObject, ObservableObject {
         database.insert(
             latitude: loc.coordinate.latitude,
             longitude: loc.coordinate.longitude,
-            createdAt: loc.timestamp,
-            deviceId: deviceId
+            createdAt: loc.timestamp
         )
         DispatchQueue.main.async { [weak self] in
             self?.appState.unsyncedCount += 1
@@ -100,6 +102,8 @@ final class LocationTracker: NSObject, ObservableObject {
         switch reason {
         case .invalidFix:
             print("[tracker] discard invalid @ \(coord)")
+        case .nonGpsSource:
+            print("[tracker] discard nonGps speed=\(loc.speed) vAcc=\(loc.verticalAccuracy) @ \(coord)")
         case .poorAccuracy(let m):
             print("[tracker] discard accuracy=\(Int(m))m @ \(coord)")
         case .staleTimestamp:
@@ -129,7 +133,27 @@ extension LocationTracker: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         for loc in locations {
-            switch filter.consume(loc) {
+            let decision = filter.consume(loc)
+
+            // Debug observability: snapshot every raw fix with its full set of
+            // CLLocation fields and the filter verdict. Writes land in
+            // `fix_diagnostics`, never in `points`, so the upload path is
+            // unaffected. Retention is bounded in `AppContainer`.
+            database.logDiagnostic(FixDiagnostic(
+                fixTimestamp: loc.timestamp,
+                latitude: loc.coordinate.latitude,
+                longitude: loc.coordinate.longitude,
+                horizontalAccuracy: loc.horizontalAccuracy,
+                verticalAccuracy: loc.verticalAccuracy,
+                altitude: loc.altitude,
+                speed: loc.speed,
+                speedAccuracy: loc.speedAccuracy,
+                course: loc.course,
+                courseAccuracy: loc.courseAccuracy,
+                decision: diagnosticTag(decision)
+            ))
+
+            switch decision {
             case .accept(let accepted):
                 maybePersist(accepted)
 
@@ -152,6 +176,26 @@ extension LocationTracker: CLLocationManagerDelegate {
                 if let alsoAccept = alsoAccept {
                     maybePersist(alsoAccept)
                 }
+            }
+        }
+    }
+
+    /// Short string tag describing what `LocationFilter` decided about a raw
+    /// fix. Used only by `fix_diagnostics` — never affects control flow.
+    private func diagnosticTag(_ decision: LocationFilter.Decision) -> String {
+        switch decision {
+        case .accept: return "accept"
+        case .buffered: return "buffered"
+        case .spikeReplaced: return "spikeReplaced"
+        case .committedPending: return "committedPending"
+        case .discard(let reason):
+            switch reason {
+            case .invalidFix: return "discard:invalidFix"
+            case .nonGpsSource: return "discard:nonGpsSource"
+            case .poorAccuracy: return "discard:poorAccuracy"
+            case .staleTimestamp: return "discard:staleTimestamp"
+            case .implausibleSpeed: return "discard:implausibleSpeed"
+            case .tooClose: return "discard:tooClose"
             }
         }
     }

@@ -9,14 +9,21 @@ import Foundation
 /// construction.
 ///
 /// Boot sequence:
-///   1. Open/migrate the local SQLite store.
+///   1. Open/migrate the local SQLite store (drops legacy `device_id` column
+///      on `points` if present; creates `fix_diagnostics` if missing).
 ///   2. Resolve the stable device identity (Keychain → UserDefaults → new UUID).
-///   3. Backfill any legacy rows with the current device ID.
-///   4. Seed the in-memory unsynced counter and publish the device ID.
+///   3. Seed the in-memory unsynced counter and publish the device ID.
+///   4. Prune diagnostic rows older than the retention window.
 ///   5. Start the tracker (always-on for the full app lifetime).
 ///   6. Start the sync loop so any leftover points drain immediately.
 final class AppContainer {
     static let shared = AppContainer()
+
+    /// Retention window for `fix_diagnostics`. Kept here rather than in
+    /// `Config` because it's debug/observability plumbing, not a user-facing
+    /// knob. Two weeks is long enough to cover a full walking cycle of the
+    /// user and any one-off anomaly without letting the table unbounded.
+    private static let diagnosticRetentionDays = 14
 
     let database: Database
     let appState: AppState
@@ -28,14 +35,14 @@ final class AppContainer {
         let state = AppState()
         let deviceId = DeviceIdentity.get()
 
-        db.backfillDeviceIdIfNeeded(deviceId)
         state.seed(db.initialCount())
         state.deviceId = deviceId
+        db.cleanupDiagnostics(olderThanDays: Self.diagnosticRetentionDays)
 
         self.database = db
         self.appState = state
-        self.tracker = LocationTracker(database: db, appState: state, deviceId: deviceId)
-        self.sync = SyncService(database: db, appState: state)
+        self.tracker = LocationTracker(database: db, appState: state)
+        self.sync = SyncService(database: db, appState: state, deviceId: deviceId)
 
         // Always-on tracking: there is no user-facing Start/Stop.
         self.tracker.start()

@@ -9,16 +9,25 @@ import CoreLocation
 /// modes would introduce false negatives against legitimate users.
 ///
 /// Applied in order:
-///   1. `horizontalAccuracy` must be valid (≥ 0) and ≤ `maxHorizontalAccuracyMeters`
-///      (PRIMARY signal — the single most reliable quality gate)
-///   2. Δt vs. the last accepted point must be > 0 (reject replayed fixes)
-///   3. implied speed vs. the last accepted point must be ≤ `maxPlausibleSpeedMps`
-///      (extremely relaxed, 500 km/h — only catches teleport-class glitches)
-///   4. distance vs. the last accepted point must be ≥ `minDistanceMeters`
-///   5. a single-point look-ahead buffer rejects the classic
+///   1. Validity: `horizontalAccuracy ≥ 0` (CoreLocation's invalid-fix sentinel).
+///   2. Source discrimination: `speed ≥ 0` AND `verticalAccuracy > 0`. GNSS
+///      fixes populate both (Doppler velocity + 3D solution); Wi-Fi / cell
+///      fallback fixes leave them as the documented sentinel negatives
+///      because network positioning has neither velocity nor altitude.
+///      Without this gate, a stale BSSID registration in Apple's Wi-Fi
+///      Positioning database can deliver a well-formed-looking fix (good
+///      `horizontalAccuracy`) that is hundreds of meters to kilometers from
+///      the true position.
+///   3. Accuracy value: `horizontalAccuracy ≤ maxHorizontalAccuracyMeters`.
+///   4. Chronology: `Δt > 0` vs. the last accepted fix (rejects replayed /
+///      cached fixes).
+///   5. Implied speed ≤ `maxPlausibleSpeedMps` — intentionally very relaxed
+///      (500 km/h), only catches teleport-class glitches.
+///   6. Single-point look-ahead buffer rejects the classic
 ///      A → B(far jump) → C(back near A) spike pattern, where "far" is
 ///      `spikeJumpMeters` (750 m — beyond any realistic sample delta) and
-///      "near" is `spikeReturnMeters` (100 m)
+///      "near" is `spikeReturnMeters` (100 m).
+///   7. Minimum distance ≥ `minDistanceMeters` from the last accepted fix.
 ///
 /// The filter is a plain value type with no CoreLocation-manager coupling, so
 /// every rule is unit-testable in isolation by constructing `CLLocation`s with
@@ -42,6 +51,7 @@ struct LocationFilter {
 
     enum Reason: Equatable {
         case invalidFix
+        case nonGpsSource
         case poorAccuracy(meters: Double)
         case staleTimestamp
         case implausibleSpeed(metersPerSecond: Double)
@@ -79,12 +89,28 @@ struct LocationFilter {
     /// Feed a new raw fix. Mutates internal state and returns what the caller
     /// should persist.
     mutating func consume(_ loc: CLLocation) -> Decision {
-        // 1. Validity + accuracy gate. An invalid CLLocation reports
-        //    horizontalAccuracy < 0; anything worse than maxAccuracy is too
-        //    noisy to be useful for visualization.
+        // 1. Validity gate. A CLLocation with horizontalAccuracy < 0 is
+        //    CoreLocation's documented signal that the fix itself is invalid.
         guard loc.horizontalAccuracy >= 0 else {
             return .discard(.invalidFix)
         }
+
+        // 2. Source gate. GNSS-derived fixes populate `speed` (from Doppler)
+        //    and `verticalAccuracy` (3D solution). Fixes that CoreLocation
+        //    synthesised from Wi-Fi or cell-tower positioning leave both as
+        //    the sentinel negatives because network positioning has neither
+        //    velocity nor altitude. Rejecting those here prevents a stale
+        //    BSSID registration in Apple's Wi-Fi Positioning database from
+        //    teleporting the trace to a wrong part of the map despite a
+        //    plausible `horizontalAccuracy`. This is the load-bearing defense
+        //    against the park-canopy fallback scenario; the accuracy gate
+        //    alone cannot catch it.
+        guard loc.speed >= 0, loc.verticalAccuracy > 0 else {
+            return .discard(.nonGpsSource)
+        }
+
+        // 3. Accuracy value gate. Anything worse than maxAccuracy is too
+        //    noisy to be useful for visualization.
         guard loc.horizontalAccuracy <= maxAccuracy else {
             return .discard(.poorAccuracy(meters: loc.horizontalAccuracy))
         }

@@ -63,3 +63,20 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         CODE_SIGN_STYLE: Automatic
+
+  GpsLoggerTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+
+    sources:
+      - path: GpsLoggerTests
+
+    dependencies:
+      - target: GpsLogger
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gpslogger.personal.tests
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        GENERATE_INFOPLIST_FILE: "YES"

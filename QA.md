@@ -4,6 +4,36 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
+### iOS LocationFilter unit tests
+
+```
+cd ios
+xcodegen generate
+xcodebuild test -project GpsLogger.xcodeproj -scheme GpsLoggerTests \
+    -destination 'platform=iOS Simulator,name=iPhone 17'
+```
+
+Covers `LocationFilter` end-to-end — every gate in the filter pipeline:
+
+- validity gate (negative `horizontalAccuracy` → discard `.invalidFix`)
+- **source gate** (GPS-origin detection via `speed` and `verticalAccuracy`):
+  rejects fixes whose `speed < 0` or `verticalAccuracy ≤ 0`, which is the
+  documented sentinel for Wi-Fi / cell-tower fallback fixes that lack Doppler
+  velocity and altitude. This is the load-bearing defense against the
+  "park-canopy teleport" anomaly where CoreLocation falls back to Wi-Fi
+  Positioning and a stale BSSID registration delivers a plausible-looking
+  fix hundreds of meters to kilometers off the true position
+- accuracy value gate (`horizontalAccuracy > 50 m` → discard `.poorAccuracy`)
+- chronology gate (`Δt ≤ 0` → discard `.staleTimestamp`)
+- implausible-speed gate (500 km/h ceiling)
+- minimum-distance gate (`< 10 m` → discard `.tooClose`)
+- spike buffer (A → B(far > 750 m) → C(near A) → drop B)
+- regression: stationary GPS fix (speed = 0, valid vertical accuracy) must
+  still be accepted — the source gate must not confuse a standing-still user
+  with a network-derived fix
+- regression: a dense burst of Wi-Fi-style fallback fixes leaves `lastAccepted`
+  pinned to the last real GPS fix and never corrupts the spike buffer
+
 ### Backend validator unit tests
 
 ```
@@ -163,6 +193,42 @@ All scenarios assume:
 - Click **Logout**. Expected: device ID and points clear, time range resets,
   status reverts to "Enter device ID to begin". A reload now shows the
   empty initial state.
+
+## Extracting the fix_diagnostics table from a device
+
+`fix_diagnostics` is a debug table in `Documents/gpslogger.sqlite` that
+records every raw `CLLocation` (fields: `horizontal_accuracy`,
+`vertical_accuracy`, `altitude`, `speed`, `speed_accuracy`, `course`,
+`course_accuracy`) together with the `LocationFilter` decision for that fix.
+Retention: 14 days, pruned on every launch. Not uploaded to the backend.
+
+To inspect it after a real-world anomaly:
+
+1. **Xcode → Window → Devices and Simulators** (or `⇧⌘2`).
+2. Select your iPhone in the left sidebar.
+3. In the **Installed Apps** list, select `GpsLogger`, click the gear icon,
+   pick **Download Container…**, and save the `.xcappdata` bundle locally.
+4. Right-click the bundle → **Show Package Contents**, then navigate to
+   `AppData/Documents/gpslogger.sqlite`.
+5. Open with any SQLite tool:
+   ```bash
+   sqlite3 /path/to/gpslogger.sqlite
+   .mode column
+   .headers on
+   SELECT logged_at, horizontal_accuracy, vertical_accuracy, speed, decision
+     FROM fix_diagnostics
+     WHERE fix_timestamp BETWEEN '2026-04-15T15:45:00Z' AND '2026-04-15T15:52:00Z'
+     ORDER BY fix_timestamp;
+   ```
+
+Signatures to look for when classifying an anomaly:
+
+| `speed` | `vertical_accuracy` | `horizontal_accuracy` | Likely source |
+|---|---|---|---|
+| `-1` | `-1` | 30–65 m | Wi-Fi / cell-tower fallback (network positioning) |
+| `≥ 0` | `> 0` | stuck at 5–15 m while coordinates drift | CoreLocation sensor-fusion drift bug |
+| `≥ 0` | `> 0` | growing with distance from real position | Regular GPS degradation |
+| `≥ 0` | `> 0` | normal | Multipath / transient glitch |
 
 ## Regressions to watch for
 

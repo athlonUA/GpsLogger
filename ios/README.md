@@ -157,7 +157,8 @@ refuse to sign for a real device.
 ## How it works
 
 - **Collection**: `CLLocationManager` with `kCLLocationAccuracyBest`,
-  `activityType = .automotiveNavigation`, `distanceFilter = 10`,
+  `activityType = .fitness` (pedestrian-appropriate hint to CoreLocation's
+  fusion engine), `distanceFilter = 10`,
   `pausesLocationUpdatesAutomatically = false`,
   `allowsBackgroundLocationUpdates = true`. Points are saved **only** from
   `didUpdateLocations` callbacks — no timers are used for collection. The
@@ -166,22 +167,42 @@ refuse to sign for a real device.
 - **Filter pipeline** (in order; a fix must pass all three to be inserted):
   1. `CLLocationManager.distanceFilter = 10 m` and a defensive per-insert
      distance check.
-  2. `LocationFilter` — drops fixes with `horizontalAccuracy > 50 m`, rejects
-     implied speeds > 500 km/h, and buffers any > 750 m jump for one tick to
-     catch A → B(far) → C(near A) spike patterns.
+  2. `LocationFilter` — drops fixes with `horizontalAccuracy > 50 m`; rejects
+     any fix whose `speed < 0` or `verticalAccuracy ≤ 0` as **non-GPS**
+     (Wi-Fi / cell-tower fallback fixes leave those fields at the sentinel
+     negatives because network positioning has no Doppler velocity and no
+     altitude — this is the load-bearing defense against stale BSSID
+     registrations in Apple's Wi-Fi Positioning database delivering
+     plausible-looking-but-wrong fixes in degraded-signal environments);
+     rejects implied speeds > 500 km/h; and buffers any > 750 m jump for one
+     tick to catch A → B(far) → C(near A) spike patterns.
   3. `StationaryDetector` — once accepted fixes stay within 20 m of a
      candidate anchor for 150 s, suppresses subsequent fixes until one lands
      more than 30 m from the cluster center. Coordinates are never smoothed,
      only accept/suppress decisions are made.
 - **Device identity**: `DeviceIdentity` mints a UUID on first launch and
   stores it in the Keychain (UserDefaults fallback) so it survives reinstalls.
-  Every inserted point is stamped with this ID.
-- **Storage**: single SQLite table `points(id, latitude, longitude, created_at,
-  device_id)` in `Documents/gpslogger.sqlite`, WAL journal mode.
+  The ID is owned by `SyncService` and stamped on every upload payload — it
+  is **not** written into individual rows of `points`, because it's a
+  property of the install, not of each fix.
+- **Storage**: `Documents/gpslogger.sqlite` (WAL journal mode) with two tables:
+  - `points(id, latitude, longitude, created_at)` — unsynced upload queue.
+    Pre-refactor installs may still have a legacy `device_id` column; it is
+    dropped idempotently via `ALTER TABLE ... DROP COLUMN` on first launch
+    after upgrade.
+  - `fix_diagnostics(id, logged_at, fix_timestamp, latitude, longitude,
+    horizontal_accuracy, vertical_accuracy, altitude, speed, speed_accuracy,
+    course, course_accuracy, decision)` — debug/observability table capturing
+    every raw `CLLocation` that enters `LocationTracker.didUpdateLocations`
+    together with the filter's decision. Never uploaded. Retained for
+    **14 days** via `cleanupDiagnostics` on every launch. Used for post-hoc
+    classification of GPS anomalies (GNSS vs network fallback vs sensor
+    fusion drift) — see `QA.md` for extraction instructions.
 - **Sync**: a `Timer` (the only timer in the app) fires every 30 s, pulls up
-  to 100 rows, POSTs them to `/points` with the device ID stamped on each
-  row, and deletes the rows on a 2xx response. Failures stay in the DB for
-  the next tick.
+  to 100 rows from `points`, POSTs them to `/points` with the device ID
+  stamped on each payload element (from the injected `SyncService.deviceId`,
+  not per-row), and deletes the rows on a 2xx response. Failures stay in the
+  DB for the next tick.
 - **Counter**: lives in memory. Seeded once at launch from `SELECT COUNT(*)`,
   then increment/decrement only — no further `COUNT` queries.
 - **Backend URL override**: `Config.apiBaseURL` reads UserDefaults at every
