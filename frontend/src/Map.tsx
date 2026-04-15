@@ -12,15 +12,47 @@ import type { Point } from './api';
 const MAX_POINTS = 4000;
 const GRADIENT_CHUNKS = 64;
 const MAX_ZOOM = 20;
+// Break the route whenever consecutive fixes are more than this far apart in
+// time. Bridging such gaps would draw straight "teleport" lines across
+// unrelated locations (car trips, power-off periods, etc.).
+const GAP_MS = 5 * 60 * 1000;
 
-function downsample(points: Point[]): Point[] {
-  if (points.length <= MAX_POINTS) return points;
-  const step = Math.ceil(points.length / MAX_POINTS);
-  const out: Point[] = [];
-  for (let i = 0; i < points.length; i += step) out.push(points[i]);
-  const last = points[points.length - 1];
-  if (out[out.length - 1] !== last) out.push(last);
-  return out;
+// Split a time-sorted list of points into groups, starting a new group
+// whenever the time delta to the previous point exceeds GAP_MS.
+function splitByTimeGaps(points: Point[]): Point[][] {
+  if (points.length === 0) return [];
+  const groups: Point[][] = [[points[0]]];
+  let prevTime = new Date(points[0].created_at).getTime();
+  for (let i = 1; i < points.length; i++) {
+    const cur = points[i];
+    const curTime = new Date(cur.created_at).getTime();
+    const dt = curTime - prevTime;
+    if (Number.isFinite(dt) && dt > GAP_MS) {
+      groups.push([cur]);
+    } else {
+      groups[groups.length - 1].push(cur);
+    }
+    prevTime = curTime;
+  }
+  return groups;
+}
+
+// Downsample each group independently while sharing a global point budget
+// proportional to group size. Preserves segment boundaries (no merging) and
+// always keeps the first/last fix of each group so endpoints stay anchored.
+function downsampleGroups(groups: Point[][]): Point[][] {
+  const total = groups.reduce((s, g) => s + g.length, 0);
+  if (total <= MAX_POINTS) return groups;
+  return groups.map((g) => {
+    if (g.length <= 2) return g;
+    const target = Math.max(2, Math.floor((g.length * MAX_POINTS) / total));
+    const step = Math.ceil(g.length / target);
+    const out: Point[] = [];
+    for (let i = 0; i < g.length; i += step) out.push(g[i]);
+    const last = g[g.length - 1];
+    if (out[out.length - 1] !== last) out.push(last);
+    return out;
+  });
 }
 
 // Blue (240°) → Purple (285°) → Red (360°) with purple exactly at t=0.5.
@@ -34,19 +66,30 @@ function gradientColor(t: number): string {
 
 type Segment = { positions: [number, number][]; color: string };
 
-function buildSegments(points: Point[]): Segment[] {
-  const n = points.length;
-  if (n < 2) return [];
-  const chunks = Math.min(GRADIENT_CHUNKS, n - 1);
+// Build gradient-colored polyline chunks for every group. Gradient t is
+// computed against the global sampled-point index so colors still convey
+// progression across the whole query window, not just within one group.
+function buildSegments(groups: Point[][]): Segment[] {
+  const total = groups.reduce((s, g) => s + g.length, 0);
+  if (total < 2) return [];
   const segs: Segment[] = [];
-  for (let c = 0; c < chunks; c++) {
-    const start = Math.floor((c * (n - 1)) / chunks);
-    const end = Math.floor(((c + 1) * (n - 1)) / chunks) + 1;
-    const positions = points
-      .slice(start, end)
-      .map((p) => [p.latitude, p.longitude] as [number, number]);
-    const t = chunks === 1 ? 0 : c / (chunks - 1);
-    segs.push({ positions, color: gradientColor(t) });
+  let globalIdx = 0;
+  for (const group of groups) {
+    const n = group.length;
+    if (n >= 2) {
+      const chunks = Math.min(GRADIENT_CHUNKS, n - 1);
+      for (let c = 0; c < chunks; c++) {
+        const start = Math.floor((c * (n - 1)) / chunks);
+        const end = Math.floor(((c + 1) * (n - 1)) / chunks) + 1;
+        const positions = group
+          .slice(start, end)
+          .map((p) => [p.latitude, p.longitude] as [number, number]);
+        const mid = globalIdx + (start + end - 1) / 2;
+        const t = total <= 1 ? 0 : mid / (total - 1);
+        segs.push({ positions, color: gradientColor(t) });
+      }
+    }
+    globalIdx += n;
   }
   return segs;
 }
@@ -229,15 +272,23 @@ function DetailCard({
 // --------------------------------------------------------------------------
 
 export default function MapView({ points }: { points: Point[] }) {
-  const sampled = useMemo(() => downsample(points), [points]);
-  const segments = useMemo(() => buildSegments(sampled), [sampled]);
+  const groups = useMemo(
+    () => downsampleGroups(splitByTimeGaps(points)),
+    [points],
+  );
+  const sampled = useMemo(() => groups.flat(), [groups]);
+  const segments = useMemo(() => buildSegments(groups), [groups]);
 
-  const haloPositions = useMemo(
+  // One halo polyline per group — keeps the subtle shadow under the route but
+  // honors the same time-gap breaks so it doesn't bridge disconnected sessions.
+  const haloGroups = useMemo(
     () =>
-      sampled.map(
-        (p) => [p.latitude, p.longitude] as [number, number],
-      ),
-    [sampled],
+      groups
+        .filter((g) => g.length >= 2)
+        .map((g) =>
+          g.map((p) => [p.latitude, p.longitude] as [number, number]),
+        ),
+    [groups],
   );
 
   const [selected, setSelected] = useState<
@@ -320,9 +371,10 @@ export default function MapView({ points }: { points: Point[] }) {
           maxZoom={MAX_ZOOM}
         />
 
-        {hasRoute && (
+        {haloGroups.map((positions, i) => (
           <Polyline
-            positions={haloPositions}
+            key={`halo-${i}`}
+            positions={positions}
             pathOptions={{
               color: '#0f172a',
               weight: 10,
@@ -332,7 +384,7 @@ export default function MapView({ points }: { points: Point[] }) {
             }}
             eventHandlers={{ click: handleRouteClick }}
           />
-        )}
+        ))}
 
         {segments.map((s, i) => (
           <Polyline
