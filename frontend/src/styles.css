@@ -1,3 +1,19 @@
+:root {
+  --bg: #fafafa;
+  --panel-bg: #ffffff;
+  --border: #e5e7eb;
+  --border-strong: #d1d5db;
+  --text: #0f172a;
+  --text-muted: #64748b;
+  --accent: #0f172a;
+  --accent-hover: #1e293b;
+  --accent-disabled: #cbd5e1;
+  --error: #dc2626;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --radius: 8px;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -8,7 +24,14 @@ body,
   margin: 0;
   padding: 0;
   height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", "Segoe UI",
+    system-ui, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "cv11", "ss01";
 }
 
 .app {
@@ -17,70 +40,317 @@ body,
   height: 100vh;
 }
 
+/* ---------- Top control bar ---------- */
+
 .panel {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  align-items: center;
-  padding: 12px 16px;
-  background: #0f172a;
-  color: #e2e8f0;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  align-items: flex-end;
+  gap: 14px;
+  padding: 14px 20px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow-md);
   z-index: 1000;
+  position: relative;
 }
 
 .panel label {
   display: flex;
   flex-direction: column;
+  gap: 4px;
   font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #94a3b8;
+  color: var(--text-muted);
 }
 
 .panel input[type="datetime-local"] {
-  margin-top: 3px;
-  padding: 6px 10px;
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 8px 12px;
   font-size: 14px;
-  border: 1px solid #334155;
-  background: #1e293b;
-  color: #e2e8f0;
-  border-radius: 4px;
+  font-weight: 500;
+  font-family: inherit;
+  color: var(--text);
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+  min-width: 180px;
+}
+
+.panel input[type="datetime-local"]:hover {
+  background: #f1f5f9;
+}
+
+.panel input[type="datetime-local"]:focus {
+  background: #ffffff;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.08);
 }
 
 .panel button {
-  padding: 10px 18px;
+  align-self: flex-end;
+  padding: 9px 20px;
   font-size: 14px;
   font-weight: 600;
-  background: #2563eb;
-  color: white;
+  font-family: inherit;
+  letter-spacing: 0.01em;
+  color: #ffffff;
+  background: var(--accent);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius);
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition:
+    background 0.15s ease,
+    transform 0.05s ease;
+  min-height: 38px;
 }
 
 .panel button:hover:not(:disabled) {
-  background: #1d4ed8;
+  background: var(--accent-hover);
+}
+
+.panel button:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .panel button:disabled {
-  background: #475569;
+  background: var(--accent-disabled);
   cursor: not-allowed;
 }
 
 .panel .stats {
   margin-left: auto;
+  align-self: flex-end;
+  padding-bottom: 10px;
   font-size: 13px;
-  color: #94a3b8;
+  font-weight: 500;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
 }
 
 .panel .stats.error {
-  color: #f87171;
+  color: var(--error);
+}
+
+/* ---------- Map area ---------- */
+
+.map-wrapper {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .map {
-  flex: 1 1 auto;
-  min-height: 0;
-  background: #1e293b;
+  position: absolute;
+  inset: 0;
+  background: #f5f5f5;
+}
+
+.leaflet-container {
+  background: #fafafa;
+  font-family: inherit;
+  outline: none;
+}
+
+/* Zoom control: clean, shadowed, consistent with panel button radius */
+.leaflet-top.leaflet-left {
+  top: 16px;
+  left: 16px;
+}
+
+.leaflet-control-zoom {
+  border: none !important;
+  border-radius: var(--radius) !important;
+  box-shadow:
+    0 4px 12px rgba(15, 23, 42, 0.08),
+    0 1px 3px rgba(15, 23, 42, 0.06) !important;
+  overflow: hidden;
+}
+
+.leaflet-control-zoom a {
+  width: 34px !important;
+  height: 34px !important;
+  line-height: 34px !important;
+  background: #ffffff !important;
+  color: var(--text) !important;
+  border: none !important;
+  font-size: 18px !important;
+  font-weight: 500 !important;
+  transition: background 0.12s ease;
+}
+
+.leaflet-control-zoom a:first-child {
+  border-bottom: 1px solid var(--border) !important;
+}
+
+.leaflet-control-zoom a:hover {
+  background: #f1f5f9 !important;
+  color: var(--text) !important;
+}
+
+/* Attribution: subtle, doesn't shout */
+.leaflet-control-attribution {
+  background: rgba(255, 255, 255, 0.85) !important;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 3px 10px !important;
+  font-size: 10px !important;
+  color: var(--text-muted) !important;
+  border-radius: 6px 0 0 0 !important;
+  box-shadow: var(--shadow-sm);
+}
+
+.leaflet-control-attribution a {
+  color: var(--text) !important;
+  text-decoration: none !important;
+}
+
+.leaflet-control-attribution a:hover {
+  text-decoration: underline !important;
+}
+
+/* ---------- Selected-point card ---------- */
+
+.point-card {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 296px;
+  max-width: calc(100vw - 32px);
+  padding: 16px 18px 14px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 28px rgba(15, 23, 42, 0.10),
+    0 4px 10px rgba(15, 23, 42, 0.06);
+  z-index: 1100;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.point-card__close {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  font-family: inherit;
+}
+
+.point-card__close:hover {
+  background: #f1f5f9;
+  color: var(--text);
+}
+
+.point-card__label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 5px;
+}
+
+.point-card__label:not(:first-of-type) {
+  margin-top: 12px;
+}
+
+.point-card__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.point-card__coords {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 9px;
+  font-family: "SF Mono", Menlo, ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  background: #f8fafc;
+  border-radius: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.point-card__address,
+.point-card__time {
+  line-height: 1.5;
+  color: var(--text);
+  min-height: 20px;
+  word-break: break-word;
+}
+
+.point-card__time {
+  font-variant-numeric: tabular-nums;
+}
+
+.point-card__timezone {
+  font-family: "SF Mono", Menlo, ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+.point-card__muted {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.point-card__error {
+  color: var(--error);
+  font-size: 12px;
+}
+
+.point-card__copy {
+  flex: 0 0 auto;
+  padding: 5px 11px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  background: #f1f5f9;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+  letter-spacing: 0.02em;
+}
+
+.point-card__copy:hover:not(:disabled) {
+  background: #e2e8f0;
+}
+
+.point-card__copy:disabled {
+  background: #dcfce7;
+  border-color: #bbf7d0;
+  color: #166534;
+  cursor: default;
+}
+
+.point-card__actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
 }

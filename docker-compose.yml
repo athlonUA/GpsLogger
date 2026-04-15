@@ -13,12 +13,43 @@ services:
       # Internal service-to-service traffic still uses 5432 via the compose network.
       - "5434:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - db:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d gpslogger"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # Daily database backup (pg_dump, retains 7 days)
+  db-backup:
+    image: postgres:16-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: gpslogger
+    volumes:
+      - db-backup:/backup
+    tmpfs:
+      - /var/lib/postgresql/data
+    entrypoint: /bin/sh
+    command: >
+      -c 'while true; do
+        STAMP=$$(date +%Y%m%d_%H%M%S);
+        pg_dump -Fc > /backup/backup_$$STAMP.dump;
+        echo "Backup created: backup_$$STAMP.dump";
+        find /backup -name "backup_*.dump" -mtime +7 -delete;
+        sleep 86400;
+      done'
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
 
   backend:
     build: ./backend
@@ -37,5 +68,20 @@ services:
       db:
         condition: service_healthy
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the JS bundle at build time. The nginx config inside the
+        # container proxies /api/* to the backend service on the compose network.
+        VITE_API_URL: /api
+    restart: unless-stopped
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+
 volumes:
-  pgdata:
+  db:
+  db-backup:

@@ -79,11 +79,20 @@ format on input and output.
 
 ## Running it
 
-### 1. Backend + DB
+### 1. Full stack via Docker Compose (recommended)
 
 ```bash
 docker compose up --build
 ```
+
+Brings up four services:
+
+| Service | Host port | Purpose |
+|---|---|---|
+| **db** | `5434` (→ container `5432`) | Postgres 16, data in the `db` named volume |
+| **db-backup** | — | Sidecar that runs `pg_dump -Fc` into the `db-backup` named volume once every 24 h with 7-day retention (`find -mtime +7 -delete`). `tmpfs` mounted over `/var/lib/postgresql/data` to avoid Docker creating an anonymous volume for the postgres image's declared VOLUME |
+| **backend** | `3000` | Express API |
+| **frontend** | `3001` | nginx serving the built SPA + `/api/*` reverse proxy to `backend:3000` |
 
 Wait for:
 
@@ -92,14 +101,22 @@ Wait for:
 [api] listening on :3000
 ```
 
-Sanity check:
+Sanity checks:
 
 ```bash
-curl -fsS http://localhost:3000/health
-# {"ok":true}
+curl -fsS http://localhost:3000/health            # backend direct  → {"ok":true}
+curl -fsS http://localhost:3001/                  # frontend index  → HTML
+curl -fsS 'http://localhost:3001/api/points?from=2000-01-01T00:00:00Z&to=2100-01-01T00:00:00Z'
+#                                                  # frontend → nginx → backend → []
 ```
 
-### 2. Frontend
+Then open **http://localhost:3001** in your browser. The UI has a **From**/**To**
+datetime pair and a **Visualize** button — no auto-refresh.
+
+### 2. Frontend in dev mode (optional)
+
+For hot-reload while working on the frontend, run the Vite dev server directly
+against the dockerized backend:
 
 ```bash
 cd frontend
@@ -107,10 +124,8 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173. The UI has a **From**/**To** datetime pair and a
-**Visualize** button — no auto-refresh.
-
-Override the backend URL via `frontend/.env`:
+Open http://localhost:5173. The dev server defaults to `http://localhost:3000`
+for the API; override via `frontend/.env` if needed:
 
 ```
 VITE_API_URL=http://localhost:3000
@@ -135,19 +150,28 @@ Short version:
 ## Architecture summary
 
 ```
-┌──────────────┐   HTTP batches    ┌───────────────┐      ┌──────────────┐
-│  iOS app     │ ─────────────────▶│  Express API  │ ───▶ │ Postgres 16  │
-│ (SwiftUI +   │  every 30s         │  /points POST │      │  points      │
-│ CoreLocation │                    │  /points GET  │◀──── │              │
-│ + SQLite)    │                    └───────────────┘      └──────────────┘
-└──────────────┘                            ▲
-                                            │ GET /points?from&to
-                                            │
-                                   ┌────────────────┐
-                                   │  React app     │
-                                   │ (Leaflet +     │
-                                   │  gradient line)│
-                                   └────────────────┘
+┌──────────────┐    HTTP batches     ┌───────────────┐       ┌──────────────┐
+│  iOS app     │ ───────────────────▶│  Express API  │ ────▶ │ Postgres 16  │
+│ (SwiftUI +   │   every 30s          │  POST /points │       │    points    │
+│ CoreLocation │                      │  GET  /points │◀───── │              │
+│ + SQLite)    │                      └───────────────┘       └──────────────┘
+└──────────────┘                              ▲
+                                              │
+                                    (service: backend:3000)
+                                              │
+                                      ┌───────┴────────┐
+                                      │ nginx          │   /api/* → backend
+                                      │ (frontend      │   /      → built SPA
+                                      │  container)    │
+                                      └───────┬────────┘
+                                              │
+                                              │ browser (localhost:3001)
+                                              ▼
+                                      ┌────────────────┐
+                                      │  React app     │
+                                      │ (Leaflet +     │
+                                      │  gradient line)│
+                                      └────────────────┘
 ```
 
 ### iOS — collection rules
@@ -193,7 +217,7 @@ Full QA plan (smoke tests + manual E2E scenarios): see [`QA.md`](QA.md).
 GpsLogger/
 ├── README.md                this file
 ├── QA.md                    test plan
-├── docker-compose.yml       backend + postgres
+├── docker-compose.yml       db + db-backup + backend + frontend
 ├── backend/
 │   ├── Dockerfile
 │   ├── package.json
@@ -202,6 +226,9 @@ GpsLogger/
 │   ├── src/routes/points.js
 │   └── test/validate.test.js
 ├── frontend/
+│   ├── Dockerfile           multi-stage: Node build → nginx serve
+│   ├── nginx.conf           static files + /api/* proxy to backend
+│   ├── .dockerignore
 │   ├── package.json
 │   ├── vite.config.ts
 │   ├── index.html

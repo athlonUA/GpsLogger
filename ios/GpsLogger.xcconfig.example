@@ -1,0 +1,17 @@
+// Local signing config for the iOS target.
+//
+// Copy this file to GpsLogger.xcconfig (which is gitignored) and fill in
+// your own Apple Developer Team ID. The xcodegen-generated .xcodeproj
+// pulls DEVELOPMENT_TEAM from the xcconfig so nothing personal ends up
+// in git.
+//
+// Find your team ID via one of:
+//   security find-identity -p codesigning -v
+//     (the 10-character value in parentheses after your email)
+//
+//   Xcode → Settings → Accounts → select your Apple ID → Team ID column
+//
+// After editing, re-run `xcodegen generate` in the `ios/` directory to
+// refresh the .xcodeproj.
+
+DEVELOPMENT_TEAM = YOUR_APPLE_TEAM_ID

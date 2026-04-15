@@ -79,17 +79,43 @@ Check: **Location updates**
 
 ### 5. Set the backend URL
 
-Edit `Config.swift`:
+Edit `Config.swift`. The committed default is:
 
 ```swift
-static let apiBaseURL = URL(string: "http://<YOUR_MAC_LAN_IP>:3000")!
+static let apiBaseURL = URL(string: "http://localhost:3000")!
 ```
 
-Find your Mac's LAN IP in **System Settings → Network → Wi-Fi → Details → TCP/IP**.
+- **iOS Simulator**: leave as-is — the simulator shares the Mac's network stack.
+- **Physical iPhone**: replace with your Mac's LAN IP
+  (**System Settings → Network → Wi-Fi → Details → TCP/IP**), e.g.
+  `http://192.168.1.25:3000`. iPhone and Mac must share the same Wi-Fi.
 
-Make sure the iPhone and Mac are on the **same Wi-Fi**.
+### 6. Local signing config (for CLI builds via xcodegen + xcodebuild)
 
-### 6. Deploy to your iPhone (free Apple ID)
+If you build from the command line rather than clicking Run in Xcode, the
+signing team ID lives in a **gitignored** xcconfig file so nothing personal
+ends up in the repo:
+
+```bash
+cd ios
+cp GpsLogger.xcconfig.example GpsLogger.xcconfig
+# edit GpsLogger.xcconfig and replace YOUR_APPLE_TEAM_ID
+xcodegen generate
+```
+
+To find your team ID:
+
+```bash
+security find-identity -p codesigning -v
+#   1) <hash> "Apple Development: you@example.com (TEAM_ID)"
+```
+
+(or Xcode → Settings → Accounts → *Team ID* column).
+
+Without this file, `xcodegen generate` still works, but `xcodebuild` will
+refuse to sign for a real device.
+
+### 7. Deploy to your iPhone (free Apple ID)
 
 1. **Xcode → Settings → Accounts → +** add your Apple ID.
 2. Select the target → **Signing & Capabilities** → set **Team** to your Personal Team.

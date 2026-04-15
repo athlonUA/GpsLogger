@@ -49,13 +49,17 @@ targets:
       path: GpsLogger/GpsLogger.entitlements
       properties: {}
 
+    # DEVELOPMENT_TEAM is provided by the gitignored GpsLogger.xcconfig file.
+    # Copy GpsLogger.xcconfig.example to GpsLogger.xcconfig and fill in your
+    # team ID, then re-run `xcodegen generate` in this directory.
+    configFiles:
+      Debug: GpsLogger.xcconfig
+      Release: GpsLogger.xcconfig
+
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.GpsLogger
+        # "com.example.*" is blocked by Apple for free accounts — use a unique ID.
+        PRODUCT_BUNDLE_IDENTIFIER: com.gpslogger.personal
         TARGETED_DEVICE_FAMILY: "1,2"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-        # Simulator build — skip signing altogether. Physical-device builds
-        # need real signing done in Xcode / via a free Apple ID profile.
-        CODE_SIGNING_REQUIRED: "NO"
-        CODE_SIGNING_ALLOWED: "NO"
-        CODE_SIGN_IDENTITY: ""
+        CODE_SIGN_STYLE: Automatic

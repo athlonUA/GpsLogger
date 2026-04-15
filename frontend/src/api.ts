@@ -5,14 +5,22 @@ export interface Point {
   created_at: string;
 }
 
-const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:3000';
+// API base URL. Accepts either an absolute origin ("http://localhost:3000")
+// or a same-origin prefix ("/api"). The trailing slash is normalized away
+// so we can always concatenate "/points" cleanly.
+//
+// - `npm run dev` on the host → falls back to http://localhost:3000 where the
+//   dockerized backend is exposed.
+// - `docker compose up` → Dockerfile sets VITE_API_URL=/api, so requests hit
+//   the frontend container's own nginx, which proxies to the backend service.
+const BASE = (import.meta.env.VITE_API_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
 
 export async function fetchPoints(from: Date, to: Date): Promise<Point[]> {
-  const url = new URL('/points', BASE);
-  url.searchParams.set('from', from.toISOString());
-  url.searchParams.set('to', to.toISOString());
-
-  const res = await fetch(url);
+  const qs = new URLSearchParams({
+    from: from.toISOString(),
+    to: to.toISOString(),
+  });
+  const res = await fetch(`${BASE}/points?${qs.toString()}`);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`GET /points failed: ${res.status} ${body}`);

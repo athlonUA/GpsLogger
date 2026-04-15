@@ -15,9 +15,16 @@ DerivedData
 *.hmap
 *.ipa
 *.dSYM.zip
+# xcodebuild -derivedDataPath outputs
+ios/build
+ios/build-device
 
 # xcodegen-generated Info plist
 ios/GpsLogger/Info-generated.plist
+
+# Local signing config — contains personal DEVELOPMENT_TEAM, see
+# ios/GpsLogger.xcconfig.example for the template.
+ios/GpsLogger.xcconfig
 
 # local state
 pgdata
@@ -26,5 +33,5 @@ pgdata
 .claude/
 .playwright-mcp/
 
-# test output
-e2e-*.png
+# test output — Playwright/E2E screenshots at the repo root
+/*.png
