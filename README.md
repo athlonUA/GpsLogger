@@ -286,7 +286,7 @@ flowchart LR
         dbbackup["db-backup<br/>pg_dump -Fc daily<br/>7-day retention"]
     end
 
-    iOS -->|HTTP batches every 30s<br/>(points + diagnostics)| backend
+    iOS -->|"HTTP batches every 30s<br/>points + diagnostics"| backend
     browser -->|static SPA request| nginx
     nginx -->|built files| browser
     browser -->|"GET /api/*"| nginx
