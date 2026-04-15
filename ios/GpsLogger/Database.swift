@@ -77,11 +77,19 @@ final class Database {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "gpslogger.db.queue")
 
-    init() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let path = docs.appendingPathComponent("gpslogger.sqlite").path
+    /// Opens (or creates) the SQLite store at `path`. The default path is
+    /// the app's Documents directory; tests pass `":memory:"` or a temp
+    /// file to keep each case isolated without touching production state.
+    init(path: String? = nil) {
+        let actualPath: String
+        if let path {
+            actualPath = path
+        } else {
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            actualPath = docs.appendingPathComponent("gpslogger.sqlite").path
+        }
 
-        if sqlite3_open(path, &db) != SQLITE_OK {
+        if sqlite3_open(actualPath, &db) != SQLITE_OK {
             let err = String(cString: sqlite3_errmsg(db))
             fatalError("sqlite open failed: \(err)")
         }
