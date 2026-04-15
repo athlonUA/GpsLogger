@@ -92,6 +92,16 @@ enum Config {
     /// to `spikeJumpMeters` so fast travel can't accidentally satisfy it.
     static let spikeReturnMeters: CLLocationDistance = 100
 
+    /// Maximum age for a fix held in `LocationFilter.pending`. The spike
+    /// buffer holds a single "suspicious" fix waiting for the next fix to
+    /// confirm or reject it. If the app is backgrounded or CoreLocation
+    /// goes quiet for longer than this, the pending point is stale — the
+    /// A → B → C temporal pattern is broken — and we drop it silently so
+    /// a returning fix isn't compared against hours-old state. 30 s covers
+    /// normal delivery gaps (walking with `distanceFilter = 10`, low
+    /// signal, brief backgrounding) while catching any long pause.
+    static let pendingTimeoutSeconds: TimeInterval = 30
+
     /// Stationary detection — how long a candidate cluster must persist before
     /// we declare the user stationary and stop recording further points.
     /// 150 s (2.5 min) is long enough that genuine short stops (traffic lights,

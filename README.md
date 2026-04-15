@@ -42,8 +42,14 @@ Rules:
 Response:
 
 ```json
-{ "inserted": 2 }
+{ "inserted": 2, "submitted": 2 }
 ```
+
+`inserted` is the number of rows that actually landed in the DB, `submitted`
+is the batch size. They differ when the backend skips duplicates on the
+idempotency key `(device_id, created_at)` — a successful retry of an
+already-accepted batch returns `{ "inserted": 0, "submitted": 2 }` without
+error. See migration `004_idempotency.sql` and the unique index.
 
 Errors:
 
@@ -98,7 +104,9 @@ Rules:
 - `device_id` same rules as `/points`.
 - batch size ≤ 1000 (iOS app uses ≤ 100).
 
-Response: `{ "inserted": N }`. No GET — reads go straight to Postgres.
+Response: `{ "inserted": N, "submitted": M }` with the same idempotency
+semantics as `/points` (duplicate `(device_id, fix_timestamp)` rows are
+silently skipped). No GET — reads go straight to Postgres.
 
 ### `GET /points?device_id=<id>&from=<ISO>&to=<ISO>`
 
@@ -130,6 +138,14 @@ ALTER TABLE points
     ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_points_device_id_created_at
     ON points (device_id, created_at);
+
+-- 004_idempotency.sql (after 003; declared out of order here for clarity)
+-- Removes any pre-existing duplicates, then creates a unique index so
+-- that retried-after-lost-response batches are idempotent.
+CREATE UNIQUE INDEX idx_points_unique_device_created
+    ON points (device_id, created_at);
+CREATE UNIQUE INDEX idx_fix_diagnostics_unique_device_fix
+    ON fix_diagnostics (device_id, fix_timestamp);
 
 -- 003_fix_diagnostics.sql
 CREATE TABLE fix_diagnostics (
@@ -301,10 +317,46 @@ flowchart LR
   tracker; the hint flips only on medium/high-confidence readings, and
   low-confidence or `stationary` readings do not change the hint
   (prevents thrashing). Requires the **Motion & Fitness** permission —
-  if denied, the classifier is a no-op and the app stays on `.fitness`
-  permanently. The source gate in `LocationFilter` is the real defense
-  against bad GPS regardless of mode — `activityType` only biases
-  CoreLocation's fusion, it does not by itself accept or reject fixes.
+  if denied or restricted, the classifier emits an `onUnavailable`
+  signal and the tracker surfaces a `motionPermissionDenied`
+  impairment banner in the UI; the app stays on `.fitness` permanently
+  until the permission is restored. The source gate in `LocationFilter`
+  is the real defense against bad GPS regardless of mode —
+  `activityType` only biases CoreLocation's fusion, it does not by
+  itself accept or reject fixes.
+- **Tracking impairment UI.** `LocationTracker` publishes a
+  `Set<TrackingImpairment>` that surfaces three degraded states as an
+  orange banner at the top of `ContentView`: `.permissionDenied` (no
+  tracking at all), `.backgroundRequiresAlways` (user has WhenInUse
+  only — foreground tracks fine but background silently drops), and
+  `.motionPermissionDenied` (vehicle mode never engages, stays on
+  `.fitness`). The state machine in
+  `locationManagerDidChangeAuthorization` also resets `LocationFilter`
+  and `StationaryDetector` when permission is restored after a denial,
+  so stale anchors from the old session don't bleed into the new one.
+- **Correctness + resilience hardening** (1.2.1):
+  - `Database.insert` and `Database.logDiagnostic` return `Bool`;
+    `LocationTracker` only increments the in-memory unsynced counter
+    on confirmed SQLite success, so disk-full or schema-mismatch
+    failures can no longer drift the UI counter off the real row count.
+  - Both the database-write path and the sync-drain path hop onto
+    private serial queues (`persistQueue` in `LocationTracker`,
+    `syncQueue` in `SyncService`), so the main thread never blocks on
+    synchronous SQLite reads/writes and the `in-flight` Bool flags
+    live on a single serial owner instead of racing between the main
+    `Timer` callback and the URLSession background completion.
+  - `LocationFilter` drops a stale `pending` spike if it has aged past
+    `Config.pendingTimeoutSeconds` (30 s), preventing a buffered fix
+    from surviving an app backgrounding and corrupting the next
+    session's filter state.
+  - `StationaryDetector` guards against a negative `age` computed from
+    an older anchor timestamp (NTP correction, DST transition, cached
+    replay) and resets the candidate instead of stalling forever in
+    Phase A.
+  - `locationManager(_:didFailWithError:)` now switches on `CLError.code`:
+    `.denied` stops the tracker and surfaces a permission impairment,
+    `.locationUnknown` is ignored as transient, the rest is logged
+    only under DEBUG.
 - **Distance filter (first gate).** Two layers ensure no points land closer
   than 10 m: `CLLocationManager.distanceFilter = 10` and a defensive
   per-insert check.
@@ -387,7 +439,8 @@ flowchart LR
 # backend unit tests (35 cases: validateBatch + validateDiagnosticsBatch + validateRange)
 cd backend && node --test test/
 
-# iOS unit tests (LocationFilter + Database drain cycle, 20 cases)
+# iOS unit tests (41 cases across LocationFilter, Database drain, 
+# MotionClassifier classify, and StationaryDetector state machine)
 cd ios && xcodegen generate && xcodebuild test \
     -project GpsLogger.xcodeproj \
     -scheme GpsLoggerTests \
@@ -442,7 +495,8 @@ GpsLogger/
     │   ├── GpsLogger.entitlements
     │   └── Info.plist
     └── GpsLoggerTests/
-        ├── LocationFilterTests.swift    13 cases covering every filter gate
-        ├── DatabaseTests.swift          7 cases locking in the drain/retention invariants
-        └── MotionClassifierTests.swift  10 cases for the pure classification rules
+        ├── LocationFilterTests.swift      15 cases covering every filter gate + pending-timeout
+        ├── DatabaseTests.swift            7 cases locking in the drain/retention invariants
+        ├── MotionClassifierTests.swift    10 cases for the pure classification rules
+        └── StationaryDetectorTests.swift   9 cases for the Phase-A/B state machine + clock-skew guard
 ```

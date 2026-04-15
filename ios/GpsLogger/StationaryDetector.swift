@@ -98,6 +98,16 @@ struct StationaryDetector {
         // at least `windowSeconds`, we are now stationary — freeze the
         // anchor as the cluster center and suppress this fix.
         let age = loc.timestamp.timeIntervalSince(anchor.timestamp)
+        if age < 0 {
+            // System clock jumped backwards between the anchor's capture
+            // and this fix (NTP adjustment, DST transition quirk, or a
+            // CoreLocation cached replay with an older timestamp). The
+            // age comparison would never fire and the detector would
+            // stall in Phase A forever. Reset the candidate to the
+            // newer fix and restart the window.
+            candidateAnchor = loc
+            return .accept
+        }
         if age >= windowSeconds {
             stationaryCenter = anchor
             candidateAnchor = nil

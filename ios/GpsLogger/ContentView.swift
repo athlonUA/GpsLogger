@@ -7,6 +7,12 @@ struct ContentView: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
             VStack(spacing: 0) {
+                if !tracker.impairments.isEmpty {
+                    ImpairmentBanner(impairments: tracker.impairments)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 12)
+                }
+
                 Spacer()
 
                 VStack(spacing: 8) {
@@ -46,6 +52,39 @@ struct ContentView: View {
         let v = (info?["CFBundleShortVersionString"] as? String) ?? "?"
         let b = (info?["CFBundleVersion"] as? String) ?? "?"
         return "v\(v) (\(b))"
+    }
+}
+
+// MARK: - Impairment banner
+
+/// Amber banner shown at the top of the screen whenever
+/// `LocationTracker.impairments` contains any entries. Each impairment
+/// gets its own line so a partially-denied state (e.g. location ok,
+/// motion denied) surfaces clearly. The order is stable because
+/// `TrackingImpairment: CaseIterable` returns declaration order.
+private struct ImpairmentBanner: View {
+    let impairments: Set<LocationTracker.TrackingImpairment>
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(LocationTracker.TrackingImpairment.allCases, id: \.self) { imp in
+                if impairments.contains(imp) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text(imp.shortMessage)
+                            .font(.footnote)
+                            .foregroundColor(.primary)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.15))
+        .cornerRadius(8)
+        .accessibilityElement(children: .combine)
     }
 }
 

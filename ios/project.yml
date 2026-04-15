@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.2.0"
-    CURRENT_PROJECT_VERSION: "5"
+    MARKETING_VERSION: "1.2.1"
+    CURRENT_PROJECT_VERSION: "6"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
 targets:
@@ -30,8 +30,8 @@ targets:
       path: GpsLogger/Info-generated.plist
       properties:
         CFBundleDisplayName: GpsLogger
-        CFBundleShortVersionString: "1.2.0"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "1.2.1"
+        CFBundleVersion: "6"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
@@ -43,8 +43,16 @@ targets:
         NSMotionUsageDescription: "GpsLogger reads the motion sensors to detect whether you are walking, cycling, or in a vehicle, so it can tune CoreLocation's activityType hint for each mode. Processing happens entirely on device."
         UIBackgroundModes:
           - location
+        # ATS is scoped to **local networking only**. `NSAllowsLocalNetworking`
+        # exempts private-IP ranges (10.x, 172.16.x–172.31.x, 192.168.x) and
+        # `.local` hostnames from ATS so the iOS app can reach the Mac's
+        # docker-compose backend over plain HTTP without the global kill
+        # switch `NSAllowsArbitraryLoads = true`. Any traffic to public
+        # internet addresses still goes through the full ATS enforcement
+        # (HTTPS, modern TLS, valid certificate), so a malicious captive
+        # portal cannot MITM unrelated requests.
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
         # Baked in from $(API_BASE_URL) in the gitignored xcconfig. Xcode
         # substitutes the value during ProcessInfoPlistFile, and
         # Config.apiBaseURL reads it from Bundle.main at launch. Keeps

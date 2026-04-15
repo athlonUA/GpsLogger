@@ -44,6 +44,20 @@ final class MotionClassifier {
         case unknown
     }
 
+    /// Reason the classifier might be unavailable at runtime, reported via
+    /// `onAvailabilityChange` so the app can surface a UI hint ("motion
+    /// sensing denied — multi-modal tracking is disabled").
+    enum UnavailabilityReason {
+        /// `CMMotionActivityManager.isActivityAvailable()` returned false
+        /// — the device has no motion coprocessor. Effectively impossible
+        /// on any iOS 16+ iPhone but handled defensively.
+        case hardwareUnavailable
+        /// User denied the Motion & Fitness permission (or parental
+        /// controls restricted it). CoreMotion will silently deliver no
+        /// data; we don't try to start updates.
+        case permissionDenied
+    }
+
     /// Latest emitted mode. Writes happen only on the main queue (same
     /// queue CoreMotion delivers callbacks to), so single-threaded reads
     /// from the main thread are safe without explicit locking.
@@ -54,17 +68,46 @@ final class MotionClassifier {
     /// downstream `activityType` writes only happen on real transitions.
     var onModeChange: ((Mode) -> Void)?
 
+    /// Called on the main queue if the classifier cannot start. Allows the
+    /// owning `LocationTracker` to surface the situation through its
+    /// `TrackingImpairment` channel so the UI can warn the user that
+    /// multi-modal classification is disabled for the rest of the session.
+    var onUnavailable: ((UnavailabilityReason) -> Void)?
+
     private let manager = CMMotionActivityManager()
 
     /// Begin subscribing to CoreMotion activity updates. Idempotent — safe
     /// to call multiple times; subsequent calls are ignored by the
     /// underlying manager if an update session is already active.
+    ///
+    /// Permission handling: CoreMotion does not have an explicit
+    /// `requestAuthorization` API — the first call to `startActivityUpdates`
+    /// triggers an implicit system prompt. We check
+    /// `CMMotionActivityManager.authorizationStatus()` first so that a
+    /// previously-denied permission results in a clean no-op plus an
+    /// `onUnavailable(.permissionDenied)` callback, instead of silently
+    /// starting a subscription that never receives data.
     func start() {
         guard CMMotionActivityManager.isActivityAvailable() else {
             #if DEBUG
             print("[motion] activity manager not available on this device")
             #endif
+            onUnavailable?(.hardwareUnavailable)
             return
+        }
+
+        let status = CMMotionActivityManager.authorizationStatus()
+        switch status {
+        case .denied, .restricted:
+            #if DEBUG
+            print("[motion] authorization=\(status.rawValue) — starting would be a no-op")
+            #endif
+            onUnavailable?(.permissionDenied)
+            return
+        case .notDetermined, .authorized:
+            break // proceed — .notDetermined will trigger the prompt implicitly
+        @unknown default:
+            break
         }
 
         manager.startActivityUpdates(to: OperationQueue.main) { [weak self] activity in

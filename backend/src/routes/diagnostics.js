@@ -40,6 +40,12 @@ router.post('/', async (req, res, next) => {
         r.device_id,
       );
     }
+    // ON CONFLICT DO NOTHING idempotency mirrors the `/points` channel.
+    // The natural key is (device_id, fix_timestamp) — `fix_timestamp` is
+    // `CLLocation.timestamp`, which is stable across retries even if
+    // `logged_at` isn't (logged_at is stamped on each call to
+    // `logDiagnostic`). See migration 004 and the unique index on
+    // `fix_diagnostics`.
     const sql = `
       INSERT INTO fix_diagnostics (
         logged_at, fix_timestamp, latitude, longitude,
@@ -47,10 +53,15 @@ router.post('/', async (req, res, next) => {
         speed, speed_accuracy, course, course_accuracy,
         decision, device_id
       ) VALUES ${placeholders.join(', ')}
+      ON CONFLICT (device_id, fix_timestamp) DO NOTHING
+      RETURNING id
     `;
-    await pool.query(sql, values);
+    const result = await pool.query(sql, values);
 
-    res.status(201).json({ inserted: rows.length });
+    res.status(201).json({
+      inserted: result.rowCount,
+      submitted: rows.length,
+    });
   } catch (err) {
     next(err);
   }

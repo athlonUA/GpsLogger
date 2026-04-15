@@ -66,19 +66,22 @@ struct LocationFilter {
     private let maxSpeed: CLLocationSpeed
     private let spikeJump: CLLocationDistance
     private let spikeReturn: CLLocationDistance
+    private let pendingTimeout: TimeInterval
 
     init(
         maxAccuracy: CLLocationDistance = Config.maxHorizontalAccuracyMeters,
         minDistance: CLLocationDistance = Config.minDistanceMeters,
         maxSpeed: CLLocationSpeed = Config.maxPlausibleSpeedMps,
         spikeJump: CLLocationDistance = Config.spikeJumpMeters,
-        spikeReturn: CLLocationDistance = Config.spikeReturnMeters
+        spikeReturn: CLLocationDistance = Config.spikeReturnMeters,
+        pendingTimeout: TimeInterval = Config.pendingTimeoutSeconds
     ) {
         self.maxAccuracy = maxAccuracy
         self.minDistance = minDistance
         self.maxSpeed = maxSpeed
         self.spikeJump = spikeJump
         self.spikeReturn = spikeReturn
+        self.pendingTimeout = pendingTimeout
     }
 
     mutating func reset() {
@@ -89,6 +92,17 @@ struct LocationFilter {
     /// Feed a new raw fix. Mutates internal state and returns what the caller
     /// should persist.
     mutating func consume(_ loc: CLLocation) -> Decision {
+        // Stale-pending cleanup. The spike buffer holds a single "suspicious"
+        // fix waiting one tick for confirmation. If the app was backgrounded
+        // or CoreLocation stalled, the pending fix may be minutes or hours
+        // old — the A→B→C temporal pattern is broken and we cannot draw any
+        // signal from it. Drop it silently so the returning fix is compared
+        // against a clean state.
+        if let buffered = pending,
+           loc.timestamp.timeIntervalSince(buffered.timestamp) > pendingTimeout {
+            pending = nil
+        }
+
         // 1. Validity gate. A CLLocation with horizontalAccuracy < 0 is
         //    CoreLocation's documented signal that the fix itself is invalid.
         guard loc.horizontalAccuracy >= 0 else {

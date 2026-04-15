@@ -160,26 +160,72 @@ final class Database {
         return false
     }
 
+    // MARK: - Delete chunking helpers
+    //
+    // `DELETE ... WHERE id IN (?,?,?,...)` interpolates one placeholder per
+    // id. SQLite caps `SQLITE_MAX_VARIABLE_NUMBER` at ~32766 (legacy builds
+    // were 999); we chunk to 500 per statement which stays under every
+    // known limit and keeps individual statements short.
+    private static let deleteChunkSize = 500
+
+    /// Whitelisted table name for delete-by-id. The caller passes a string
+    /// literal from a small set; the value is interpolated into the SQL
+    /// (parameterised binding is not supported for table names). Adding a
+    /// new table here requires a conscious change.
+    private enum DeletableTable: String {
+        case points
+        case fixDiagnostics = "fix_diagnostics"
+    }
+
+    private func deleteIdsChunk(_ table: DeletableTable, _ ids: ArraySlice<Int64>) {
+        let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+        let sql = "DELETE FROM \(table.rawValue) WHERE id IN (\(placeholders));"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("[db] delete(\(table.rawValue)) prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+            return
+        }
+        for (offset, id) in ids.enumerated() {
+            sqlite3_bind_int64(stmt, Int32(offset + 1), id)
+        }
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            print("[db] delete(\(table.rawValue)) step failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+    }
+
     // MARK: - points
 
-    func insert(latitude: Double, longitude: Double, createdAt: Date) {
+    /// Insert a single point into the local upload queue.
+    ///
+    /// Returns `true` if the row landed, `false` on any prepare/step
+    /// failure. Callers should only mutate the in-memory unsynced counter
+    /// when this returns `true`, otherwise the UI counter and the DB row
+    /// count drift apart (disk full, schema mismatch, WAL contention).
+    @discardableResult
+    func insert(latitude: Double, longitude: Double, createdAt: Date) -> Bool {
         let iso = ISO8601Formatter.shared.string(from: createdAt)
-        queue.sync {
+        return queue.sync { () -> Bool in
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
             let sql = "INSERT INTO points (latitude, longitude, created_at) VALUES (?, ?, ?);"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 print("[db] insert prepare failed: \(String(cString: sqlite3_errmsg(db)))")
-                return
+                return false
             }
+            // Bind return codes are not checked individually: bad index or
+            // out-of-memory manifests as a failing `sqlite3_step` below,
+            // which the caller observes via the `Bool` return.
             sqlite3_bind_double(stmt, 1, latitude)
             sqlite3_bind_double(stmt, 2, longitude)
             sqlite3_bind_text(stmt, 3, iso, -1, SQLITE_TRANSIENT)
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 print("[db] insert step failed: \(String(cString: sqlite3_errmsg(db)))")
+                return false
             }
+            return true
         }
     }
 
@@ -190,39 +236,42 @@ final class Database {
 
             let sql = "SELECT id, latitude, longitude, created_at FROM points ORDER BY id ASC LIMIT ?;"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                print("[db] fetchBatch prepare failed: \(String(cString: sqlite3_errmsg(db)))")
                 return []
             }
             sqlite3_bind_int(stmt, 1, Int32(limit))
 
             var result: [LocalPoint] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
                 let id = sqlite3_column_int64(stmt, 0)
                 let lat = sqlite3_column_double(stmt, 1)
                 let lng = sqlite3_column_double(stmt, 2)
                 let cstrIso = sqlite3_column_text(stmt, 3)
                 let iso = cstrIso != nil ? String(cString: cstrIso!) : ""
                 result.append(LocalPoint(id: id, latitude: lat, longitude: lng, createdAt: iso))
+                status = sqlite3_step(stmt)
+            }
+            if status != SQLITE_DONE {
+                // SQLITE_ERROR / SQLITE_BUSY / SQLITE_CORRUPT etc. — the loop
+                // exited on a non-row, non-done status. Surface it so the
+                // SyncService doesn't conclude "queue is empty" on what is
+                // actually a transient I/O or contention failure.
+                print("[db] fetchBatch step failed: status=\(status) \(String(cString: sqlite3_errmsg(db)))")
             }
             return result
         }
     }
 
+    /// Remove rows by id after a successful upload. Chunks to at most
+    /// `deleteChunkSize` placeholders per prepared statement so an
+    /// oversized batch can never exceed SQLite's parameter limit.
     func delete(ids: [Int64]) {
         guard !ids.isEmpty else { return }
         queue.sync {
-            let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
-            let sql = "DELETE FROM points WHERE id IN (\(placeholders));"
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                print("[db] delete prepare failed: \(String(cString: sqlite3_errmsg(db)))")
-                return
-            }
-            for (i, id) in ids.enumerated() {
-                sqlite3_bind_int64(stmt, Int32(i + 1), id)
-            }
-            if sqlite3_step(stmt) != SQLITE_DONE {
-                print("[db] delete step failed: \(String(cString: sqlite3_errmsg(db)))")
+            for start in stride(from: 0, to: ids.count, by: Self.deleteChunkSize) {
+                let end = Swift.min(start + Self.deleteChunkSize, ids.count)
+                deleteIdsChunk(.points, ids[start..<end])
             }
         }
     }
@@ -234,10 +283,15 @@ final class Database {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM points;", -1, &stmt, nil) == SQLITE_OK else {
+                print("[db] initialCount prepare failed: \(String(cString: sqlite3_errmsg(db)))")
                 return 0
             }
-            if sqlite3_step(stmt) == SQLITE_ROW {
+            let status = sqlite3_step(stmt)
+            if status == SQLITE_ROW {
                 return Int(sqlite3_column_int64(stmt, 0))
+            }
+            if status != SQLITE_DONE {
+                print("[db] initialCount step failed: status=\(status) \(String(cString: sqlite3_errmsg(db)))")
             }
             return 0
         }
@@ -245,12 +299,15 @@ final class Database {
 
     // MARK: - fix_diagnostics
 
-    /// Record a raw fix + its filter decision. Used only for offline analysis
-    /// of anomalies; never touched by the upload path.
-    func logDiagnostic(_ d: FixDiagnostic) {
+    /// Record a raw fix + its filter decision. Returns `true` if the row
+    /// landed, `false` on any prepare/step failure. Callers use the return
+    /// value to decide whether to log a diagnostic failure separately;
+    /// they typically don't retry since diagnostic rows are best-effort.
+    @discardableResult
+    func logDiagnostic(_ d: FixDiagnostic) -> Bool {
         let loggedAt = ISO8601Formatter.shared.string(from: Date())
         let fixIso = ISO8601Formatter.shared.string(from: d.fixTimestamp)
-        queue.sync {
+        return queue.sync { () -> Bool in
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
@@ -263,7 +320,7 @@ final class Database {
                 """
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 print("[db] diagnostic prepare failed: \(String(cString: sqlite3_errmsg(db)))")
-                return
+                return false
             }
             sqlite3_bind_text(stmt, 1, loggedAt, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 2, fixIso, -1, SQLITE_TRANSIENT)
@@ -280,7 +337,9 @@ final class Database {
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 print("[db] diagnostic insert step failed: \(String(cString: sqlite3_errmsg(db)))")
+                return false
             }
+            return true
         }
     }
 
@@ -302,12 +361,14 @@ final class Database {
                 LIMIT ?;
                 """
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                print("[db] fetchDiagnosticsBatch prepare failed: \(String(cString: sqlite3_errmsg(db)))")
                 return []
             }
             sqlite3_bind_int(stmt, 1, Int32(limit))
 
             var result: [LocalFixDiagnostic] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
                 let id = sqlite3_column_int64(stmt, 0)
                 let loggedAt = Self.readText(stmt, 1)
                 let fixTs = Self.readText(stmt, 2)
@@ -337,29 +398,24 @@ final class Database {
                     courseAccuracy: cAcc,
                     decision: decision
                 ))
+                status = sqlite3_step(stmt)
+            }
+            if status != SQLITE_DONE {
+                print("[db] fetchDiagnosticsBatch step failed: status=\(status) \(String(cString: sqlite3_errmsg(db)))")
             }
             return result
         }
     }
 
-    /// Delete diagnostic rows after a successful backend upload. Mirrors
-    /// `delete(ids:)` for `points`.
+    /// Delete diagnostic rows after a successful backend upload. Uses the
+    /// same chunked helper as `delete(ids:)` so either call path is safe
+    /// for arbitrarily large batches.
     func deleteDiagnostics(ids: [Int64]) {
         guard !ids.isEmpty else { return }
         queue.sync {
-            let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
-            let sql = "DELETE FROM fix_diagnostics WHERE id IN (\(placeholders));"
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                print("[db] diagnostic delete prepare failed: \(String(cString: sqlite3_errmsg(db)))")
-                return
-            }
-            for (i, id) in ids.enumerated() {
-                sqlite3_bind_int64(stmt, Int32(i + 1), id)
-            }
-            if sqlite3_step(stmt) != SQLITE_DONE {
-                print("[db] diagnostic delete step failed: \(String(cString: sqlite3_errmsg(db)))")
+            for start in stride(from: 0, to: ids.count, by: Self.deleteChunkSize) {
+                let end = Swift.min(start + Self.deleteChunkSize, ids.count)
+                deleteIdsChunk(.fixDiagnostics, ids[start..<end])
             }
         }
     }

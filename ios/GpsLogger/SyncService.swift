@@ -1,7 +1,6 @@
 import Foundation
 
 /// Periodically drains the local DB and POSTs batches to the backend.
-/// A timer is allowed here — it is used ONLY for sync, never for location collection.
 ///
 /// Two upload channels run on the same 30 s cadence:
 ///   - `points` → the production upload queue, drives the visible trace.
@@ -9,6 +8,15 @@ import Foundation
 ///     backend `fix_diagnostics` table for post-hoc analysis. Each channel
 ///     has an independent in-flight guard so a slow response on one does
 ///     not stall the other.
+///
+/// All in-flight state (`pointsInFlight`, `diagnosticsInFlight`) and all
+/// database access triggered by sync is performed on a **private serial
+/// queue** (`syncQueue`). The main-thread `Timer` callback schedules work
+/// onto that queue; the URLSession completion handler also hops back onto
+/// that queue before touching state. This eliminates the Bool data race
+/// that would otherwise occur between main-thread reads and background
+/// URLSession completion writes, and keeps main thread free of
+/// synchronous SQLite reads via `fetchBatch`.
 ///
 /// Device identity is owned here and stamped onto every upload payload, not
 /// written into each row in the local DB. The ID is resolved once at
@@ -19,6 +27,17 @@ final class SyncService {
     private let appState: AppState
     private let deviceId: String
     private let session: URLSession
+
+    /// Serial queue that owns all sync state. Every read or write of
+    /// `pointsInFlight` / `diagnosticsInFlight` happens here, including
+    /// from URLSession completion handlers (which re-dispatch onto this
+    /// queue before touching the flags). `fetchBatch` /
+    /// `fetchDiagnosticsBatch` also run here so main thread never blocks
+    /// on synchronous SQLite reads during a Timer callback.
+    private let syncQueue = DispatchQueue(
+        label: "gpslogger.sync.state",
+        qos: .utility
+    )
 
     private var timer: Timer?
     private var pointsInFlight = false
@@ -48,12 +67,19 @@ final class SyncService {
     }
 
     private func tick() {
-        drainPoints()
-        drainDiagnostics()
+        // Hop onto the serial sync queue before touching any state or
+        // reading from the DB. The Timer fires on main; this is where we
+        // leave main for the rest of the drain cycle.
+        syncQueue.async { [weak self] in
+            self?.drainPoints()
+            self?.drainDiagnostics()
+        }
     }
 
     // MARK: - points channel
 
+    /// Runs on `syncQueue`. Reads/writes `pointsInFlight` safely because
+    /// there is no other producer on this queue.
     private func drainPoints() {
         guard !pointsInFlight else { return }
         let batch = database.fetchBatch(limit: Config.syncBatchSize)
@@ -69,23 +95,30 @@ final class SyncService {
             ]
         }
         postJsonBatch(path: "points", payload: payload) { [weak self] success in
-            guard let self = self else { return }
-            if success {
-                let ids = batch.map { $0.id }
-                self.database.delete(ids: ids)
+            // URLSession completion runs on an unspecified background queue.
+            // Hop back onto `syncQueue` so all state mutations stay on a
+            // single serial owner — no locks, no torn writes.
+            self?.syncQueue.async { [weak self] in
+                guard let self = self else { return }
+                if success {
+                    let ids = batch.map { $0.id }
+                    self.database.delete(ids: ids)
 
-                let delta = batch.count
-                DispatchQueue.main.async { [weak self] in
-                    guard let state = self?.appState else { return }
-                    state.unsyncedCount = max(0, state.unsyncedCount - delta)
+                    let delta = batch.count
+                    DispatchQueue.main.async { [weak self] in
+                        guard let state = self?.appState else { return }
+                        state.unsyncedCount = max(0, state.unsyncedCount - delta)
+                    }
                 }
+                self.pointsInFlight = false
             }
-            self.pointsInFlight = false
         }
     }
 
     // MARK: - diagnostics channel
 
+    /// Runs on `syncQueue`. Mirror of `drainPoints` for the debug
+    /// observability channel.
     private func drainDiagnostics() {
         guard !diagnosticsInFlight else { return }
         let batch = database.fetchDiagnosticsBatch(limit: Config.syncBatchSize)
@@ -110,12 +143,14 @@ final class SyncService {
             ]
         }
         postJsonBatch(path: "diagnostics", payload: payload) { [weak self] success in
-            guard let self = self else { return }
-            if success {
-                let ids = batch.map { $0.id }
-                self.database.deleteDiagnostics(ids: ids)
+            self?.syncQueue.async { [weak self] in
+                guard let self = self else { return }
+                if success {
+                    let ids = batch.map { $0.id }
+                    self.database.deleteDiagnostics(ids: ids)
+                }
+                self.diagnosticsInFlight = false
             }
-            self.diagnosticsInFlight = false
         }
     }
 

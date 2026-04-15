@@ -22,10 +22,22 @@ router.post('/', async (req, res, next) => {
         points[i].device_id,
       );
     }
-    const sql = `INSERT INTO points (latitude, longitude, created_at, device_id) VALUES ${placeholders.join(', ')}`;
-    await pool.query(sql, values);
+    // ON CONFLICT DO NOTHING idempotency: if the client retries a batch
+    // because a previous response was lost in flight, the duplicate
+    // (device_id, created_at) rows are silently skipped. `RETURNING id`
+    // lets us count how many actually landed so the response reflects the
+    // real state, not the submitted size.
+    const sql =
+      `INSERT INTO points (latitude, longitude, created_at, device_id) ` +
+      `VALUES ${placeholders.join(', ')} ` +
+      `ON CONFLICT (device_id, created_at) DO NOTHING ` +
+      `RETURNING id`;
+    const result = await pool.query(sql, values);
 
-    res.status(201).json({ inserted: points.length });
+    res.status(201).json({
+      inserted: result.rowCount,
+      submitted: points.length,
+    });
   } catch (err) {
     next(err);
   }

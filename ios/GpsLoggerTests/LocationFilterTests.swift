@@ -172,6 +172,61 @@ final class LocationFilterTests: XCTestCase {
         XCTAssertEqual(accepted.coordinate.latitude, 50.45)
     }
 
+    // MARK: - Pending timeout
+
+    func testStalePendingDroppedAfterTimeout() {
+        // A buffered spike waiting for confirmation must age out if the
+        // next fix arrives much later than the expected sample interval
+        // (app was backgrounded, CoreLocation stalled, etc.). Otherwise
+        // the A→B→C temporal pattern is broken and the filter would
+        // wrongly treat the next arbitrary fix as a spike confirmation.
+        var filter = LocationFilter(pendingTimeout: 30)
+
+        // A at t=0.
+        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
+        _ = filter.consume(a)
+
+        // B at t=10, ~1 km east — buffered as spike candidate.
+        let b = makeFix(lat: 50.4500, lon: 30.5370, timestamp: date(10))
+        XCTAssertEqual(filter.consume(b), .buffered)
+        XCTAssertNotNil(filter.pending)
+
+        // C arrives 100 s later (far beyond the 30 s pendingTimeout). The
+        // filter should have dropped the stale pending before evaluating
+        // C. From C's perspective, only A is still the anchor.
+        // Use a small displacement from A so C doesn't trip the spike
+        // jump threshold itself — this way we're testing the pending
+        // cleanup in isolation, not the new-spike path.
+        let c = makeFix(lat: 50.4501, lon: 30.5232, timestamp: date(110))
+        let decision = filter.consume(c)
+        // pending must be nil after consume; C is accepted as normal
+        // progression from A (distance ~13 m, above minDistance = 10 m).
+        XCTAssertNil(filter.pending, "stale pending must be dropped before evaluating the next fix")
+        guard case .accept = decision else {
+            return XCTFail("C should be accepted against A (not via spike logic) after pending aged out, got \(decision)")
+        }
+    }
+
+    func testFreshPendingKeptWithinTimeout() {
+        // Sanity check: pending that arrives within the timeout window
+        // is retained and the normal spike logic runs.
+        var filter = LocationFilter(pendingTimeout: 30)
+        _ = filter.consume(makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0)))
+
+        // B ~1 km east, buffered.
+        _ = filter.consume(makeFix(lat: 50.4500, lon: 30.5370, timestamp: date(10)))
+        XCTAssertNotNil(filter.pending)
+
+        // C arrives at t=20, only 10 s after B — well under the 30 s
+        // timeout. Pending must still be there when C is processed.
+        // C is back near A, forming the classic spike pattern.
+        let c = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(20))
+        let decision = filter.consume(c)
+        guard case .spikeReplaced = decision else {
+            return XCTFail("fresh A→B→C pattern must still produce spikeReplaced, got \(decision)")
+        }
+    }
+
     // MARK: - Helpers
 
     private let baseTime = Date(timeIntervalSince1970: 1_700_000_000)
