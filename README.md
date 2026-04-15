@@ -10,7 +10,7 @@ Minimal end-to-end GPS tracking system.
 
 | Component | Tech | Purpose |
 |---|---|---|
-| **iOS app** (`ios/`) | SwiftUI + CoreLocation + raw sqlite3 | record GPS points, store locally, sync in batches; second channel uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
+| **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in batches; second channel uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, for debugging) |
 | **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a gradient polyline |
@@ -289,10 +289,22 @@ flowchart LR
   timers for location**. Points are inserted exclusively in the
   `didUpdateLocations` callback. A `Timer` exists, but only inside
   `SyncService`, to schedule HTTP uploads.
-- **Pedestrian `activityType`.** `manager.activityType = .fitness` — semantic
-  match for a walking/running tracker, avoids biasing CoreLocation's fusion
-  engine toward vehicle motion models and road-snapping in degraded-signal
-  environments.
+- **Multi-modal `activityType`.** A single install tracks walking,
+  cycling, and motorized transport (car, bus, train) with the right
+  CoreLocation hint for each mode. `MotionClassifier` wraps
+  `CMMotionActivityManager` — which reads the phone's inertial sensors,
+  not GPS speed — and emits a coarse mode (`.pedestrian`, `.cycling`,
+  `.automotive`, `.unknown`) that `LocationTracker` maps to
+  `CLLocationManager.activityType`: `.fitness` for pedestrian/cycling,
+  `.automotiveNavigation` for any motor vehicle. Startup default is
+  `.fitness`, so a fresh launch behaves exactly like a pedestrian
+  tracker; the hint flips only on medium/high-confidence readings, and
+  low-confidence or `stationary` readings do not change the hint
+  (prevents thrashing). Requires the **Motion & Fitness** permission —
+  if denied, the classifier is a no-op and the app stays on `.fitness`
+  permanently. The source gate in `LocationFilter` is the real defense
+  against bad GPS regardless of mode — `activityType` only biases
+  CoreLocation's fusion, it does not by itself accept or reject fixes.
 - **Distance filter (first gate).** Two layers ensure no points land closer
   than 10 m: `CLLocationManager.distanceFilter = 10` and a defensive
   per-insert check.
@@ -419,9 +431,10 @@ GpsLogger/
     │   ├── AppContainer.swift
     │   ├── AppState.swift
     │   ├── ContentView.swift
-    │   ├── LocationTracker.swift     delegate, pipeline, diagnostic logging
+    │   ├── LocationTracker.swift     delegate, pipeline, diagnostic logging, runtime activityType swap
     │   ├── LocationFilter.swift      validity → source → accuracy → speed → spike
     │   ├── StationaryDetector.swift  jitter-cluster suppression
+    │   ├── MotionClassifier.swift    CMMotionActivityManager wrapper, emits transport mode
     │   ├── DeviceIdentity.swift      Keychain-backed UUID
     │   ├── SyncService.swift         points + diagnostics drains
     │   ├── Database.swift            points + fix_diagnostics store
@@ -429,6 +442,7 @@ GpsLogger/
     │   ├── GpsLogger.entitlements
     │   └── Info.plist
     └── GpsLoggerTests/
-        ├── LocationFilterTests.swift 13 cases covering every filter gate
-        └── DatabaseTests.swift       7 cases locking in the drain/retention invariants
+        ├── LocationFilterTests.swift    13 cases covering every filter gate
+        ├── DatabaseTests.swift          7 cases locking in the drain/retention invariants
+        └── MotionClassifierTests.swift  10 cases for the pure classification rules
 ```

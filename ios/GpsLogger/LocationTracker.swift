@@ -16,9 +16,16 @@ import Combine
 /// - Device identity is owned by `SyncService` and stamped on the upload
 ///   payload, not on individual rows — it's a property of the install, not
 ///   of each fix.
+/// - **Multi-modal `activityType`**: the hint passed to CoreLocation is
+///   swapped at runtime from `.fitness` to `.automotiveNavigation` based on
+///   `MotionClassifier`'s reading of the phone's inertial sensors. Walking
+///   and cycling use `.fitness`, motorized transport (car, bus, train) uses
+///   `.automotiveNavigation`, and the default on startup — before CoreMotion
+///   has had time to classify — is `.fitness`. See `MotionClassifier.swift`.
 final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var isTracking = false
     @Published private(set) var authStatus: CLAuthorizationStatus
+    @Published private(set) var motionMode: MotionClassifier.Mode = .unknown
 
     private let manager = CLLocationManager()
     private let database: Database
@@ -26,6 +33,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private var filter = LocationFilter()
     private var stationary = StationaryDetector()
+    private let classifier = MotionClassifier()
 
     init(database: Database, appState: AppState) {
         self.database = database
@@ -35,15 +43,22 @@ final class LocationTracker: NSObject, ObservableObject {
 
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyBest
-        // `.fitness` is Apple's hint for walking/running/cycling. The previous
-        // value (`.automotiveNavigation`) was a semantic mismatch for a
-        // pedestrian tracker and biased CoreLocation's fusion engine toward
-        // vehicle motion models in degraded-signal environments.
+        // Startup default: pedestrian hint. `MotionClassifier` will flip
+        // this to `.automotiveNavigation` once it detects a motor vehicle
+        // with medium/high confidence. The previous hard-coded
+        // `.automotiveNavigation` was a semantic mismatch for walkers and
+        // biased the fusion engine toward vehicle motion models in
+        // degraded-signal environments.
         manager.activityType = .fitness
         manager.distanceFilter = Config.minDistanceMeters
         manager.pausesLocationUpdatesAutomatically = false
         manager.allowsBackgroundLocationUpdates = true
         manager.showsBackgroundLocationIndicator = true
+
+        classifier.onModeChange = { [weak self] mode in
+            self?.apply(mode: mode)
+        }
+        classifier.start()
     }
 
     /// Kick off tracking. Called once from `AppContainer` at launch.
@@ -68,6 +83,42 @@ final class LocationTracker: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.isTracking = true
         }
+    }
+
+    /// Map a `MotionClassifier.Mode` to the `CLActivityType` hint used by
+    /// CoreLocation's fusion engine, and apply it if it actually changes.
+    /// Called on the main queue because `MotionClassifier` delivers
+    /// updates there.
+    ///
+    /// Mapping rationale:
+    /// - `.pedestrian` / `.cycling` → `.fitness` (Apple's documented hint
+    ///   for walking/running/cycling).
+    /// - `.automotive` → `.automotiveNavigation` (correct for car, bus,
+    ///   and train — CoreMotion does not distinguish between them).
+    /// - `.unknown` is intentionally left as a no-op: if CoreMotion can't
+    ///   classify (stationary, low confidence, permission denied), we
+    ///   keep whatever hint was last applied instead of flapping back to
+    ///   the default on every ambiguous reading.
+    private func apply(mode: MotionClassifier.Mode) {
+        DispatchQueue.main.async { [weak self] in
+            self?.motionMode = mode
+        }
+
+        let target: CLActivityType?
+        switch mode {
+        case .pedestrian, .cycling:
+            target = .fitness
+        case .automotive:
+            target = .automotiveNavigation
+        case .unknown:
+            target = nil
+        }
+
+        guard let target = target, manager.activityType != target else { return }
+        manager.activityType = target
+        #if DEBUG
+        print("[tracker] activityType -> \(target.rawValue) (\(mode))")
+        #endif
     }
 
     private func persist(_ loc: CLLocation) {

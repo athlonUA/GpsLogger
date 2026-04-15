@@ -28,6 +28,7 @@ ios/
     ├── DeviceIdentity.swift       ← Keychain-backed UUID (UserDefaults fallback)
     ├── SyncService.swift          ← sync timer + HTTP upload
     ├── Database.swift             ← raw sqlite3 wrapper
+    ├── MotionClassifier.swift     ← CMMotionActivityManager wrapper, emits transport mode
     ├── Config.swift               ← tunables + apiBaseURL resolver (xcconfig → Info.plist → fallback)
     ├── GpsLogger.entitlements
     └── Info.plist                 ← reference plist with required keys
