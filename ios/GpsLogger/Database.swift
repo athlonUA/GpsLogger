@@ -12,10 +12,19 @@ struct LocalPoint {
     let latitude: Double
     let longitude: Double
     let createdAt: String   // stored and uploaded verbatim as ISO 8601 UTC
+    let deviceId: String
 }
 
 /// Thread-safe SQLite store for unsynced GPS points.
 /// Uses raw sqlite3 — no external dependencies, no SPM packages.
+///
+/// Data-safety invariants:
+///   - `CREATE TABLE IF NOT EXISTS` is used on every launch, so the store
+///     survives app restarts and upgrades without clobber.
+///   - Schema migrations are additive (`ALTER TABLE ADD COLUMN`) and gated
+///     behind a `PRAGMA table_info` check so they are idempotent.
+///   - Points are only ever deleted from `SyncService` after a confirmed
+///     2xx upload; no deletion on failure, no overwrite on restart.
 final class Database {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "gpslogger.db.queue")
@@ -37,6 +46,12 @@ final class Database {
                 created_at TEXT NOT NULL
             );
         """)
+        // Additive migration: upgrades from pre-device_id databases. `ADD
+        // COLUMN` would fail with "duplicate column" on a fresh schema, so
+        // we guard on the current column list.
+        if !columnExists(table: "points", column: "device_id") {
+            exec("ALTER TABLE points ADD COLUMN device_id TEXT NOT NULL DEFAULT '';")
+        }
         exec("CREATE INDEX IF NOT EXISTS idx_points_created_at ON points(created_at);")
         exec("PRAGMA journal_mode=WAL;")
     }
@@ -52,13 +67,45 @@ final class Database {
         }
     }
 
-    func insert(latitude: Double, longitude: Double, createdAt: Date) {
+    private func columnExists(table: String, column: String) -> Bool {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = "PRAGMA table_info(\(table));"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let cstr = sqlite3_column_text(stmt, 1) {
+                if String(cString: cstr) == column { return true }
+            }
+        }
+        return false
+    }
+
+    /// Stamp any legacy rows (inserted before the device_id migration) with
+    /// the current device ID so they upload under the correct identity. Safe
+    /// to call on every launch — it's a no-op once legacy rows are drained.
+    func backfillDeviceIdIfNeeded(_ deviceId: String) {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "UPDATE points SET device_id = ? WHERE device_id = '';"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                print("[db] backfill prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+                return
+            }
+            sqlite3_bind_text(stmt, 1, deviceId, -1, SQLITE_TRANSIENT)
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                print("[db] backfill step failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+    }
+
+    func insert(latitude: Double, longitude: Double, createdAt: Date, deviceId: String) {
         let iso = ISO8601Formatter.shared.string(from: createdAt)
         queue.sync {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
-            let sql = "INSERT INTO points (latitude, longitude, created_at) VALUES (?, ?, ?);"
+            let sql = "INSERT INTO points (latitude, longitude, created_at, device_id) VALUES (?, ?, ?, ?);"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 print("[db] insert prepare failed: \(String(cString: sqlite3_errmsg(db)))")
                 return
@@ -66,6 +113,7 @@ final class Database {
             sqlite3_bind_double(stmt, 1, latitude)
             sqlite3_bind_double(stmt, 2, longitude)
             sqlite3_bind_text(stmt, 3, iso, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 4, deviceId, -1, SQLITE_TRANSIENT)
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 print("[db] insert step failed: \(String(cString: sqlite3_errmsg(db)))")
@@ -78,7 +126,7 @@ final class Database {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
-            let sql = "SELECT id, latitude, longitude, created_at FROM points ORDER BY id ASC LIMIT ?;"
+            let sql = "SELECT id, latitude, longitude, created_at, device_id FROM points ORDER BY id ASC LIMIT ?;"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 return []
             }
@@ -89,9 +137,11 @@ final class Database {
                 let id = sqlite3_column_int64(stmt, 0)
                 let lat = sqlite3_column_double(stmt, 1)
                 let lng = sqlite3_column_double(stmt, 2)
-                let cstr = sqlite3_column_text(stmt, 3)
-                let iso = cstr != nil ? String(cString: cstr!) : ""
-                result.append(LocalPoint(id: id, latitude: lat, longitude: lng, createdAt: iso))
+                let cstrIso = sqlite3_column_text(stmt, 3)
+                let iso = cstrIso != nil ? String(cString: cstrIso!) : ""
+                let cstrDev = sqlite3_column_text(stmt, 4)
+                let dev = cstrDev != nil ? String(cString: cstrDev!) : ""
+                result.append(LocalPoint(id: id, latitude: lat, longitude: lng, createdAt: iso, deviceId: dev))
             }
             return result
         }

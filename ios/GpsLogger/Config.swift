@@ -2,14 +2,29 @@ import Foundation
 import CoreLocation
 
 enum Config {
-    /// Backend base URL.
+    /// Default backend base URL, used when no override has been stored.
     /// - **iOS Simulator**: `http://localhost:3000` works out of the box —
     ///   the simulator shares the Mac's network stack.
-    /// - **Physical iPhone**: replace with your Mac's LAN IP
-    ///   (System Settings → Network → Wi-Fi → Details → TCP/IP),
-    ///   e.g. `http://192.168.1.25:3000`. Mac and iPhone must share the
-    ///   same Wi-Fi. If you move to a different network, update this value.
-    static let apiBaseURL = URL(string: "http://localhost:3000")!
+    /// - **Physical iPhone**: copy `GpsLogger.xcconfig.example` and set your
+    ///   Mac's LAN IP, or override at runtime via `UserDefaults` under the
+    ///   key returned by `apiBaseURLKey`.
+    static let defaultApiBaseURL = URL(string: "http://localhost:3000")!
+
+    /// UserDefaults key holding the runtime-configurable backend URL.
+    /// Stored as a raw string so it can be edited via `defaults write` for
+    /// quick re-pointing during development without a rebuild.
+    static let apiBaseURLKey = "apiBaseURL"
+
+    /// Effective backend URL. Read at every call site so changing the
+    /// UserDefaults value takes effect on the next sync tick without a restart.
+    static var apiBaseURL: URL {
+        if let raw = UserDefaults.standard.string(forKey: apiBaseURLKey),
+           let url = URL(string: raw),
+           url.scheme != nil {
+            return url
+        }
+        return defaultApiBaseURL
+    }
 
     /// Sync timer interval. Spec allows 30–60s.
     static let syncIntervalSeconds: TimeInterval = 30
@@ -19,4 +34,44 @@ enum Config {
 
     /// Minimum distance between saved points, in meters.
     static let minDistanceMeters: CLLocationDistance = 10
+
+    /// Primary quality signal: discard any fix whose reported horizontal
+    /// accuracy is worse than this. 50 m is a practical ceiling — indoor /
+    /// urban-canyon fixes worse than this are almost always unusable, while
+    /// legitimate outdoor fixes are normally well under 30 m. This single
+    /// rule is the most reliable defense against GPS noise and is
+    /// movement-type agnostic (works identically for walking, driving, trains).
+    static let maxHorizontalAccuracyMeters: CLLocationDistance = 50
+
+    /// Extremely relaxed speed ceiling, used **only** to catch teleport-class
+    /// glitches (impossible physics), never to gate normal movement.
+    /// 500 km/h ≈ 138.9 m/s comfortably covers any real surface transport:
+    ///   - walking / running: ~5 km/h
+    ///   - urban driving:     ~50 km/h
+    ///   - highway:           ~130 km/h
+    ///   - high-speed rail:   ~300–350 km/h (Shinkansen, TGV, AVE)
+    ///   - maglev:            ~430 km/h (Shanghai)
+    /// Anything above 500 km/h on a phone implies a hardware or fusion glitch,
+    /// not real movement. Intentionally chosen *not* to match any transport
+    /// mode so it cannot produce false negatives against legitimate users.
+    static let maxPlausibleSpeedMps: CLLocationSpeed = 500.0 * 1000.0 / 3600.0
+
+    /// A new point farther than this from the last accepted point is treated
+    /// as *suspicious* and held back one tick, waiting for the next fix to
+    /// confirm or reject it (A → B → C spike pattern, see `LocationFilter`).
+    ///
+    /// Intentionally sized so normal movement **never** triggers buffering,
+    /// including high-speed rail:
+    ///   - 350 km/h ≈ 97 m/s → 5 s sample delta ≈ 485 m (< 750 m)
+    ///   - 130 km/h ≈ 36 m/s → 5 s sample delta ≈ 180 m (< 750 m)
+    /// Only genuine teleports (several hundred meters into an unrelated
+    /// street, with no real motion to explain them) cross this threshold.
+    static let spikeJumpMeters: CLLocationDistance = 750
+
+    /// Companion to `spikeJumpMeters`: if — after a suspicious point was
+    /// buffered — the *next* fix lands within this radius of the last
+    /// accepted point, the buffered one is confirmed as a spike and dropped
+    /// (classic A → B(far) → C(near A) return pattern). Scaled proportionally
+    /// to `spikeJumpMeters` so fast travel can't accidentally satisfy it.
+    static let spikeReturnMeters: CLLocationDistance = 100
 }

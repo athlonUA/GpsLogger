@@ -15,8 +15,9 @@ export interface Point {
 //   the frontend container's own nginx, which proxies to the backend service.
 const BASE = (import.meta.env.VITE_API_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
 
-export async function fetchPoints(from: Date, to: Date): Promise<Point[]> {
+export async function fetchPoints(deviceId: string, from: Date, to: Date): Promise<Point[]> {
   const qs = new URLSearchParams({
+    device_id: deviceId,
     from: from.toISOString(),
     to: to.toISOString(),
   });

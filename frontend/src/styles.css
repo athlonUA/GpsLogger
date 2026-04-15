@@ -66,7 +66,8 @@ body,
   color: var(--text-muted);
 }
 
-.panel input[type="datetime-local"] {
+.panel input[type="datetime-local"],
+.panel input[type="text"] {
   appearance: none;
   -webkit-appearance: none;
   padding: 8px 12px;
@@ -85,14 +86,41 @@ body,
   min-width: 180px;
 }
 
-.panel input[type="datetime-local"]:hover {
+.panel input[type="datetime-local"]:hover,
+.panel input[type="text"]:hover {
   background: #f1f5f9;
 }
 
-.panel input[type="datetime-local"]:focus {
+.panel input[type="datetime-local"]:focus,
+.panel input[type="text"]:focus {
   background: #ffffff;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.08);
+}
+
+.panel label.device-id-label input[type="text"] {
+  min-width: 260px;
+  font-family: "SF Mono", Menlo, ui-monospace, monospace;
+  font-size: 13px;
+  letter-spacing: -0.01em;
+}
+
+.panel .panel__logout {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+}
+
+.panel .panel__logout:hover:not(:disabled) {
+  background: #f1f5f9;
+  color: var(--text);
+}
+
+.panel .panel__logout:disabled {
+  background: transparent;
+  color: var(--accent-disabled);
+  border-color: var(--border);
+  cursor: not-allowed;
 }
 
 .panel button {

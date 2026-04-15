@@ -1,4 +1,9 @@
 export const MAX_BATCH = 1000;
+export const MAX_DEVICE_ID_LEN = 128;
+
+function isValidDeviceId(v) {
+  return typeof v === 'string' && v.length > 0 && v.length <= MAX_DEVICE_ID_LEN;
+}
 
 export function validateBatch(body) {
   if (!Array.isArray(body)) {
@@ -17,7 +22,7 @@ export function validateBatch(body) {
     if (!raw || typeof raw !== 'object') {
       return { ok: false, error: `points[${i}]: must be an object` };
     }
-    const { latitude, longitude, created_at } = raw;
+    const { latitude, longitude, created_at, device_id } = raw;
 
     if (typeof latitude !== 'number' || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
       return { ok: false, error: `points[${i}].latitude: must be a finite number in [-90, 90]` };
@@ -32,14 +37,26 @@ export function validateBatch(body) {
     if (Number.isNaN(ts.getTime())) {
       return { ok: false, error: `points[${i}].created_at: invalid date` };
     }
+    if (!isValidDeviceId(device_id)) {
+      return { ok: false, error: `points[${i}].device_id: must be a non-empty string up to ${MAX_DEVICE_ID_LEN} chars` };
+    }
 
-    points[i] = { latitude, longitude, created_at: ts };
+    points[i] = { latitude, longitude, created_at: ts, device_id };
   }
   return { ok: true, points };
 }
 
 export function validateRange(query) {
   const out = {};
+
+  // device_id is required: GET /points is always scoped to a specific device
+  // so an unauthenticated caller cannot enumerate the full dataset by
+  // omitting filters.
+  if (!isValidDeviceId(query.device_id)) {
+    return { ok: false, error: 'device_id: required, non-empty string' };
+  }
+  out.device_id = query.device_id;
+
   if (query.from !== undefined) {
     if (typeof query.from !== 'string') return { ok: false, error: 'from: must be an ISO string' };
     const d = new Date(query.from);

@@ -68,6 +68,7 @@ final class SyncService {
                 "latitude": p.latitude,
                 "longitude": p.longitude,
                 "created_at": p.createdAt,
+                "device_id": p.deviceId,
             ]
         }
 
