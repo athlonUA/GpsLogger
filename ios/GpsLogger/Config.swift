@@ -2,12 +2,9 @@ import Foundation
 import CoreLocation
 
 enum Config {
-    /// Default backend base URL, used when no override has been stored.
-    /// - **iOS Simulator**: `http://localhost:3000` works out of the box —
-    ///   the simulator shares the Mac's network stack.
-    /// - **Physical iPhone**: copy `GpsLogger.xcconfig.example` and set your
-    ///   Mac's LAN IP, or override at runtime via `UserDefaults` under the
-    ///   key returned by `apiBaseURLKey`.
+    /// Simulator-friendly fallback for `apiBaseURL`. The iOS Simulator
+    /// shares the Mac's network stack, so `http://localhost:3000` reaches
+    /// the docker-compose backend without any configuration.
     static let defaultApiBaseURL = URL(string: "http://localhost:3000")!
 
     /// UserDefaults key holding the runtime-configurable backend URL.
@@ -15,10 +12,30 @@ enum Config {
     /// quick re-pointing during development without a rebuild.
     static let apiBaseURLKey = "apiBaseURL"
 
-    /// Effective backend URL. Read at every call site so changing the
-    /// UserDefaults value takes effect on the next sync tick without a restart.
+    /// Info.plist key populated at build time from the gitignored
+    /// `GpsLogger.xcconfig` (`API_BASE_URL = http://<LAN-IP>:3000`). This
+    /// is the path that keeps personal LAN IPs out of git while producing
+    /// a self-contained physical-device build.
+    static let apiBaseURLInfoKey = "API_BASE_URL"
+
+    /// Effective backend URL. Resolution order:
+    ///   1. Runtime override via `UserDefaults` (for re-pointing the app
+    ///      between hosts without rebuilding — `defaults write` the key
+    ///      above from the Simulator or via a dev hook on device).
+    ///   2. Build-time value from `Info.plist["API_BASE_URL"]`, populated
+    ///      by `$(API_BASE_URL)` substitution from the gitignored xcconfig.
+    ///      This is what the on-device build relies on in normal operation.
+    ///   3. Simulator fallback `defaultApiBaseURL` (localhost:3000).
+    /// Read at every call site so the UserDefaults override takes effect
+    /// on the next sync tick without a restart.
     static var apiBaseURL: URL {
         if let raw = UserDefaults.standard.string(forKey: apiBaseURLKey),
+           let url = URL(string: raw),
+           url.scheme != nil {
+            return url
+        }
+        if let raw = Bundle.main.object(forInfoDictionaryKey: apiBaseURLInfoKey) as? String,
+           !raw.isEmpty,
            let url = URL(string: raw),
            url.scheme != nil {
             return url

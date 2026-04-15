@@ -1,17 +1,34 @@
-// Local signing config for the iOS target.
+// Local signing + backend config for the iOS target.
 //
 // Copy this file to GpsLogger.xcconfig (which is gitignored) and fill in
-// your own Apple Developer Team ID. The xcodegen-generated .xcodeproj
-// pulls DEVELOPMENT_TEAM from the xcconfig so nothing personal ends up
-// in git.
+// your own values. The xcodegen-generated .xcodeproj pulls these
+// through so nothing personal ends up in git.
+//
+// --- Signing ---
 //
 // Find your team ID via one of:
 //   security find-identity -p codesigning -v
 //     (the 10-character value in parentheses after your email)
-//
 //   Xcode → Settings → Accounts → select your Apple ID → Team ID column
+//
+// --- Backend URL ---
+//
+// Mac's LAN IP where the docker-compose backend is listening. Baked into
+// Info.plist at build time and read by Config.apiBaseURL on launch.
+//
+//   Simulator: can stay http://localhost:3000 (shares the Mac network stack).
+//   Physical iPhone: must be a routable LAN IP — find it via
+//     System Settings → Network → Wi-Fi → Details → TCP/IP,
+//     or from the terminal: ipconfig getifaddr en0
+//
+// NOTE: xcconfig files treat `//` as the start of a line comment, so a
+// literal "http://" must be escaped as `http:/$()/` — the `$()` is an
+// empty variable expansion that breaks up the `//` sequence. After
+// xcconfig processing, the value becomes `http://...` exactly as you'd
+// expect.
 //
 // After editing, re-run `xcodegen generate` in the `ios/` directory to
 // refresh the .xcodeproj.
 
 DEVELOPMENT_TEAM = YOUR_APPLE_TEAM_ID
+API_BASE_URL = http:/$()/YOUR_MAC_LAN_IP:3000

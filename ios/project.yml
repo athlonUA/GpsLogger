@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.1.0"
-    CURRENT_PROJECT_VERSION: "3"
+    MARKETING_VERSION: "1.1.1"
+    CURRENT_PROJECT_VERSION: "4"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
 targets:
@@ -30,8 +30,8 @@ targets:
       path: GpsLogger/Info-generated.plist
       properties:
         CFBundleDisplayName: GpsLogger
-        CFBundleShortVersionString: "1.1.0"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "1.1.1"
+        CFBundleVersion: "4"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
@@ -44,14 +44,21 @@ targets:
           - location
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # Baked in from $(API_BASE_URL) in the gitignored xcconfig. Xcode
+        # substitutes the value during ProcessInfoPlistFile, and
+        # Config.apiBaseURL reads it from Bundle.main at launch. Keeps
+        # personal LAN IPs out of git while producing a self-contained
+        # physical-device build.
+        API_BASE_URL: $(API_BASE_URL)
 
     entitlements:
       path: GpsLogger/GpsLogger.entitlements
       properties: {}
 
-    # DEVELOPMENT_TEAM is provided by the gitignored GpsLogger.xcconfig file.
-    # Copy GpsLogger.xcconfig.example to GpsLogger.xcconfig and fill in your
-    # team ID, then re-run `xcodegen generate` in this directory.
+    # DEVELOPMENT_TEAM and API_BASE_URL are provided by the gitignored
+    # GpsLogger.xcconfig file. Copy GpsLogger.xcconfig.example to
+    # GpsLogger.xcconfig, fill in your team ID and your Mac's LAN IP, then
+    # re-run `xcodegen generate` in this directory.
     configFiles:
       Debug: GpsLogger.xcconfig
       Release: GpsLogger.xcconfig
