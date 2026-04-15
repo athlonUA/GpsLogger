@@ -149,29 +149,27 @@ Short version:
 
 ## Architecture summary
 
-```
-┌──────────────┐    HTTP batches     ┌───────────────┐       ┌──────────────┐
-│  iOS app     │ ───────────────────▶│  Express API  │ ────▶ │ Postgres 16  │
-│ (SwiftUI +   │   every 30s          │  POST /points │       │    points    │
-│ CoreLocation │                      │  GET  /points │◀───── │              │
-│ + SQLite)    │                      └───────────────┘       └──────────────┘
-└──────────────┘                              ▲
-                                              │
-                                    (service: backend:3000)
-                                              │
-                                      ┌───────┴────────┐
-                                      │ nginx          │   /api/* → backend
-                                      │ (frontend      │   /      → built SPA
-                                      │  container)    │
-                                      └───────┬────────┘
-                                              │
-                                              │ browser (localhost:3001)
-                                              ▼
-                                      ┌────────────────┐
-                                      │  React app     │
-                                      │ (Leaflet +     │
-                                      │  gradient line)│
-                                      └────────────────┘
+```mermaid
+flowchart LR
+    iOS(["iOS app<br/>SwiftUI · CoreLocation · sqlite3"])
+    browser(["Browser<br/>localhost:3001"])
+
+    subgraph compose["docker-compose stack"]
+        direction LR
+        nginx["nginx<br/>frontend container"]
+        backend["Express API<br/>POST /points<br/>GET /points"]
+        db[("Postgres 16<br/>points")]
+        dbbackup["db-backup<br/>pg_dump -Fc daily<br/>7-day retention"]
+    end
+
+    iOS -->|HTTP batches every 30s| backend
+    browser -->|static SPA request| nginx
+    nginx -->|built files| browser
+    browser -->|"GET /api/*"| nginx
+    nginx -->|"reverse proxy /api/*"| backend
+    backend --> db
+    db --> backend
+    dbbackup -->|nightly dump| db
 ```
 
 ### iOS — collection rules
