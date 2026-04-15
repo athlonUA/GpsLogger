@@ -5,9 +5,11 @@ import Combine
 /// Thin wrapper around CLLocationManager.
 ///
 /// - No timers. Points are stored purely in response to CoreLocation callbacks.
-/// - Raw CLLocation samples pass through `LocationFilter` before reaching the
-///   database (accuracy gate, min-distance gate, relaxed-speed gate, spike
-///   buffer — see `LocationFilter.swift`).
+/// - Raw CLLocation samples pass through `LocationFilter` first (accuracy
+///   gate, min-distance gate, relaxed-speed gate, spike buffer — see
+///   `LocationFilter.swift`), then through `StationaryDetector`, which
+///   suppresses stationary-jitter clusters without touching the coordinates
+///   themselves.
 /// - Always-on: `start()` is invoked once during container bootstrap and the
 ///   tracker runs for the full app lifetime. There is no user-facing Stop;
 ///   CoreLocation only ceases when the OS terminates the process.
@@ -23,6 +25,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private let deviceId: String
 
     private var filter = LocationFilter()
+    private var stationary = StationaryDetector()
 
     init(database: Database, appState: AppState, deviceId: String) {
         self.database = database
@@ -76,6 +79,21 @@ final class LocationTracker: NSObject, ObservableObject {
         }
     }
 
+    /// Persist with a final stationary-jitter gate. Every accept path from
+    /// `LocationFilter` funnels through here so stationary suppression is
+    /// applied uniformly to direct accepts, spike replacements, and
+    /// committed-pending emissions.
+    private func maybePersist(_ loc: CLLocation) {
+        switch stationary.consume(loc) {
+        case .accept:
+            persist(loc)
+        case .suppress:
+            #if DEBUG
+            print("[tracker] suppress stationary @ \(loc.coordinate.latitude),\(loc.coordinate.longitude)")
+            #endif
+        }
+    }
+
     private func logDiscard(_ reason: LocationFilter.Reason, _ loc: CLLocation) {
         #if DEBUG
         let coord = "\(loc.coordinate.latitude),\(loc.coordinate.longitude)"
@@ -113,7 +131,7 @@ extension LocationTracker: CLLocationManagerDelegate {
         for loc in locations {
             switch filter.consume(loc) {
             case .accept(let accepted):
-                persist(accepted)
+                maybePersist(accepted)
 
             case .buffered:
                 break // waiting for next fix to confirm
@@ -126,13 +144,13 @@ extension LocationTracker: CLLocationManagerDelegate {
                 print("[tracker] discard spike @ \(dropped.coordinate.latitude),\(dropped.coordinate.longitude)")
                 #endif
                 if let accepted = accepted {
-                    persist(accepted)
+                    maybePersist(accepted)
                 }
 
             case .committedPending(let pending, let alsoAccept):
-                persist(pending)
+                maybePersist(pending)
                 if let alsoAccept = alsoAccept {
-                    persist(alsoAccept)
+                    maybePersist(alsoAccept)
                 }
             }
         }

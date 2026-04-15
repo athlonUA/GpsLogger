@@ -74,4 +74,25 @@ enum Config {
     /// (classic A → B(far) → C(near A) return pattern). Scaled proportionally
     /// to `spikeJumpMeters` so fast travel can't accidentally satisfy it.
     static let spikeReturnMeters: CLLocationDistance = 100
+
+    /// Stationary detection — how long a candidate cluster must persist before
+    /// we declare the user stationary and stop recording further points.
+    /// 150 s (2.5 min) is long enough that genuine short stops (traffic lights,
+    /// pedestrian crossings) never trigger it, but short enough that sitting
+    /// indoors gets suppressed quickly.
+    static let stationaryWindowSeconds: TimeInterval = 150
+
+    /// Radius of the stationary cluster. While the user is not yet classified
+    /// as stationary, each new accepted fix must fall within this distance of
+    /// the candidate anchor to extend the cluster. A fix outside this radius
+    /// resets the candidate to itself (i.e., restarts the clock). 20 m is
+    /// comfortably above typical indoor GPS jitter (~5–15 m) while still
+    /// rejecting true walking.
+    static let stationaryRadiusMeters: CLLocationDistance = 20
+
+    /// Exit threshold — once stationary, a new fix farther than this from the
+    /// cluster center resumes normal recording. Strictly greater than
+    /// `stationaryRadiusMeters` so a single borderline jitter point can't
+    /// toggle the mode. 30 m adds ~10 m of hysteresis.
+    static let stationaryResumeMeters: CLLocationDistance = 30
 }
