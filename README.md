@@ -463,7 +463,8 @@ GpsLogger/
 │   ├── migrations/
 │   │   ├── 001_init.sql
 │   │   ├── 002_device_id.sql
-│   │   └── 003_fix_diagnostics.sql
+│   │   ├── 003_fix_diagnostics.sql
+│   │   └── 004_idempotency.sql
 │   ├── src/{index,db,validate}.js
 │   ├── src/routes/{points,diagnostics}.js
 │   └── test/validate.test.js

@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS LocationFilter unit tests
+### iOS unit tests (41 cases across 4 test files)
 
 ```
 cd ios
@@ -13,26 +13,82 @@ xcodebuild test -project GpsLogger.xcodeproj -scheme GpsLoggerTests \
     -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
-Covers `LocationFilter` end-to-end — every gate in the filter pipeline:
+**`LocationFilterTests` (15 cases)** — every gate in the filter
+pipeline end-to-end:
 
 - validity gate (negative `horizontalAccuracy` → discard `.invalidFix`)
 - **source gate** (GPS-origin detection via `speed` and `verticalAccuracy`):
   rejects fixes whose `speed < 0` or `verticalAccuracy ≤ 0`, which is the
   documented sentinel for Wi-Fi / cell-tower fallback fixes that lack Doppler
-  velocity and altitude. This is the load-bearing defense against the
-  "park-canopy teleport" anomaly where CoreLocation falls back to Wi-Fi
-  Positioning and a stale BSSID registration delivers a plausible-looking
-  fix hundreds of meters to kilometers off the true position
+  velocity and altitude. Load-bearing defense against the "park-canopy
+  teleport" anomaly.
+- source gate runs before the accuracy value gate (so a pristine
+  `horizontalAccuracy = 5 m` but `speed = -1` fix is still rejected)
 - accuracy value gate (`horizontalAccuracy > 50 m` → discard `.poorAccuracy`)
 - chronology gate (`Δt ≤ 0` → discard `.staleTimestamp`)
 - implausible-speed gate (500 km/h ceiling)
 - minimum-distance gate (`< 10 m` → discard `.tooClose`)
 - spike buffer (A → B(far > 750 m) → C(near A) → drop B)
-- regression: stationary GPS fix (speed = 0, valid vertical accuracy) must
-  still be accepted — the source gate must not confuse a standing-still user
-  with a network-derived fix
-- regression: a dense burst of Wi-Fi-style fallback fixes leaves `lastAccepted`
-  pinned to the last real GPS fix and never corrupts the spike buffer
+- **pending timeout** (1.2.1): a buffered spike older than
+  `Config.pendingTimeoutSeconds` is dropped silently before the next
+  fix is evaluated, so an app-backgrounding event cannot leave stale
+  spike state across sessions
+- regression: stationary GPS fix (speed = 0, valid vertical accuracy)
+  must still be accepted — the source gate must not confuse a
+  standing-still user with a network-derived fix
+- regression: a dense burst of Wi-Fi-style fallback fixes leaves
+  `lastAccepted` pinned to the last real GPS fix and never corrupts
+  the spike buffer
+
+**`DatabaseTests` (7 cases)** — insert/fetch/delete/retention
+invariants on an in-memory SQLite opened via `Database(path: ":memory:")`:
+
+- `points`: insert 5 → fetch → delete → count == 0
+- `points`: 250-row backlog drains in exactly 3 ticks of 100 each
+- `fix_diagnostics`: log → fetch → delete cycle leaves the store empty
+- `fix_diagnostics`: same 250-row drain cycle
+- **sentinel round-trip**: `speed = -1, vAcc = -1, course = -1` survive
+  the insert/fetch round trip intact (the whole point of the table)
+- **race guard**: rows written *after* a `fetchDiagnosticsBatch` but
+  *before* the matching `deleteDiagnostics(ids:)` are not collaterally
+  deleted — the delete only targets the ids that were in the fetched
+  batch
+- retention: `cleanupDiagnostics(olderThanDays: 3)` does not touch
+  fresh rows, so sync-pending rows can't be pruned from under the
+  upload path
+
+**`MotionClassifierTests` (10 cases)** — the pure static
+`classify(...)` rule that maps CoreMotion flags to the coarse mode:
+
+- low-confidence reading → returns nil so the caller keeps the prior mode
+- each mode (`.automotive`, `.cycling`, `.pedestrian`, `.unknown`) at
+  medium/high confidence
+- running maps to `.pedestrian` (same activityType hint as walking)
+- overlap priority: `automotive > cycling > pedestrian` so a
+  transition moment where CoreMotion briefly reports `automotive &&
+  walking` (e.g. getting out of a car) stays on the vehicle hint
+  until walking is confident-alone
+- stationary/no-activity with high confidence → `.unknown` (caller
+  keeps the prior hint)
+
+**`StationaryDetectorTests` (9 cases)** — Phase-A/B state machine
+plus the 1.2.1 clock-skew guard:
+
+- first fix is accepted and becomes the candidate
+- fixes inside `stationaryRadius` before the window elapses are still
+  forwarded
+- fix outside the radius resets the candidate
+- sustained cluster for ≥ `windowSeconds` transitions into Phase B
+  (suppressing subsequent fixes)
+- Phase B fix inside `resumeRadius` is suppressed
+- Phase B fix beyond `resumeRadius` exits stationary and adopts the
+  new fix as a fresh candidate
+- hysteresis: a fix between `stationaryRadius` and `resumeRadius`
+  stays suppressed (no flapping on a single borderline fix)
+- **negative-age guard** (1.2.1): an anchor timestamp newer than the
+  incoming fix (NTP correction / DST transition / cached replay)
+  resets the candidate instead of stalling the window forever
+- `reset()` clears both candidate and stationaryCenter
 
 ### Backend validator unit tests
 
@@ -94,7 +150,16 @@ curl -fsS -X POST http://localhost:3000/points \
       {"latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00Z", "device_id": "demo"},
       {"latitude": 37.7750, "longitude": -122.4180, "created_at": "2024-01-01T12:00:05Z", "device_id": "demo"}
     ]'
-# → {"inserted":2}
+# → {"inserted":2,"submitted":2}
+
+# idempotency — send the same batch a second time: duplicates skipped
+curl -fsS -X POST http://localhost:3000/points \
+    -H 'Content-Type: application/json' \
+    -d '[
+      {"latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00Z", "device_id": "demo"},
+      {"latitude": 37.7750, "longitude": -122.4180, "created_at": "2024-01-01T12:00:05Z", "device_id": "demo"}
+    ]'
+# → {"inserted":0,"submitted":2}  ← migration 004 unique index + ON CONFLICT DO NOTHING
 
 # read back (device_id is required on the query string)
 curl -fsS 'http://localhost:3000/points?device_id=demo&from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z'
@@ -126,7 +191,7 @@ curl -fsS -X POST http://localhost:3000/diagnostics \
         "device_id": "demo"
       }
     ]'
-# → {"inserted":1}
+# → {"inserted":1,"submitted":1}
 
 # diagnostics — Wi-Fi / cell-tower fallback row (negative sentinels must pass)
 curl -fsS -X POST http://localhost:3000/diagnostics \
@@ -143,7 +208,7 @@ curl -fsS -X POST http://localhost:3000/diagnostics \
         "device_id": "demo"
       }
     ]'
-# → {"inserted":1}
+# → {"inserted":1,"submitted":1}
 
 # bad request — invalid latitude in diagnostics
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3000/diagnostics \
@@ -156,9 +221,12 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3000/diagnost
 
 All scenarios assume:
 
-- `docker-compose up` is running on the Mac
-- iPhone has the app installed via Xcode, backend URL set to Mac's LAN IP
-- iPhone and Mac share the same Wi-Fi
+- `docker-compose up --build` has run on the Mac (migrations 001–004 applied)
+- iPhone has the app installed with `API_BASE_URL` in
+  `ios/GpsLogger.xcconfig` pointing to the Mac's current LAN IP
+- iPhone and Mac share the same Wi-Fi network
+- Location permission is **Always**; Motion & Fitness permission is
+  allowed (both prompts appear on first launch)
 
 > The iOS app is **always-on**: there is no Start/Stop button. Tracking begins
 > in `AppContainer.init` and the pulsing green dot in the top-right corner
@@ -255,6 +323,43 @@ All scenarios assume:
 - Click **Logout**. Expected: device ID and points clear, time range resets,
   status reverts to "Enter device ID to begin". A reload now shows the
   empty initial state.
+
+### 11. Multi-modal activityType swap (MotionClassifier)
+
+- Launch app with **Motion & Fitness** permission granted. Go for a
+  short walk. Then get on a bicycle or into a car/bus/train and stay
+  on it for at least 2 minutes.
+- Expected: while walking, CoreLocation's hint is `.fitness` (startup
+  default). Within ~30–60 s of sustained vehicle motion,
+  `MotionClassifier` sees `automotive` with medium/high confidence
+  and `LocationTracker` swaps `manager.activityType` to
+  `.automotiveNavigation`. In DEBUG builds the console shows
+  `[motion] mode -> automotive` followed by
+  `[tracker] activityType -> 1 (automotive)`.
+- Cross-check via `fix_diagnostics`: after the swap, accepted rows
+  should continue flowing with normal `speed` / `horizontal_accuracy`
+  for vehicle-scale motion. `decision = accept`, no regression.
+- When the trip ends and you step out, the classifier eventually
+  flips back to `.pedestrian` and the hint returns to `.fitness`.
+
+### 12. TrackingImpairment banner
+
+- **permissionDenied**: open Settings → GpsLogger → Location → *Never*.
+  Expected: within a few seconds the app shows an orange banner
+  at the top saying "Location permission denied — open Settings to
+  allow." Counter stops incrementing. Switch back to **Always** —
+  banner disappears, counter resumes, tracking state machine resets
+  internal filter anchors so the first new fix is a clean baseline.
+- **backgroundRequiresAlways**: Settings → GpsLogger → Location →
+  *While Using the App*. Expected: banner "Background tracking needs
+  Always permission." Foreground tracking still works; background
+  tracking silently drops (this is the whole reason the banner
+  exists — tell the user before their trip has gaps). Restore
+  **Always** to clear.
+- **motionPermissionDenied**: Settings → GpsLogger → Motion & Fitness
+  off. Expected: banner "Motion sensing off — vehicle mode will not
+  engage." The app still records everything correctly, but
+  `activityType` stays on `.fitness` regardless of real mode.
 
 ## Inspecting fix_diagnostics after an anomaly
 

@@ -14,80 +14,62 @@ to the backend. Uses raw `sqlite3` (system library) — no external Swift packag
 
 ```
 ios/
-├── README.md                      ← this file
-├── project.yml                    ← xcodegen spec
-├── GpsLogger.xcconfig.example     ← template for local signing config
-└── GpsLogger/
-    ├── GpsLoggerApp.swift         ← @main entry
-    ├── AppContainer.swift         ← dependency wiring (singleton)
-    ├── AppState.swift             ← @Published counter + device ID
-    ├── ContentView.swift          ← UI (counter + device ID row + status dot)
-    ├── LocationTracker.swift      ← CLLocationManager wrapper, always-on
-    ├── LocationFilter.swift       ← accuracy / speed / spike gates
-    ├── StationaryDetector.swift   ← jitter-cluster suppression
-    ├── DeviceIdentity.swift       ← Keychain-backed UUID (UserDefaults fallback)
-    ├── SyncService.swift          ← sync timer + HTTP upload
-    ├── Database.swift             ← raw sqlite3 wrapper
-    ├── MotionClassifier.swift     ← CMMotionActivityManager wrapper, emits transport mode
-    ├── Config.swift               ← tunables + apiBaseURL resolver (xcconfig → Info.plist → fallback)
-    ├── GpsLogger.entitlements
-    └── Info.plist                 ← reference plist with required keys
+├── README.md                           ← this file
+├── project.yml                         ← xcodegen spec (app + test target)
+├── GpsLogger.xcconfig.example          ← template for DEVELOPMENT_TEAM + API_BASE_URL
+├── GpsLogger/
+│   ├── GpsLoggerApp.swift              ← @main entry
+│   ├── AppContainer.swift              ← dependency wiring (singleton)
+│   ├── AppState.swift                  ← @Published counter + device ID
+│   ├── ContentView.swift               ← UI (counter, device ID row, status dot, impairment banner)
+│   ├── LocationTracker.swift           ← CLLocationManager delegate + pipeline + activityType swap
+│   ├── LocationFilter.swift            ← validity → source → accuracy → speed → spike → min-distance
+│   ├── StationaryDetector.swift        ← jitter-cluster suppression + clock-skew guard
+│   ├── MotionClassifier.swift          ← CMMotionActivityManager wrapper, emits transport mode
+│   ├── DeviceIdentity.swift            ← Keychain-backed UUID (UserDefaults fallback)
+│   ├── SyncService.swift               ← sync timer + private syncQueue + HTTP upload
+│   ├── Database.swift                  ← raw sqlite3 wrapper (points + fix_diagnostics)
+│   ├── Config.swift                    ← tunables + apiBaseURL resolver
+│   ├── GpsLogger.entitlements
+│   └── Info.plist                      ← reference plist with required keys
+└── GpsLoggerTests/
+    ├── LocationFilterTests.swift       ← 15 cases covering every filter gate + pending-timeout
+    ├── DatabaseTests.swift              ← 7 cases for insert/fetch/delete/retention invariants
+    ├── MotionClassifierTests.swift     ← 10 cases for the pure classification rules
+    └── StationaryDetectorTests.swift    ← 9 cases for Phase-A/B state machine + clock-skew guard
 ```
 
-## One-time Xcode setup
+## One-time setup (xcodegen-based)
 
-### 1. Create an Xcode project
+The repo is **xcodegen-driven**: the `.xcodeproj` is generated from
+`project.yml` on every build. You do not create an Xcode project by
+hand; you edit a single config file and run `xcodegen generate`. All
+Info.plist keys, background modes, target membership, test target, and
+entitlements are specified in `project.yml` and
+`GpsLogger.xcconfig.example` — nothing needs to be clicked through in
+Xcode's GUI.
 
-1. **Xcode → File → New → Project…**
-2. **iOS → App**
-3. Product Name: `GpsLogger`
-4. Organization Identifier: anything unique (e.g. `com.yourname.gpslogger`)
-5. Interface: **SwiftUI** / Language: **Swift** / Storage: **None**
-6. Leave tests unchecked.
-7. Save the project at e.g. `~/Projects/GpsLogger/ios-xcode/`
-   (keeping it **outside** the `ios/GpsLogger` source folder keeps the repo clean).
+Prerequisite (one-time): `brew install xcodegen`.
 
-### 2. Replace the template source files
+### 1. Clone the repo
 
-In the Xcode project navigator, **delete** the two files Xcode generated:
+```bash
+git clone https://github.com/<you>/GpsLogger.git
+cd GpsLogger/ios
+```
 
-- `ContentView.swift`
-- `GpsLoggerApp.swift`
+### 2. Create the local personal config file
 
-Then drag all `.swift` files from `ios/GpsLogger/` into the Xcode project
-(currently 11: `GpsLoggerApp`, `AppContainer`, `AppState`, `ContentView`,
-`LocationTracker`, `LocationFilter`, `StationaryDetector`, `DeviceIdentity`,
-`SyncService`, `Database`, `Config`).
-In the dialog:
+Copy the committed template to the gitignored real file:
 
-- ✅ **Copy items if needed** (uncheck if you want Xcode to reference the files in-place)
-- ✅ **Create groups**
-- ✅ Add to the `GpsLogger` target
+```bash
+cp GpsLogger.xcconfig.example GpsLogger.xcconfig
+```
 
-### 3. Configure Info.plist
+Then edit `GpsLogger.xcconfig` and fill in two values — see
+**section 3. Set the backend URL** below for details on both.
 
-Open `ios/GpsLogger/Info.plist` (in this repo) and copy its keys into your project's
-Info tab:
-
-**Target → Info → Custom iOS Target Properties → +**
-
-| Key | Type | Value |
-|---|---|---|
-| `NSLocationAlwaysAndWhenInUseUsageDescription` | String | `GpsLogger records your location in the background to log your trip.` |
-| `NSLocationWhenInUseUsageDescription` | String | `GpsLogger records your current position to log your trip.` |
-| `App Transport Security Settings` | Dictionary | — |
-| &nbsp;&nbsp;↳ `Allow Arbitrary Loads` | Boolean | `YES` |
-
-> The ATS exception is **dev-only** so the app can reach your LAN backend over plain
-> HTTP. Remove it and use HTTPS in production.
-
-### 4. Enable Background Modes
-
-**Target → Signing & Capabilities → + Capability → Background Modes**
-
-Check: **Location updates**
-
-### 5. Set the backend URL
+### 3. Set the backend URL
 
 `Config.apiBaseURL` resolves the backend base URL at every call site in
 this order:
@@ -141,20 +123,9 @@ the output, the xcconfig wasn't picked up — re-run `xcodegen generate`
 and make sure `GpsLogger.xcconfig` is present (not just the
 `.example` template).
 
-### 6. Local personal config (signing team + backend URL)
+### 4. Fill in the two xcconfig values
 
-Everything personal lives in a single **gitignored** file,
-`ios/GpsLogger.xcconfig`, which you create once from the committed
-template:
-
-```bash
-cd ios
-cp GpsLogger.xcconfig.example GpsLogger.xcconfig
-# then edit GpsLogger.xcconfig
-xcodegen generate
-```
-
-Two settings to fill in:
+`GpsLogger.xcconfig` has exactly two personal settings:
 
 - **`DEVELOPMENT_TEAM`** — your Apple Developer Team ID, used by
   `xcodebuild` to sign for a real device. Find it via:
@@ -164,34 +135,87 @@ Two settings to fill in:
   ```
   (or Xcode → Settings → Accounts → *Team ID* column).
 
-- **`API_BASE_URL`** — your Mac's LAN IP + backend port, for the
-  physical-device build (see section 5 above). Remember the
-  `http:/$()/` escape for the `//` sequence.
-
-The iOS target's `configFiles` in `project.yml` points Debug and
-Release at this file, and `project.yml`'s info.properties block
-references `$(API_BASE_URL)` so it lands in the bundled `Info.plist`.
-After editing the xcconfig, always re-run `xcodegen generate` to
-refresh the `.xcodeproj`.
+- **`API_BASE_URL`** — your Mac's LAN IP + backend port, as covered in
+  section 3 above. Remember the `http:/$()/` escape for the `//`
+  sequence.
 
 Without this file, `xcodegen generate` still works, but `xcodebuild`
 will refuse to sign for a real device, and the built bundle will fall
 back to `http://localhost:3000` — which only reaches the backend on
-the simulator.
+the Simulator.
 
-### 7. Deploy to your iPhone (free Apple ID)
+### 5. Generate the Xcode project
+
+```bash
+cd ios
+xcodegen generate
+```
+
+Look for:
+
+```
+Generating plists...
+Generating project...
+Writing project...
+Created project at …/GpsLogger.xcodeproj
+```
+
+`project.yml` is the source of truth: it declares the app target, the
+unit-test target, all Info.plist keys
+(`NSLocationAlwaysAndWhenInUseUsageDescription`,
+`NSLocationWhenInUseUsageDescription`, `NSMotionUsageDescription`,
+`NSAllowsLocalNetworking`), background modes, signing config, and the
+`$(API_BASE_URL)` substitution into the Info.plist. Nothing has to be
+configured manually in Xcode.
+
+Re-run `xcodegen generate` every time you change `project.yml` or
+`GpsLogger.xcconfig` — editing those files alone does not refresh the
+`.xcodeproj`.
+
+### 6. Deploy to your iPhone (free Apple ID)
+
+Two paths, both supported and tested. Pick whichever is faster for you.
+
+**GUI path (simplest first time):**
 
 1. **Xcode → Settings → Accounts → +** add your Apple ID.
-2. Select the target → **Signing & Capabilities** → set **Team** to your Personal Team.
-3. Connect your iPhone (USB or Wi-Fi pairing).
-4. Select the iPhone in the device picker next to the Run button.
-5. Press ▶ **Run**.
-6. First time: on your iPhone, go to
-   **Settings → General → VPN & Device Management** and trust the developer profile.
-7. Launch the app.
+2. Open `ios/GpsLogger.xcodeproj` in Xcode.
+3. Select the target → **Signing & Capabilities** → set **Team** to
+   your Personal Team (it inherits `DEVELOPMENT_TEAM` from the
+   xcconfig automatically).
+4. Connect your iPhone (USB or Wi-Fi pairing).
+5. Select the iPhone in the device picker next to the Run button.
+6. Press ▶ **Run**.
+7. First time on each device: **Settings → General → VPN & Device
+   Management** on the iPhone, trust the developer profile.
 
-> Free Apple ID provisioning profiles expire after **7 days**. When that happens,
-> connect the iPhone to Xcode and hit Run again to refresh.
+**CLI path (for iteration / scripting):**
+
+```bash
+cd ios
+
+# iPhone with iOS 17+ — CoreDevice / devicectl:
+UDID=<your-udid>              # xcrun xctrace list devices
+xcodebuild build -project GpsLogger.xcodeproj -scheme GpsLogger \
+    -destination "id=$UDID" -configuration Debug
+APP=$(find ~/Library/Developer/Xcode/DerivedData/GpsLogger-*/Build/Products/Debug-iphoneos \
+    -maxdepth 1 -name "GpsLogger.app" | head -1)
+xcrun devicectl device install app --device "$UDID" "$APP"
+xcrun devicectl device process launch --device "$UDID" com.gpslogger.personal
+
+# iPhone with iOS 16.x — ios-deploy (CoreDevice only supports 17+):
+brew install ios-deploy     # one-time
+ios-deploy --id <udid-hex> --bundle "$APP" --no-wifi
+```
+
+Building against a UDID in `-destination` auto-registers the device
+into your Personal Team provisioning profile, so one `.app` bundle
+covers every device you've built for.
+
+> Free Apple ID provisioning profiles expire after **7 days**. When
+> that happens, re-run `xcodegen generate && xcodebuild build ...` and
+> reinstall. On the Personal Team, you are limited to 3 registered
+> devices at a time.
 
 ## Usage
 
@@ -212,29 +236,82 @@ the simulator.
 ## How it works
 
 - **Collection**: `CLLocationManager` with `kCLLocationAccuracyBest`,
-  `activityType = .fitness` (pedestrian-appropriate hint to CoreLocation's
-  fusion engine), `distanceFilter = 10`,
-  `pausesLocationUpdatesAutomatically = false`,
-  `allowsBackgroundLocationUpdates = true`. Points are saved **only** from
-  `didUpdateLocations` callbacks — no timers are used for collection. The
-  tracker is started in `AppContainer.init` and runs for the lifetime of the
-  app; there is no Start/Stop button.
-- **Filter pipeline** (in order; a fix must pass all three to be inserted):
-  1. `CLLocationManager.distanceFilter = 10 m` and a defensive per-insert
-     distance check.
-  2. `LocationFilter` — drops fixes with `horizontalAccuracy > 50 m`; rejects
-     any fix whose `speed < 0` or `verticalAccuracy ≤ 0` as **non-GPS**
-     (Wi-Fi / cell-tower fallback fixes leave those fields at the sentinel
-     negatives because network positioning has no Doppler velocity and no
-     altitude — this is the load-bearing defense against stale BSSID
-     registrations in Apple's Wi-Fi Positioning database delivering
-     plausible-looking-but-wrong fixes in degraded-signal environments);
-     rejects implied speeds > 500 km/h; and buffers any > 750 m jump for one
-     tick to catch A → B(far) → C(near A) spike patterns.
-  3. `StationaryDetector` — once accepted fixes stay within 20 m of a
-     candidate anchor for 150 s, suppresses subsequent fixes until one lands
-     more than 30 m from the cluster center. Coordinates are never smoothed,
-     only accept/suppress decisions are made.
+  `distanceFilter = 10`, `pausesLocationUpdatesAutomatically = false`,
+  `allowsBackgroundLocationUpdates = true`. Points are saved **only**
+  from `didUpdateLocations` callbacks — no timers are used for
+  collection. The tracker is started in `AppContainer.init` and runs
+  for the lifetime of the app; there is no Start/Stop button.
+- **Multi-modal `activityType`**: a single install covers walking,
+  cycling, and motorized transport (car, bus, train) through
+  `MotionClassifier`. It wraps `CMMotionActivityManager` — which reads
+  the phone's accelerometer/gyroscope, not GPS speed — and emits a
+  coarse mode (`.pedestrian`, `.cycling`, `.automotive`, `.unknown`)
+  that `LocationTracker.apply(mode:)` maps to
+  `CLLocationManager.activityType` at runtime: `.fitness` for
+  pedestrian and cycling, `.automotiveNavigation` for any motor
+  vehicle. Startup default is `.fitness`, so a cold launch behaves
+  exactly like a pedestrian tracker; the hint flips only on
+  medium/high-confidence readings. Low-confidence or `.unknown`
+  readings never change the hint, preventing thrashing. Requires the
+  **Motion & Fitness** permission — if denied or the device has no
+  motion coprocessor, the classifier emits `onUnavailable`, the
+  tracker surfaces a `motionPermissionDenied` impairment in the UI,
+  and `activityType` stays on `.fitness` for the rest of the session.
+- **Filter pipeline** (every fix passes distanceFilter → LocationFilter
+  → StationaryDetector before it lands in `points`):
+  1. **`CLLocationManager.distanceFilter = 10 m`** and a defensive
+     per-insert distance check (LocationFilter's minDistance rule).
+  2. **`LocationFilter`** — seven rules in order:
+     (a) validity — `horizontalAccuracy ≥ 0`.
+     (b) **source gate** — `speed ≥ 0` AND `verticalAccuracy > 0`.
+     GNSS fixes populate both (Doppler velocity + 3D solution);
+     Wi-Fi / cell-tower fallback fixes leave them at Apple's
+     documented sentinel negatives. This is the load-bearing defense
+     against stale-BSSID Wi-Fi Positioning "teleport" fixes that
+     otherwise pass the accuracy gate.
+     (c) accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
+     (d) chronology — `Δt > 0` vs the last accepted fix (rejects
+     replayed cached fixes).
+     (e) implausible speed — rejects implied speeds > 500 km/h.
+     (f) spike buffer — a fix > 750 m from the last accepted point is
+     held one tick; if the next fix returns within 100 m of the last
+     accepted point, the buffered fix is confirmed as a spike and
+     dropped. A `pending` fix older than
+     `Config.pendingTimeoutSeconds` (30 s) is discarded silently so
+     an app-backgrounding event cannot corrupt the next session.
+     (g) minimum distance — ≥ 10 m from the last accepted fix.
+  3. **`StationaryDetector`** — after accepted fixes stay within 20 m
+     of a candidate anchor for 150 s, suppresses subsequent fixes
+     until one lands more than 30 m from the cluster center. The
+     `age >= window` comparison is guarded against negative deltas
+     (NTP correction, DST transition, cached replay) so a clock jump
+     cannot stall the detector in Phase A. Coordinates are never
+     smoothed or averaged — only accept/suppress decisions.
+- **Tracking impairment UI**: `LocationTracker` publishes a
+  `Set<TrackingImpairment>`, rendered as an orange banner at the top
+  of `ContentView` whenever non-empty. Three cases:
+  `.permissionDenied` (location auth denied or revoked — no tracking
+  at all), `.backgroundRequiresAlways` (user has WhenInUse only —
+  foreground works but background silently drops), and
+  `.motionPermissionDenied` (vehicle mode never engages). The state
+  machine in `locationManagerDidChangeAuthorization` also resets
+  `LocationFilter` and `StationaryDetector` on a re-grant so stale
+  anchors from a previous session don't bleed into the new one.
+- **Correctness + resilience (1.2.1)**: `Database.insert` and
+  `logDiagnostic` return `Bool`, so the in-memory unsynced counter
+  only increments on confirmed SQLite success. All SQLite writes from
+  the tracker hop onto a private serial `persistQueue` so the
+  CoreLocation main-queue callback is never blocked by a synchronous
+  `sqlite3_step`. All SyncService state (`pointsInFlight`,
+  `diagnosticsInFlight`, the fetch+delete pair) runs on a private
+  serial `syncQueue`; URLSession completion handlers re-dispatch back
+  onto it before touching flags, eliminating the Bool data race that
+  would otherwise arise between the main Timer callback and the
+  URLSession background completion. `delete` / `deleteDiagnostics`
+  chunk at 500 ids per statement so an oversized batch cannot exceed
+  SQLite's parameter limit. `didFailWithError` switches on
+  `CLError.code` (`.denied` stops the tracker and surfaces the
+  impairment, `.locationUnknown` is ignored as transient).
 - **Device identity**: `DeviceIdentity` mints a UUID on first launch and
   stores it in the Keychain (UserDefaults fallback) so it survives reinstalls.
   The ID is owned by `SyncService` and stamped on every upload payload — it
