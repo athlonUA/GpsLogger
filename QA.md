@@ -22,8 +22,9 @@ DB write and read:
 - rejects `latitude` out of `[-90, 90]`, non-finite, non-number
 - rejects `longitude` out of `[-180, 180]`, non-finite, non-number
 - rejects missing/invalid `created_at`
+- rejects missing/empty `device_id`, non-string `device_id`, `device_id` longer than 128 chars
 - rejects `null` element
-- range: accepts empty query, parses `from`/`to`, rejects invalid dates, rejects `from > to`
+- range: requires `device_id`, parses optional `from`/`to`, rejects invalid dates, rejects `from > to`
 
 The DB layer itself is intentionally thin (parameterized inserts and a single
 filter+sort select) and is exercised end-to-end via the smoke tests below.
@@ -34,23 +35,28 @@ filter+sort select) and is exercised end-to-end via the smoke tests below.
 # health
 curl -fsS http://localhost:3000/health
 
-# insert
+# insert (device_id is required on every element)
 curl -fsS -X POST http://localhost:3000/points \
     -H 'Content-Type: application/json' \
     -d '[
-      {"latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00Z"},
-      {"latitude": 37.7750, "longitude": -122.4180, "created_at": "2024-01-01T12:00:05Z"}
+      {"latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00Z", "device_id": "demo"},
+      {"latitude": 37.7750, "longitude": -122.4180, "created_at": "2024-01-01T12:00:05Z", "device_id": "demo"}
     ]'
 # → {"inserted":2}
 
-# read back
-curl -fsS 'http://localhost:3000/points?from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z'
+# read back (device_id is required on the query string)
+curl -fsS 'http://localhost:3000/points?device_id=demo&from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z'
 # → [{"id":1,"latitude":37.7749, ...}, ...]
 
-# bad request
+# bad request — invalid latitude
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3000/points \
     -H 'Content-Type: application/json' \
-    -d '[{"latitude":999,"longitude":0,"created_at":"2024-01-01T00:00:00Z"}]'
+    -d '[{"latitude":999,"longitude":0,"created_at":"2024-01-01T00:00:00Z","device_id":"demo"}]'
+# → 400
+
+# bad request — missing device_id on GET
+curl -sS -o /dev/null -w '%{http_code}\n' \
+    'http://localhost:3000/points?from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z'
 # → 400
 ```
 
@@ -62,67 +68,101 @@ All scenarios assume:
 - iPhone has the app installed via Xcode, backend URL set to Mac's LAN IP
 - iPhone and Mac share the same Wi-Fi
 
+> The iOS app is **always-on**: there is no Start/Stop button. Tracking begins
+> in `AppContainer.init` and the pulsing green dot in the top-right corner
+> indicates the tracker is active. Copy the **Device ID** from the app's
+> footer into the web UI's Device ID field before visualizing.
+
 ### 1. Long drive (30+ min)
 
-- Start app → press **Start** → begin driving.
+- Launch app → begin driving.
 - Expected: counter ticks up as ~10 m+ movements accumulate.
   Every ~30 s it drops by the batch size (up to 100) after a successful sync.
-- Park, press **Stop**.
-- On the web UI pick the drive's time range → click **Visualize**.
+- Park.
+- Paste the device ID into the web UI, pick the drive's time range, click **Visualize**.
 - Expected: a gradient polyline traces the actual route, blue at the start,
   red at the end. Route fits the viewport.
 
-### 2. Stops / stationary periods
+### 2. Stops / stationary periods (StationaryDetector)
 
-- Start app, sit stationary for 10 minutes, then walk around.
-- Expected: while stationary, **no new points** accumulate (distance filter).
-  The blue status bar stays visible; CoreLocation is active but the 10 m
-  filter suppresses inserts.
-- After walking, new points start flowing again.
+- Launch app, sit stationary for 3+ minutes, then walk around.
+- Expected: during the first ~150 s the distance filter alone suppresses
+  inserts. After 150 s within 20 m of the candidate anchor, `StationaryDetector`
+  declares the user stationary and drops everything until a fix lands more
+  than 30 m from the cluster center.
+- Walk away (≥30 m). New points start flowing again.
 
-### 3. No internet (offline queue)
+### 3. GPS spike rejection (LocationFilter)
 
-- Start app, begin walking.
+- Launch app, walk normally for a few minutes.
+- Expected: in the web UI the route has no >750 m teleport jumps even in
+  urban canyons. The accuracy gate (>50 m horizontal accuracy) and spike
+  buffer (A → B(>750 m) → C(near A) → drop B) silently filter glitches.
+  No legitimate transport mode (walking, driving, train) is affected.
+
+### 4. No internet (offline queue)
+
+- Launch app, begin walking.
 - Toggle the Mac backend off (`docker-compose stop backend`).
 - Expected: counter keeps growing — upload fails silently, points stay in the
   local SQLite.
 - Bring the backend back up (`docker-compose start backend`).
 - Expected: counter drains within a few sync cycles as queued batches flush.
 
-### 4. Background tracking
+### 5. Background tracking
 
-- Start app, press **Start**, lock the iPhone.
+- Launch app, lock the iPhone.
 - Put it in a pocket and walk for a few minutes.
 - Expected: blue location indicator remains visible on unlock. Counter has
   increased. Visualizing the range in the web UI shows the walked route.
 
-### 5. App restart mid-session
+### 6. App restart mid-session
 
-- Start app, press **Start**, accumulate a few dozen points.
+- Launch app, accumulate a few dozen points.
 - Swipe-kill the app.
-- Relaunch. Press **Start** again.
+- Relaunch.
 - Expected:
   - Counter reloads from the DB (seed via `initialCount()`) showing the
     still-unsynced points from before the kill.
-  - Sync drains them whether or not you press Start again
-    (`SyncService.start()` runs in `AppContainer.init`).
-  - Collection resumes once Start is pressed again.
+  - Tracking resumes immediately — no button to press; `LocationTracker`
+    starts from `AppContainer.init`.
+  - `SyncService.start()` (also in `AppContainer.init`) drains the queue.
+  - The same device ID is restored from the Keychain, so previously-uploaded
+    points remain visible under the same ID in the web UI.
 
-### 6. Backend restart (data durability)
+### 7. Backend restart (data durability)
 
 - Insert points via the iPhone.
 - `docker-compose restart db`
-- Query `/points` again with the same range.
+- Query `/points` again with the same `device_id` and range.
 - Expected: all previously-inserted points are still there — Postgres volume
   `pgdata` persists across container restarts.
 
-### 7. Frontend downsampling
+### 8. Frontend downsampling
 
-- Insert 10k+ synthetic points via `curl`.
+- Insert 10k+ synthetic points via `curl` (remember `device_id`).
 - Visualize the range.
 - Expected: the polyline renders smoothly in <1 s. The status bar shows the
   full count ("10,247 points"). Internally, the map only renders ≤ 4000
-  after downsampling, across 64 colored segments.
+  after downsampling, across up to 64 colored segments per group.
+
+### 9. Time-gap polyline split
+
+- Insert two clusters of points for the same `device_id` with a >5 minute
+  gap between them at distant coordinates.
+- Visualize a range that covers both clusters.
+- Expected: two separate polylines render — **no straight line bridges the
+  two clusters**. The gradient color (blue → red) is global across both
+  groups, so the second cluster picks up the gradient where the first
+  finished.
+
+### 10. Logout / device switch (frontend)
+
+- In the web UI, enter a device ID and visualize. Reload the page —
+  expected: the device ID is restored from `localStorage`.
+- Click **Logout**. Expected: device ID and points clear, time range resets,
+  status reverts to "Enter device ID to begin". A reload now shows the
+  empty initial state.
 
 ## Regressions to watch for
 

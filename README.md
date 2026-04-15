@@ -26,8 +26,8 @@ Body: **raw JSON array** (not an envelope object):
 
 ```json
 [
-  { "latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00.000Z" },
-  { "latitude": 37.7750, "longitude": -122.4180, "created_at": "2024-01-01T12:00:05.000Z" }
+  { "latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00.000Z", "device_id": "B1F2…" },
+  { "latitude": 37.7750, "longitude": -122.4180, "created_at": "2024-01-01T12:00:05.000Z", "device_id": "B1F2…" }
 ]
 ```
 
@@ -36,6 +36,7 @@ Rules:
 - `latitude` ∈ `[-90, 90]`, finite number
 - `longitude` ∈ `[-180, 180]`, finite number
 - `created_at` is an ISO 8601 string in **UTC**
+- `device_id` is a non-empty string ≤ 128 chars (stable per install, see iOS `DeviceIdentity`)
 - batch size ≤ 1000 (iOS app uses ≤ 100)
 
 Response:
@@ -50,9 +51,11 @@ Errors:
 { "error": "points[3].latitude: must be a finite number in [-90, 90]" }
 ```
 
-### `GET /points?from=<ISO>&to=<ISO>`
+### `GET /points?device_id=<id>&from=<ISO>&to=<ISO>`
 
-Both params optional. Returns an array **sorted ASC by `created_at`**:
+`device_id` is **required** — the endpoint is always scoped to one device so an
+unauthenticated caller cannot enumerate the full dataset. `from` and `to` are
+optional. Returns an array **sorted ASC by `created_at`**:
 
 ```json
 [
@@ -64,6 +67,7 @@ Both params optional. Returns an array **sorted ASC by `created_at`**:
 ### Schema
 
 ```sql
+-- 001_init.sql
 CREATE TABLE points (
     id          SERIAL PRIMARY KEY,
     latitude    DOUBLE PRECISION NOT NULL,
@@ -71,11 +75,21 @@ CREATE TABLE points (
     created_at  TIMESTAMPTZ      NOT NULL
 );
 CREATE INDEX idx_points_created_at ON points (created_at);
+
+-- 002_device_id.sql
+ALTER TABLE points
+    ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_points_device_id_created_at
+    ON points (device_id, created_at);
 ```
 
-Note: spec says `TIMESTAMP`. We use `TIMESTAMPTZ` because it round-trips correctly
-through `pg` regardless of container timezone — strictly more correct, same wire
-format on input and output.
+Notes:
+- `TIMESTAMPTZ` (not `TIMESTAMP`) so values round-trip correctly through `pg`
+  regardless of container timezone.
+- The composite `(device_id, created_at)` index covers the primary access
+  pattern: `WHERE device_id = ? AND created_at BETWEEN ? AND ? ORDER BY created_at ASC`.
+- `device_id` ships with `DEFAULT ''` so the migration is non-blocking on a
+  populated table; new rows must supply a non-empty value (enforced at the API layer).
 
 ## Running it
 
@@ -106,12 +120,14 @@ Sanity checks:
 ```bash
 curl -fsS http://localhost:3000/health            # backend direct  → {"ok":true}
 curl -fsS http://localhost:3001/                  # frontend index  → HTML
-curl -fsS 'http://localhost:3001/api/points?from=2000-01-01T00:00:00Z&to=2100-01-01T00:00:00Z'
+curl -fsS 'http://localhost:3001/api/points?device_id=demo&from=2000-01-01T00:00:00Z&to=2100-01-01T00:00:00Z'
 #                                                  # frontend → nginx → backend → []
 ```
 
-Then open **http://localhost:3001** in your browser. The UI has a **From**/**To**
-datetime pair and a **Visualize** button — no auto-refresh.
+Then open **http://localhost:3001** in your browser. The UI has a **Device ID**
+field (persisted in `localStorage`), a **From**/**To** datetime pair, a
+**Visualize** button, and a **Logout** button that clears the stored device ID
+and resets the view. No auto-refresh.
 
 ### 2. Frontend in dev mode (optional)
 
@@ -174,13 +190,35 @@ flowchart LR
 
 ### iOS — collection rules
 
-- **Only** `CLLocationManager` drives point collection — the app uses **no timers
-  for location**. Points are inserted exclusively in the
-  `didUpdateLocations` callback.
-- A `Timer` exists, but only inside `SyncService`, to schedule HTTP uploads.
-- Two layers of distance filtering ensure no points land closer than 10 m:
-  `CLLocationManager.distanceFilter = 10` and a defensive per-insert check.
-- The unsynced counter lives in memory: seeded once at launch via
+- **Always-on tracker.** There is no Start/Stop button — `LocationTracker`
+  starts in `AppContainer.init` and runs for the lifetime of the app. The UI
+  shows a pulsing green dot when active and an unsynced-points counter.
+- **Only** `CLLocationManager` drives point collection — the app uses **no
+  timers for location**. Points are inserted exclusively in the
+  `didUpdateLocations` callback. A `Timer` exists, but only inside
+  `SyncService`, to schedule HTTP uploads.
+- **Distance filter (first gate).** Two layers ensure no points land closer
+  than 10 m: `CLLocationManager.distanceFilter = 10` and a defensive
+  per-insert check.
+- **`LocationFilter` (second gate, GPS noise).**
+  - Accuracy gate: drops fixes with `horizontalAccuracy > 50 m`.
+  - Speed gate: rejects implied speeds > 500 km/h (teleport-class glitches
+    only — every real surface transport mode passes).
+  - Spike buffer: a fix > 750 m from the last accepted point is held one
+    tick. If the next fix returns within 100 m of the last accepted point,
+    the buffered point is confirmed as a spike and dropped (A → B(far) → C(near A)).
+- **`StationaryDetector` (third gate, jitter clusters).** After accepted
+  fixes stay within 20 m of a candidate anchor for 150 s, the user is
+  declared stationary and subsequent fixes are dropped until one lands more
+  than 30 m from the cluster center (10 m of hysteresis). Coordinates are
+  never smoothed or averaged — only accept/suppress decisions are made, and
+  `LocationFilter.lastAccepted` keeps advancing so the spike/speed gates
+  stay sane across long stationary windows.
+- **Persistent device identity.** `DeviceIdentity` mints a UUID on first
+  launch and stores it in the Keychain (UserDefaults fallback), so the same
+  ID survives reinstalls. Every inserted point is stamped with this ID, and
+  the value is shown in the UI with a copy button.
+- **Unsynced counter** lives in memory: seeded once at launch via
   `SELECT COUNT(*)`, then incremented/decremented only. No further count queries.
 
 ### Backend — minimalism
@@ -193,11 +231,16 @@ flowchart LR
 
 ### Frontend — visualization
 
-- User-driven fetch only. **No auto-refresh, no clustering, no segmentation,
-  no heatmap.**
-- Downsamples to ≤ 4000 points before rendering (`ceil(total / 4000)` stride).
-- Splits the downsampled polyline into 64 chunks to fake a gradient under
-  Leaflet's single-color-per-polyline limitation.
+- User-driven fetch only. **No auto-refresh, no clustering, no heatmap.**
+- Splits the time-sorted points into groups whenever consecutive fixes are
+  more than **5 minutes** apart, so unrelated trips (or power-off periods)
+  never get bridged by a straight "teleport" line.
+- Downsamples each group with a shared global budget of ≤ 4000 points total.
+- Renders one halo + gradient polyline per group; gradient `t` stays global
+  across groups so colors track progression across the full query window
+  (blue early → red late).
+- Each polyline is split into up to 64 colored chunks to fake a gradient
+  under Leaflet's single-color-per-polyline limitation.
 - `fitBounds` on every successful fetch.
 
 ## Tests
@@ -219,7 +262,9 @@ GpsLogger/
 ├── backend/
 │   ├── Dockerfile
 │   ├── package.json
-│   ├── migrations/001_init.sql
+│   ├── migrations/
+│   │   ├── 001_init.sql
+│   │   └── 002_device_id.sql
 │   ├── src/{index,db,validate}.js
 │   ├── src/routes/points.js
 │   └── test/validate.test.js
@@ -232,15 +277,21 @@ GpsLogger/
 │   ├── index.html
 │   └── src/{main,App,Map,api,styles,vite-env.d}.{tsx,ts,css}
 └── ios/
-    ├── README.md            Xcode setup guide
+    ├── README.md                  Xcode setup guide
+    ├── project.yml                xcodegen spec
+    ├── GpsLogger.xcconfig.example template for local signing config
     └── GpsLogger/
         ├── GpsLoggerApp.swift
         ├── AppContainer.swift
         ├── AppState.swift
         ├── ContentView.swift
         ├── LocationTracker.swift
+        ├── LocationFilter.swift     accuracy / speed / spike gates
+        ├── StationaryDetector.swift jitter-cluster suppression
+        ├── DeviceIdentity.swift     Keychain-backed UUID
         ├── SyncService.swift
         ├── Database.swift
         ├── Config.swift
+        ├── GpsLogger.entitlements
         └── Info.plist
 ```
