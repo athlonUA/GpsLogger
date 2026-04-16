@@ -33,7 +33,7 @@ ios/
 │   ├── GpsLogger.entitlements
 │   └── Info.plist                      ← reference plist with required keys
 └── GpsLoggerTests/
-    ├── LocationFilterTests.swift       ← 15 cases covering every filter gate + pending-timeout
+    ├── LocationFilterTests.swift       ← 26 cases covering every filter gate + pending-timeout + deadlock-escape
     ├── DatabaseTests.swift              ← 7 cases for insert/fetch/delete/retention invariants
     ├── MotionClassifierTests.swift     ← 10 cases for the pure classification rules
     └── StationaryDetectorTests.swift    ← 9 cases for Phase-A/B state machine + clock-skew guard
@@ -237,10 +237,20 @@ covers every device you've built for.
 
 - **Collection**: `CLLocationManager` with `kCLLocationAccuracyBest`,
   `distanceFilter = 10`, `pausesLocationUpdatesAutomatically = false`,
-  `allowsBackgroundLocationUpdates = true`. Points are saved **only**
+  `allowsBackgroundLocationUpdates = true`,
+  `showsBackgroundLocationIndicator = true`. Points are saved **only**
   from `didUpdateLocations` callbacks — no timers are used for
   collection. The tracker is started in `AppContainer.init` and runs
   for the lifetime of the app; there is no Start/Stop button.
+  The `didUpdateLocations` array is sorted ascending by timestamp
+  before iteration (1.2.5 defensive sort) so a future iOS change in
+  array ordering cannot corrupt the spike-buffer logic.
+  `startMonitoringSignificantLocationChanges` is subscribed alongside
+  the regular update stream (1.2.6 fallback wake) so iOS can relaunch
+  the app via `UIApplicationLaunchOptionsLocationKey` even from a
+  terminated state; SLC fires on ~500 m movements and is
+  cellular-triangulation powered, so the extra subscription has no
+  battery cost.
 - **Multi-modal `activityType`**: a single install covers walking,
   cycling, and motorized transport (car, bus, train) through
   `MotionClassifier`. It wraps `CMMotionActivityManager` — which reads
@@ -262,8 +272,12 @@ covers every device you've built for.
   1. **`CLLocationManager.distanceFilter = 10 m`** and a defensive
      per-insert distance check (LocationFilter's minDistance rule).
   2. **`LocationFilter`** — nine rules in order:
-     (a) **delivery age** (1.2.2) — `|now − timestamp| ≤ 10 s`. Rejects
-     cached locations that CoreLocation replays after a signal gap.
+     (a) **delivery age** (1.2.2, symmetric in 1.2.5) —
+     `|now − timestamp| ≤ 10 s`. Rejects cached locations that
+     CoreLocation replays after a signal gap; the 1.2.5 symmetric
+     variant also rejects fixes with timestamps *ahead* of wall-clock
+     (system-clock skew backward: NTP correction, manual time change,
+     DST edge).
      (b) validity — `horizontalAccuracy ≥ 0`.
      (c) **source gate** — `speed ≥ 0` AND `verticalAccuracy > 0`.
      GNSS fixes populate both (Doppler velocity + 3D solution);
@@ -274,9 +288,14 @@ covers every device you've built for.
      (d) accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
      (e) chronology — `Δt > 0` vs the last accepted fix (rejects
      replayed cached fixes).
-     (f) **gap-aware accuracy** (1.2.2) — if `Δt > 60 s`, tightens
-     the accuracy ceiling from 50 m to 20 m, filtering multipath
-     convergence fixes after extended indoor / background signal loss.
+     (f) **gap-aware accuracy** (1.2.2, three-tier in 1.2.6) — if
+     `Δt > 60 s`, tightens the accuracy ceiling from 50 m to 20 m,
+     filtering multipath convergence fixes after extended indoor /
+     background signal loss. **1.2.6 escape valve**: if `Δt > 120 s`
+     the ceiling falls back to the normal 50 m so sustained marginal
+     signal cannot self-reinforce into a multi-minute blackout (see
+     the 1.2.6 hardening bullet below for the production incident
+     that motivated the fix).
      (g) implausible speed — rejects implied speeds > 500 km/h.
      (h) spike buffer — a fix > 750 m from the last accepted point is
      held one tick; if the next fix returns within 100 m of the last
@@ -306,6 +325,47 @@ covers every device you've built for.
   `LocationFilter` gates address cached-fix replay and multipath
   convergence drift after extended indoor or background signal loss.
   See filter pipeline rules (a) and (f) above.
+- **Background drain + error-aware backoff (1.2.4)**: `SyncService`
+  classifies HTTP outcomes into a `SyncResult` enum — 2xx `.success`,
+  network errors / 408 / 429 / 5xx `.retryable` (exponential backoff
+  up to 5 min), every other 4xx `.nonRetryable` (batch retained, loud
+  release-build log, interval held steady so a client-side bug surfaces
+  in seconds rather than being hidden behind a 5-min cadence).
+  `NWPathMonitor` short-circuits the drain when there is no usable
+  network, replacing 15 s URLSession-timeout spins in airplane mode
+  with a fast no-op skip. `GpsLoggerApp` registers a `BGAppRefreshTask`
+  (`com.gpslogger.personal.refresh`) and submits a new request on
+  every background scene-phase transition, so the local queue drains
+  even when the foreground 30 s `Timer` is suspended. The
+  fetch → upload → delete invariant is documented at the class level
+  and depends on the backend's unique `(device_id, created_at)` /
+  `(device_id, fix_timestamp)` indexes from migration 004; replayed
+  batches are absorbed server-side as no-ops. `Database` sets
+  `PRAGMA synchronous=NORMAL` alongside WAL mode to make the
+  crash-safety posture reviewable in code.
+- **GPS audit follow-ups (1.2.5)**: stale-delivery gate is now
+  symmetric (see filter rule (a) above). `LocationTracker.didUpdateLocations`
+  sorts the incoming `[CLLocation]` by timestamp before iteration as
+  defensive insurance against a future iOS change in array ordering.
+  First-fix short-circuit in `LocationFilter` is explicitly documented:
+  a multi-hour app relaunch is a first fix, not a first fix after gap,
+  so the gap-aware rule is bypassed by design — the other gates
+  (stale-delivery, validity, source, 50 m accuracy) have already run.
+- **Filter deadlock escape valve (1.2.6)**: the gap-aware accuracy
+  gate is now three-tier (see filter rule (f) above). Fixes a
+  self-reinforcing deadlock observed in the 2026-04-16 production
+  session where a 60 s tram-tunnel signal dip cascaded into a
+  17-minute accepted-fix blackout: every new fix landed in the
+  20–50 m band, the gate stayed tight, `Δt` kept growing, and the
+  receiver never produced a sub-20 m fix under sustained marginal
+  signal. At `Δt > 120 s` the ceiling now relaxes back to 50 m,
+  bounding the worst case at two minutes instead of seventeen.
+  Multipath-convergence defense for the typical 30–90 s post-indoor
+  reacquisition is unchanged. `LocationTracker` also counts
+  consecutive discards and emits an unconditional
+  `[tracker] WARN: N consecutive discards` line every 20 rejections
+  so compound deadlocks are visible in Console.app without needing
+  the `fix_diagnostics` Postgres query.
 - **Correctness + resilience (1.2.1)**: `Database.insert` and
   `logDiagnostic` return `Bool`, so the in-memory unsynced counter
   only increments on confirmed SQLite success. All SQLite writes from
@@ -340,16 +400,27 @@ covers every device you've built for.
     Postgres table. Local rows are deleted on successful 2xx; a 3-day
     retention window in `cleanupDiagnostics` covers prolonged backend
     outages. See `QA.md` for how to query the backend after an anomaly.
-- **Sync**: a `Timer` (the only timer in the app) fires every 30 s and runs
-  two independent drains:
+- **Sync**: a `Timer` (the only in-app timer) fires every 30 s and runs
+  two independent drains on a private serial `syncQueue`:
   - `points` → `POST /points` — drives the visible trace. Pulls up to 100
     rows, stamps the device ID on each payload element (from the injected
     `SyncService.deviceId`, not per-row), and deletes on 2xx.
   - `fix_diagnostics` → `POST /diagnostics` — mirror shape of the points
     drain. Each channel has its own in-flight guard so one slow response
     cannot stall the other.
-  Failures stay in the local DB for the next tick — no partial delete,
-  no retry storms.
+
+  HTTP outcomes are classified (1.2.4): 2xx resets the backoff interval;
+  network errors / 408 / 429 / 5xx double it up to a 5-min cap; every
+  other 4xx holds the interval steady and logs loudly so a schema drift
+  or rotated API key is visible within seconds. `NWPathMonitor`
+  short-circuits the drain when there is no usable network, preventing
+  15 s URLSession-timeout spins. The same code path is exposed as
+  `drainOnce(completion:)` and invoked by a registered
+  `BGAppRefreshTask` so the local queue drains in background even when
+  the `Timer` is suspended. Failures stay in the local DB for the next
+  tick — no partial delete, no retry storms; replay safety is
+  guaranteed by the backend's idempotent `ON CONFLICT DO NOTHING`
+  constraints (migration 004).
 - **Counter**: lives in memory. Seeded once at launch from `SELECT COUNT(*)`,
   then increment/decrement only — no further `COUNT` queries.
 - **Backend URL resolution**: `Config.apiBaseURL` is read at every call

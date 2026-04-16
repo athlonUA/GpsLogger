@@ -467,10 +467,13 @@ flowchart LR
   than 10 m: `CLLocationManager.distanceFilter = 10` and a defensive
   per-insert check.
 - **`LocationFilter` (second gate, GPS noise).** Rules applied in order:
-  0. **Delivery age** (1.2.2) — `|now − timestamp| ≤ 10 s`. CoreLocation
-     may replay cached locations after a signal gap; Apple's documentation
-     explicitly recommends checking fix age. Rejects stale cached fixes
-     before any other gate runs.
+  0. **Delivery age** (1.2.2, symmetric in 1.2.5) — `|now − timestamp| ≤ 10 s`.
+     CoreLocation may replay cached locations after a signal gap; Apple's
+     documentation explicitly recommends checking fix age. Rejects stale
+     cached fixes before any other gate runs. The 1.2.5 symmetric variant
+     also rejects fixes whose timestamp is *ahead* of wall-clock, which
+     happens on system-clock skew backward (NTP correction, manual time
+     change, DST edge).
   1. Validity — `horizontalAccuracy ≥ 0`.
   2. **Source discrimination** — `speed ≥ 0` AND `verticalAccuracy > 0`.
      GNSS fixes populate both (Doppler velocity + 3D solution); Wi-Fi /
@@ -484,11 +487,15 @@ flowchart LR
   3. Accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
   4. Chronology — `Δt > 0` vs. the last accepted fix (rejects replayed /
      cached fixes).
-  4b. **Gap-aware accuracy** (1.2.2) — if `Δt > 60 s`, tightens the
-     accuracy ceiling from 50 m to 20 m. After extended signal loss
-     (indoor, tunnel, background) the GPS receiver's first convergence
-     fixes are disproportionately likely to suffer multipath displacement
-     despite reporting optimistic `horizontalAccuracy`.
+  4b. **Gap-aware accuracy** (1.2.2, three-tier in 1.2.6) — if
+     `Δt > 60 s`, tightens the accuracy ceiling from 50 m to 20 m.
+     After extended signal loss (indoor, tunnel, background) the GPS
+     receiver's first convergence fixes are disproportionately likely
+     to suffer multipath displacement despite reporting optimistic
+     `horizontalAccuracy`. **1.2.6 escape valve**: if `Δt > 120 s` the
+     ceiling falls back to the normal 50 m so sustained marginal signal
+     cannot self-reinforce into a multi-minute blackout (see the 1.2.6
+     hardening subsection above).
   5. Speed ceiling — rejects implied speeds > 500 km/h (teleport-class
      glitches only; every real surface transport mode passes).
   6. Spike buffer — a fix > 750 m from the last accepted point is held one
@@ -659,7 +666,7 @@ GpsLogger/
     │   ├── GpsLogger.entitlements
     │   └── Info.plist
     └── GpsLoggerTests/
-        ├── LocationFilterTests.swift      15 cases covering every filter gate + pending-timeout
+        ├── LocationFilterTests.swift      26 cases covering every filter gate + pending-timeout + deadlock-escape
         ├── DatabaseTests.swift            7 cases locking in the drain/retention invariants
         ├── MotionClassifierTests.swift    10 cases for the pure classification rules
         └── StationaryDetectorTests.swift   9 cases for the Phase-A/B state machine + clock-skew guard
