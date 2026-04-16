@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (48 cases across 4 test files)
+### iOS unit tests (49 cases across 4 test files)
 
 ```
 cd ios
@@ -13,7 +13,7 @@ xcodebuild test -project GpsLogger.xcodeproj -scheme GpsLoggerTests \
     -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
-**`LocationFilterTests` (22 cases)** — every gate in the filter
+**`LocationFilterTests` (23 cases)** — every gate in the filter
 pipeline end-to-end:
 
 - validity gate (negative `horizontalAccuracy` → discard `.invalidFix`)
@@ -33,9 +33,13 @@ pipeline end-to-end:
   `Config.pendingTimeoutSeconds` is dropped silently before the next
   fix is evaluated, so an app-backgrounding event cannot leave stale
   spike state across sessions
-- **stale-delivery gate** (1.2.2): fix with timestamp > 10 s behind wall
-  clock is rejected as `discard:staleDelivery`; gate runs before all
-  other gates; fix within threshold is accepted
+- **stale-delivery gate** (1.2.2, symmetric in 1.2.4): fix with
+  timestamp > 10 s behind wall clock is rejected as
+  `discard:staleDelivery`; gate runs before all other gates; fix
+  within threshold is accepted; **symmetric variant (1.2.5)** also
+  rejects fixes whose timestamp is > 10 s *ahead* of wall-clock, which
+  happens on system-clock skew backward (NTP correction, manual time
+  change, DST edge)
 - **gap-aware accuracy** (1.2.2): after `Δt > 60 s`, accuracy ceiling
   tightens from 50 m to 20 m (`discard:poorResumeAccuracy`); good
   accuracy (≤ 20 m) is accepted even after a gap; mediocre accuracy
@@ -530,6 +534,29 @@ docker exec gpslogger-db-1 psql -U postgres -d gpslogger -c \
 | `≥ 0` | `> 0` | normal | Multipath / transient glitch — spike buffer should have handled it. |
 | any | any | any, but `logged_at − fix_timestamp > 10 s` | Cached fix replay — `discard:staleDelivery` gate (1.2.2) should have rejected it. |
 | `≥ 0` | `> 0` | 20–50 m, first fix after gap > 60 s | Post-indoor multipath convergence — `discard:poorResumeAccuracy` gate (1.2.2) should have rejected it. |
+| `-1` | `> 0` | normal (5–30 m), first 1–3 fixes after a cold boot / airplane-mode toggle / first-ever install | GNSS cold start with Doppler lock still acquiring. The receiver has a valid 3D fix (positive `vertical_accuracy`) but has not yet computed velocity. The source gate correctly rejects these as `discard:nonGpsSource` — not a bug, but it explains why the trace starts 5–15 s later than the tap on "Start". |
+| any | any | `logged_at` more than 10 s *ahead* of `fix_timestamp` (wall-clock jumped backward) | System clock skew (NTP correction, manual time change, DST edge). `discard:staleDelivery` (1.2.4 symmetric gate) rejects. |
+
+**Slow cold-start diagnostic workflow.** If a user reports "the trace
+took 15 s to appear after I tapped launch" — which is normal behavior,
+not a bug — the pattern above is what you expect to see in
+`fix_diagnostics`:
+
+```sql
+SELECT fix_timestamp, horizontal_accuracy, vertical_accuracy,
+       speed, speed_accuracy, decision
+  FROM fix_diagnostics
+ WHERE device_id = '<your-device-uuid>'
+   AND fix_timestamp BETWEEN '<launch-time>'::timestamptz
+                         AND '<launch-time>'::timestamptz + INTERVAL '30 seconds'
+ ORDER BY fix_timestamp ASC;
+```
+
+Expected: 1–3 rows with `speed = -1` and `decision =
+'discard:nonGpsSource'`, followed by rows with `speed >= 0` and
+`decision = 'accept'`. If *every* row in the first 60 s has `speed =
+-1`, the device was indoors and CoreLocation never handed us a GNSS
+fix — trace gap is a signal issue, not a filter issue.
 
 If the bad rows show `decision = 'discard:nonGpsSource'` they never made it
 into `points`; the fix is already doing its job and the anomaly should not

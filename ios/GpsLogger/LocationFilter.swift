@@ -109,11 +109,17 @@ struct LocationFilter {
     /// should persist.
     mutating func consume(_ loc: CLLocation, now: Date = Date()) -> Decision {
         // 0. Stale-delivery gate. CoreLocation may deliver cached locations
-        //    after a signal gap. A fix whose timestamp is more than maxFixAge
-        //    seconds behind wall-clock time was computed during a previous
-        //    signal window and is being replayed.
+        //    after a signal gap. A fix whose timestamp is more than
+        //    maxFixAge seconds *behind* wall-clock time was computed during
+        //    a previous signal window and is being replayed. We compare on
+        //    `abs(deliveryAge)` so the gate is symmetric — a timestamp more
+        //    than maxFixAge seconds *ahead* of wall-clock (system-clock
+        //    skew backward: NTP correction, manual time change, daylight-
+        //    saving edge) is also rejected. Either direction indicates the
+        //    fix cannot be placed on a coherent local timeline relative to
+        //    the anchor we already hold.
         let deliveryAge = now.timeIntervalSince(loc.timestamp)
-        if deliveryAge > maxFixAge {
+        if abs(deliveryAge) > maxFixAge {
             return .discard(.staleDelivery)
         }
 
@@ -155,6 +161,21 @@ struct LocationFilter {
         }
 
         // First-ever accepted fix: no prior anchor, just take it.
+        //
+        // This branch deliberately short-circuits **before** the gap-aware
+        // accuracy gate (4b, below). With no prior anchor there is no `dt`
+        // to compare against, so the ">60 s gap → 20 m accuracy ceiling"
+        // rule has nothing to gate on. A multi-hour app relaunch should
+        // not be treated as a "first fix after gap" — it is a first fix,
+        // full stop. Stale-delivery (gate 0), validity (gate 1), source
+        // discrimination (gate 2), and the 50 m accuracy ceiling (gate 3)
+        // have already run, so the accepted first fix is guaranteed to be
+        // GNSS-origin, non-cached, and within the normal accuracy bound.
+        //
+        // Do NOT reorder this branch below gate 4b: it would silently
+        // delay cold-start acceptance whenever the gap-aware branch
+        // happened to misfire (e.g. on a first fix that is slightly above
+        // the 20 m resume ceiling but well under the normal 50 m ceiling).
         guard let last = lastAccepted else {
             lastAccepted = loc
             return .accept(loc)

@@ -263,6 +263,23 @@ final class LocationFilterTests: XCTestCase {
         )
     }
 
+    func testRejectsFutureTimestampedFix() {
+        // Symmetric case (audit fix F3): if the fix's timestamp is
+        // `maxFixAgeSeconds` or more *ahead* of wall-clock time — which
+        // happens when the system clock jumps backward (manual time
+        // change, NTP correction, daylight-saving edge case) — the gate
+        // must reject it. Otherwise the anchor we already hold and the
+        // new fix would be on different timelines, producing a negative
+        // `dt` on the chronology gate or, worse, a negative age in the
+        // stationary-detector Phase A window.
+        var filter = LocationFilter()
+        let fix = makeFix(lat: 50.45, lon: 30.52, timestamp: date(15))
+        XCTAssertEqual(
+            filter.consume(fix, now: date(0)),   // now is 15 s behind fix
+            .discard(.staleDelivery)
+        )
+    }
+
     // MARK: - Gap-aware accuracy
 
     func testRejectsMediacreAccuracyAfterGap() {

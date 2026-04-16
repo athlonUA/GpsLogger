@@ -318,7 +318,14 @@ extension LocationTracker: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        for loc in locations {
+        // Apple documents `locations` as already sorted ascending by
+        // timestamp, and the spike-buffer + chronology logic in
+        // `LocationFilter` depends on that ordering. Sort defensively
+        // anyway so a future iOS change in array semantics cannot silently
+        // corrupt filter state — the array is almost always 1–3 elements
+        // in live tracking (larger only after signal recovery or app-wake
+        // from suspended state), so the cost is negligible.
+        for loc in locations.sorted(by: { $0.timestamp < $1.timestamp }) {
             let decision = filter.consume(loc)
 
             // Debug observability: snapshot every raw fix with its full

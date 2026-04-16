@@ -391,6 +391,27 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **GPS audit follow-ups** (1.2.5):
+  - Stale-delivery gate is now symmetric: `abs(delivery_age) > 10 s`
+    rejects both cached replays (timestamp behind wall-clock) and
+    fixes whose timestamp is ahead of wall-clock, which happens on
+    system-clock skew backward (NTP correction, manual time change,
+    DST edge). Both directions produce a fix that cannot be placed
+    on a coherent timeline against the anchor `LocationFilter` already
+    holds.
+  - `LocationTracker.didUpdateLocations` sorts the incoming
+    `[CLLocation]` array by timestamp before processing. Apple
+    documents the array as already ordered, but the spike-buffer and
+    chronology gates are correctness-sensitive to order — sorting
+    defensively protects against any future iOS change in array
+    semantics, at zero cost (the array is almost always 1–3 elements).
+  - First-fix short-circuit in `LocationFilter` is now explicitly
+    documented: a multi-hour app relaunch is a first fix, not a first
+    fix *after gap*, so the gap-aware accuracy gate is bypassed by
+    design. The load-bearing checks (stale-delivery, validity, source,
+    50 m accuracy ceiling) have already run, so the fix is still
+    guaranteed to be GNSS-origin, non-cached, and within the normal
+    accuracy bound.
 - **Background sync + error-aware backoff** (1.2.4):
   - `GpsLoggerApp` registers a `BGAppRefreshTask`
     (`com.gpslogger.personal.refresh`) and submits a new request on
@@ -553,7 +574,7 @@ cd backend && node --test test/
 # gradientColor, buildSegments — the pure functions behind the route view)
 cd frontend && npm test
 
-# iOS unit tests (48 cases across LocationFilter, Database drain,
+# iOS unit tests (49 cases across LocationFilter, Database drain,
 # MotionClassifier classify, and StationaryDetector state machine)
 cd ios && xcodegen generate && xcodebuild test \
     -project GpsLogger.xcodeproj \
