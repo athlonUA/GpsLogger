@@ -481,6 +481,152 @@ API_KEY=rotated docker compose up -d backend
   time out) are the ones that actually double the interval up to the
   5-min cap.
 
+## 1.2.6 deadlock-fix regression plan
+
+Targeted field regression for the three-tier gap-aware gate introduced
+in 1.2.6. Verifies:
+
+- **G1** — tight 20 m ceiling still fires for `60 s < dt ≤ 120 s` (no
+  silent weakening of the multipath-convergence defense from 1.2.2).
+- **G2** — escape valve relaxes the ceiling back to 50 m at `dt > 120 s`
+  (no more multi-minute `poorResumeAccuracy` blackouts like the
+  2026-04-16 session).
+- **G3** — normal outdoor tracking is indistinguishable from 1.2.5.
+
+Prereqs: iPhone on 1.2.6 (version string in the app footer reads
+`v1.2.6 (11)`), `docker compose ps` shows all four services healthy,
+Console.app attached to the device with filter `process = GpsLogger` +
+string = `[tracker]` (keeps the `WARN: N consecutive discards` line
+visible live), and the Device ID copied from the app footer —
+substituted as `<DEV>` in every query below. All four scenarios cover
+~30 min of field time total.
+
+### 15. Gap-aware tight gate after short indoor visit (1.2.6, G1)
+
+Verifies the `60 s < dt ≤ 120 s` tier still fires after a brief
+building entry — this is the case the gate was designed for in 1.2.2
+and must not be silently weakened by the 1.2.6 relax tier.
+
+- Stand outside for 2–3 min until the unsynced counter is ticking
+  steadily.
+- Enter a store/building, stay 2–3 min, exit, walk 60–90 s at normal
+  pace.
+- Expected: the trace resumes **60–120 s after exit**, not sooner.
+- If wrong (trace resumes < 30 s after exit, visible zigzag on a
+  straight sidewalk), query the post-exit window and expect 3–20 rows
+  of `discard:poorResumeAccuracy` at 20–50 m in the first 60–120 s:
+
+  ```sql
+  SELECT fix_timestamp, horizontal_accuracy, decision
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<exit-utc>'
+                           AND '<exit-utc>'::timestamptz + INTERVAL '3 minutes'
+   ORDER BY fix_timestamp;
+  ```
+
+  If all rows are `accept` starting immediately on exit, the tight
+  gate isn't engaging — check `Config.resumeGapSeconds` and
+  `Config.resumeMaxAccuracyMeters` in the running binary.
+
+### 16. Deadlock escape after long indoor + marginal exit (1.2.6, G2)
+
+Verifies the `dt > 120 s` relax tier fires cleanly. Creates the
+compound-degradation scenario that historically deadlocked the filter.
+
+- Phone in pocket, GPS tracking on. Enter a building for ≥ 10 min.
+- Exit but remain in marginal signal for 3 min (under an awning, along
+  a tall wall, narrow alley). Do not remove the phone from the pocket.
+- Step into clear sky and walk for 2 min.
+- Expected: the trace resumes **within 120 s of exit**. Console.app
+  shows **at most one** `[tracker] WARN: 20 consecutive discards …`
+  line. A second WARN (`40 consecutive discards`) means the escape
+  isn't relaxing the gate.
+- If wrong, query the 5-min window after exit:
+
+  ```sql
+  SELECT fix_timestamp, horizontal_accuracy, decision
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<exit-utc>'
+                           AND '<exit-utc>'::timestamptz + INTERVAL '5 minutes'
+   ORDER BY fix_timestamp;
+  ```
+
+  The longest consecutive run of `discard:poorResumeAccuracy` must not
+  exceed ~120 s of wall-clock time. If it does:
+
+  1. Confirm the running build is 1.2.6:
+     `plutil -p .../GpsLogger.app/Info.plist | grep CFBundleShortVersionString`.
+  2. Confirm `LocationFilter.swift`'s gap-aware gate has the `dt <= resumeRelax`
+     conjunct (the three-tier rule comment mentions the 1.2.6 fix).
+
+### 17. Transit through signal-weak corridor (1.2.6, G2 — regression case)
+
+Exact reproduction of the 2026-04-16 production session where a 60 s
+tram signal dip cascaded into a 17-minute blackout. Highest-reproducibility
+scenario for the deadlock.
+
+- Board a tram or bus that passes through a tunnel / underpass / dense
+  downtown for ≥ 60 s.
+- Continue on the same vehicle for ≥ 10 min past the signal-weak section.
+- Expected: short straight-line segments (< 5 min gap) where the
+  tunnel was are a frontend rendering choice and fine. **On the data
+  side**, no accepted-fix gap longer than ~180 s anywhere in the ride.
+- If wrong, compute the gaps between consecutive accepts:
+
+  ```sql
+  SELECT fix_timestamp, horizontal_accuracy,
+         EXTRACT(EPOCH FROM (fix_timestamp - LAG(fix_timestamp)
+                             OVER (ORDER BY fix_timestamp)))::int AS secs_since_prev
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<board>' AND '<alight>'
+     AND decision = 'accept'
+   ORDER BY fix_timestamp;
+  ```
+
+  Maximum `secs_since_prev` among accepts should be < 180 s. Any value
+  ≥ 300 s is a regression against the 1.2.6 fix — pull the full slice
+  (all decisions, not just accepts) for that gap and escalate with the
+  slice attached.
+
+### 18. Normal outdoor walk (1.2.6, G3 — no regression)
+
+Baseline sanity check that the 1.2.6 change has not altered normal
+outdoor tracking quality.
+
+- 20 min walk on a clear-sky route, ideally one previously walked on
+  1.2.5 so numbers are comparable.
+- Query the window:
+
+  ```sql
+  SELECT
+    COUNT(*) FILTER (WHERE decision = 'accept') AS accepts,
+    COUNT(*) FILTER (WHERE decision = 'accept' AND horizontal_accuracy <= 10)         AS under_10m,
+    COUNT(*) FILTER (WHERE decision = 'accept' AND horizontal_accuracy BETWEEN 10 AND 20) AS in_10_20m,
+    COUNT(*) FILTER (WHERE decision = 'accept' AND horizontal_accuracy > 20)          AS over_20m
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<start>' AND '<end>';
+  ```
+
+- Expected for continuous outdoor walking at ~1 m/s with `distanceFilter`
+  = 10 m over 20 min: `accepts` ≈ 100–150, `under_10m + in_10_20m`
+  ≥ 90 % of `accepts`, `over_20m` is small. Every `over_20m` accept
+  should correspond to a `dt > 120 s` event (the escape path).
+- If wrong — `over_20m` > 20 % of accepts during continuous walking —
+  sample the offending rows and confirm their `dt` to the prior accept
+  is > 120 s. Any `over_20m` accept with `dt` in the `60–120 s` band
+  is a regression against the 1.2.2 tight-gate guarantee — the escape
+  valve is firing when it shouldn't.
+
+**Out of scope for the 1.2.6 round.** These were explicitly not changed
+and don't need retesting here — scenarios #1–14 above already cover
+them: source gate (Wi-Fi/cell fallback), spike buffer, stationary
+detector, sync/backoff/idempotency, BGTaskScheduler, backend API,
+frontend visualization, Docker stack.
+
 ## Inspecting fix_diagnostics after an anomaly
 
 `fix_diagnostics` records every raw `CLLocation` that entered
