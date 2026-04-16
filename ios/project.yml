@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.2.3"
-    CURRENT_PROJECT_VERSION: "8"
+    MARKETING_VERSION: "1.2.4"
+    CURRENT_PROJECT_VERSION: "9"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
 targets:
@@ -30,8 +30,8 @@ targets:
       path: GpsLogger/Info-generated.plist
       properties:
         CFBundleDisplayName: GpsLogger
-        CFBundleShortVersionString: "1.2.3"
-        CFBundleVersion: "8"
+        CFBundleShortVersionString: "1.2.4"
+        CFBundleVersion: "9"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
@@ -42,7 +42,17 @@ targets:
         NSLocationWhenInUseUsageDescription: "GpsLogger records your current position to log your trip."
         NSMotionUsageDescription: "GpsLogger reads the motion sensors to detect whether you are walking, cycling, or in a vehicle, so it can tune CoreLocation's activityType hint for each mode. Processing happens entirely on device."
         UIBackgroundModes:
+          # `location` keeps CoreLocation delivering updates while the app
+          # is backgrounded (the primary data-collection path).
+          # `fetch` lets `BGAppRefreshTask` wake the app to drain the
+          # upload queue when CoreLocation has gone quiet (stationary
+          # phone) and the foreground sync Timer is suspended.
           - location
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          # Must match `Config.backgroundRefreshTaskId`. Registered in
+          # `GpsLoggerApp.init` via `BGTaskScheduler.shared.register`.
+          - com.gpslogger.personal.refresh
         # ATS is scoped to **local networking only**. `NSAllowsLocalNetworking`
         # exempts private-IP ranges (10.x, 172.16.x–172.31.x, 192.168.x) and
         # `.local` hostnames from ATS so the iOS app can reach the Mac's

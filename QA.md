@@ -145,6 +145,64 @@ DB write and read.
 The DB layer itself is intentionally thin (parameterized inserts and a single
 filter+sort select) and is exercised end-to-end via the smoke tests below.
 
+### Frontend unit tests (20 cases)
+
+```
+cd frontend
+npm test
+```
+
+Covers the pure route-processing functions extracted into `src/route.ts`
+so they can be tested in `vitest`'s default Node environment without
+loading `react-leaflet` (which requires the DOM).
+
+**`splitByTimeGaps` (6 cases)** — turns the time-sorted `Point[]` into
+time-gap groups:
+
+- empty input returns `[]` (no placeholder group)
+- single point produces one one-point group — the input survives the
+  segmentation stage even when there is nothing to gap against
+- consecutive close points stay in the same group
+- gap boundary is **strictly greater than** `GAP_MS` (exactly 5 min is
+  not a split; 5 min + 1 s is)
+- many gaps produce the expected number of groups
+- a lone fix between two clusters becomes its own 1-point group,
+  unblocking the singleton-render path in `buildSegments`
+
+**`downsampleGroups` (5 cases)** — global budget with per-group
+proportional allocation:
+
+- under-budget input returns the same array reference (identity, no
+  reallocation) so React's `useMemo` doesn't invalidate needlessly
+- over-budget input compresses below `MAX_POINTS` while preserving the
+  first and last fix of each group (polyline endpoints stay anchored
+  to the real trace)
+- 2-point group passes through unchanged (short-circuit for already-minimal groups)
+- singleton group passes through unchanged
+- budget splits proportionally: a 2N-point group ends up with more
+  sampled points than a 0.5N-point group
+
+**`gradientColor` (3 cases)** — Blue → Purple → Red hue mapping:
+
+- output is always a valid `hsl(...)` string
+- anchor values: t=0 → 240°, t=0.5 → 285°, t=1 → 360°
+- monotonic across [0, 1]
+
+**`buildSegments` (6 cases)** — render-primitives builder:
+
+- empty input → empty render
+- **singleton regression (1.2.4)**: a 1-point group emits a singleton
+  with the right color, no polyline segments — the audit-day bug where
+  lone fixes were silently dropped is locked in
+- multi-point group emits polyline segments with ≥ 2 positions each,
+  no singletons
+- mixed groups emit both polyline segments and singletons
+- global-`t` preservation: a singleton at the chronological centre
+  picks up `hue = 285°` (purple), proving the gradient spans the whole
+  query window rather than restarting per group
+- bookends: first segment is near blue (240°) and last segment is near
+  red (360°) across a two-group window
+
 ### Smoke tests (after `docker-compose up`)
 
 ```bash
@@ -229,7 +287,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:3000/diagnost
 
 All scenarios assume:
 
-- `docker-compose up --build` has run on the Mac (migrations 001–004 applied)
+- `docker-compose up --build` has run on the Mac (migrations 001–005 applied)
 - iPhone has the app installed with `API_BASE_URL` in
   `ios/GpsLogger.xcconfig` pointing to the Mac's current LAN IP
 - iPhone and Mac share the same Wi-Fi network
@@ -368,6 +426,50 @@ All scenarios assume:
   off. Expected: banner "Motion sensing off — vehicle mode will not
   engage." The app still records everything correctly, but
   `activityType` stays on `.fitness` regardless of real mode.
+
+### 13. Background refresh drain (1.2.4, simulator-only)
+
+Production delivery of `BGAppRefreshTask` is throttled by iOS based on
+usage patterns and battery state (typically no more sooner than every
+~15 min, often much longer on a new install). For a predictable
+verification run use the debugger to simulate a launch.
+
+- Run the app in the simulator from Xcode, then suspend it with
+  `Cmd+Shift+H` twice to send it to background.
+- In the Xcode debug console (lldb) run:
+  ```
+  e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"com.gpslogger.personal.refresh"]
+  ```
+- Expected: the `handleBackgroundRefresh` log fires,
+  `SyncService.drainOnce` posts at most one batch of `points` and one
+  of `fix_diagnostics`, and the task completes with
+  `setTaskCompleted(success: true)`. Re-submit the next refresh is
+  logged by the `scheduleBackgroundRefresh` call at the top of the
+  handler, so the next cycle is already queued before iOS releases
+  our runtime.
+- Re-foreground the app: the standard 30 s `Timer` path takes over;
+  no duplicates appear in the backend because migration 004's unique
+  `(device_id, created_at)` / `(device_id, fix_timestamp)` indexes
+  absorb any race between the background drain and the foreground tick.
+
+### 14. Error-aware backoff (1.2.4, optional manual)
+
+To verify that 4xx responses do **not** stretch the sync interval,
+temporarily set `API_KEY` on the backend to a random value after the
+iOS app has already sent its first batch:
+
+```bash
+API_KEY=rotated docker compose up -d backend
+```
+
+- Expected: the iOS debug console shows
+  `[sync] points NON-RETRYABLE: points HTTP 401 — batch retained` on
+  every tick at the base 30 s cadence (not doubling).
+- Restore the original `API_KEY` (or clear it) and within one tick
+  the batch uploads successfully and the interval stays at the base
+  value. Retryable failures (kill the backend entirely so requests
+  time out) are the ones that actually double the interval up to the
+  5-min cap.
 
 ## Inspecting fix_diagnostics after an anomaly
 

@@ -184,6 +184,33 @@ Notes:
   without range constraints — negative values are Apple's sentinels for
   "no data" and are exactly what we need to preserve.
 
+### Data retention
+
+The backend ships **no automated retention**. Both `points` and
+`fix_diagnostics` grow without bound. This is a conscious decision, not an
+oversight:
+
+- **Volume is manageable.** With aggressive client-side filtering (three
+  gates in `LocationFilter`, stationary suppression) a daily-active single
+  user produces ~1–5 k points/day, or a few million rows per year.
+  Postgres + the composite `(device_id, created_at)` index handle that
+  comfortably on any reasonable host.
+- **History belongs in backups, not tables.** The `db-backup` sidecar
+  (see `docker-compose.yml`) runs `pg_dump -Fc` every 24 h and keeps
+  seven days of dumps in the `db-backup` named volume. Long-term history
+  lives there; the hot tables carry only what's currently useful.
+- **Pruning is a deployment choice.** If a specific operator needs to
+  cap growth, the natural pattern is a time-range `DELETE` on
+  `fix_diagnostics` first (debug-only, no UI dependency), then on
+  `points` only if unavoidable. No migration ships to do this
+  automatically — the decision about what to keep is per-deployment.
+
+The **iOS device's local SQLite is different**: `fix_diagnostics` rows
+are pruned after 3 days (`cleanupDiagnostics`), and `points` rows are
+deleted immediately after a successful 2xx upload to `/points`. The
+on-device DB is a staging buffer, not a store of record; the backend
+Postgres is authoritative for everything.
+
 ## Running it
 
 ### 1. Full stack via Docker Compose (recommended)
@@ -364,6 +391,34 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **Background sync + error-aware backoff** (1.2.4):
+  - `GpsLoggerApp` registers a `BGAppRefreshTask`
+    (`com.gpslogger.personal.refresh`) and submits a new request on
+    every background scenePhase transition. When iOS wakes the app the
+    handler calls `SyncService.drainOnce` and re-submits, so the local
+    upload queue drains even when the foreground `Timer` is suspended
+    (stationary phone, long indoor stop, airplane-mode recovery). Paired
+    Info.plist entries (`UIBackgroundModes += fetch`,
+    `BGTaskSchedulerPermittedIdentifiers`) are declared in `project.yml`.
+  - HTTP outcomes are classified into a `SyncResult` enum: 2xx →
+    `.success`, network errors / 408 / 429 / 5xx → `.retryable`
+    (exponential backoff doubles up to 5 min), every other 4xx →
+    `.nonRetryable` (batch retained, loud release-build log, interval
+    held steady so a client bug — schema drift, rotated key,
+    misconfigured URL — surfaces within seconds instead of being masked
+    behind a 5 min cadence).
+  - `NWPathMonitor` short-circuits the drain when the device has no
+    usable network, replacing the previous 15 s URLSession-timeout spin
+    in airplane mode / captive portals with a fast no-op skip.
+  - Fetch → upload → delete is now explicitly documented as
+    non-atomic: a crash between a 2xx and the local `DELETE` replays
+    the batch, and the backend's unique `(device_id, created_at)` /
+    `(device_id, fix_timestamp)` constraints from migration 004 absorb
+    the replay. Any future weakening of those constraints must also
+    introduce a two-phase commit on the iOS side.
+  - `Database` sets `PRAGMA synchronous=NORMAL` explicitly alongside
+    WAL mode so the crash-safety posture is reviewable in code rather
+    than implicit in the iOS SQLite default.
 - **Distance filter (first gate).** Two layers ensure no points land closer
   than 10 m: `CLLocationManager.distanceFilter = 10` and a defensive
   per-insert check.
@@ -424,30 +479,69 @@ flowchart LR
 ### Backend — minimalism
 
 - Three routes + health endpoint: `POST /points`, `GET /points`,
-  `POST /diagnostics`. No auth, no envelopes, no extra layers.
-- Parameterized multi-row `INSERT` for O(1) round-trips per batch on both
-  write endpoints.
+  `POST /diagnostics`. No envelopes, no extra layers. Optional
+  `API_KEY` bearer-token auth gates the two POST routes — compared
+  with `crypto.timingSafeEqual` so the key prefix doesn't leak
+  through a response-time side channel. `GET /health` and `GET /points`
+  are unprotected so the frontend and Docker healthcheck keep working
+  without a token.
+- `GET /health` runs `SELECT 1` against the pool and returns 503 on
+  failure, so the Docker healthcheck reflects actual DB reachability,
+  not just process liveness.
+- Parameterized multi-row `INSERT` for O(1) round-trips per batch on
+  both write endpoints. `ON CONFLICT DO NOTHING` on the natural
+  idempotency keys turns retried-after-lost-response batches into
+  no-ops (see migration `004_idempotency.sql`).
 - Range query is a single `SELECT … WHERE device_id = ? AND created_at
   BETWEEN` against the composite `(device_id, created_at)` index.
+  Results are capped at 10 001 rows and the response includes a
+  `truncated` flag so the client can narrow the range.
+- Structured logging via `pino` with per-request correlation IDs:
+  inbound `X-Request-ID` is honored if present, else a UUID v4 is
+  minted and echoed back on the response. Every downstream log line
+  carries `reqId` so cross-hop trace stitching is free.
+- Graceful shutdown on `SIGTERM` / `SIGINT`: stops the HTTP listener,
+  drains the pg pool, exits — with an 8 s hard deadline fallback so
+  Docker never has to escalate to `SIGKILL` on a clean restart.
 - No `GET /diagnostics` — diagnostics are read via psql / a DB browser
   against Postgres directly, not through the API, because they're a
   debug/observability channel and the frontend never displays them.
 - Pure-function input validators with a dedicated unit-test suite
-  (35 tests covering both `validateBatch` and `validateDiagnosticsBatch`).
+  (35 tests covering `validateBatch`, `validateDiagnosticsBatch`, and
+  `validateRange`).
 
 ### Frontend — visualization
 
 - User-driven fetch only. **No auto-refresh, no clustering, no heatmap.**
-- Splits the time-sorted points into groups whenever consecutive fixes are
-  more than **5 minutes** apart, so unrelated trips (or power-off periods)
-  never get bridged by a straight "teleport" line.
-- Downsamples each group with a shared global budget of ≤ 4000 points total.
-- Renders one halo + gradient polyline per group; gradient `t` stays global
-  across groups so colors track progression across the full query window
-  (blue early → red late).
-- Each polyline is split into up to 64 colored chunks to fake a gradient
-  under Leaflet's single-color-per-polyline limitation.
+- **Query range in URL.** The `from`/`to` datetime selectors round-trip
+  through `URLSearchParams` (ISO UTC, `history.replaceState` so history
+  stays clean), so reloading the page or sharing the link hydrates the
+  same range. Device ID stays in `localStorage` because it's identity,
+  not query state; Logout clears both.
+- Splits the time-sorted points into groups whenever consecutive fixes
+  are more than **5 minutes** apart, so unrelated trips (or power-off
+  periods) never get bridged by a straight "teleport" line.
+- Downsamples each group with a shared global budget of ≤ 4000 points
+  total, always preserving the first and last fix of each group.
+- Groups of ≥ 2 points render as a halo + gradient polyline; groups of
+  a single point render as standalone `CircleMarker`s (1.2.4) so an
+  isolated fix in a sparse tracking window doesn't silently disappear
+  between the status-bar count and the map.
+- Gradient `t` stays global across groups so colors track progression
+  across the full query window (blue early → red late). Each polyline
+  is split into up to 64 colored chunks to fake a gradient under
+  Leaflet's single-color-per-polyline limitation.
+- Clicks snap to the nearest rendered point in **screen-pixel space**
+  via `map.latLngToContainerPoint` (30 px radius), so the snap behavior
+  stays consistent at every zoom level — the previous degree-based
+  radius was ~1 km regardless of zoom and felt erratic at the extremes.
 - `fitBounds` on every successful fetch.
+- Nginx serves the built SPA with a locked-down CSP,
+  `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and
+  `Referrer-Policy: no-referrer-when-downgrade` (see
+  `frontend/nginx.conf`). Only `nominatim.openstreetmap.org` and the
+  CARTO / OpenStreetMap tile hosts are whitelisted for outbound
+  connections.
 
 ## Tests
 
@@ -455,7 +549,11 @@ flowchart LR
 # backend unit tests (35 cases: validateBatch + validateDiagnosticsBatch + validateRange)
 cd backend && node --test test/
 
-# iOS unit tests (41 cases across LocationFilter, Database drain, 
+# frontend unit tests (20 cases covering splitByTimeGaps, downsampleGroups,
+# gradientColor, buildSegments — the pure functions behind the route view)
+cd frontend && npm test
+
+# iOS unit tests (48 cases across LocationFilter, Database drain,
 # MotionClassifier classify, and StationaryDetector state machine)
 cd ios && xcodegen generate && xcodebuild test \
     -project GpsLogger.xcodeproj \
@@ -480,8 +578,9 @@ GpsLogger/
 │   │   ├── 001_init.sql
 │   │   ├── 002_device_id.sql
 │   │   ├── 003_fix_diagnostics.sql
-│   │   └── 004_idempotency.sql
-│   ├── src/{index,db,validate}.js
+│   │   ├── 004_idempotency.sql
+│   │   └── 005_cleanup.sql
+│   ├── src/{index,db,log,validate}.js
 │   ├── src/routes/{points,diagnostics}.js
 │   └── test/validate.test.js
 ├── frontend/
@@ -491,7 +590,11 @@ GpsLogger/
 │   ├── package.json
 │   ├── vite.config.ts
 │   ├── index.html
-│   └── src/{main,App,Map,api,styles,vite-env.d}.{tsx,ts,css}
+│   └── src/
+│       ├── {main,App,Map}.tsx
+│       ├── {api,route,vite-env.d}.ts
+│       ├── route.test.ts                pure-function vitest suite
+│       └── styles.css
 └── ios/
     ├── README.md                     Xcode setup guide
     ├── project.yml                   xcodegen spec (main + test target)

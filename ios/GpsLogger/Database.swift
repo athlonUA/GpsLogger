@@ -133,7 +133,17 @@ final class Database {
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_fix_diagnostics_logged_at ON fix_diagnostics(logged_at);")
 
+        // WAL + synchronous=NORMAL is the documented safe pairing for
+        // iOS-local SQLite: WAL provides crash recovery via the write-ahead
+        // log, and NORMAL lets SQLite skip the extra fsync on every commit
+        // while still fsync'ing at checkpoint boundaries. The combined
+        // worst case on power loss is losing the last transaction, not
+        // corrupting the database. FULL would fsync on every commit and is
+        // unnecessary here — no financial-grade durability requirement, and
+        // the battery cost on a high-write path (every accepted fix) would
+        // be noticeable. Made explicit so the safety posture is reviewable.
         exec("PRAGMA journal_mode=WAL;")
+        exec("PRAGMA synchronous=NORMAL;")
     }
 
     deinit {

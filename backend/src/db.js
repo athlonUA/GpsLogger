@@ -2,6 +2,7 @@ import pg from 'pg';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { logger } from './log.js';
 
 const { Pool } = pg;
 
@@ -27,6 +28,6 @@ export async function migrate() {
   for (const f of files) {
     const sql = fs.readFileSync(path.join(migrationsDir, f), 'utf8');
     await pool.query(sql);
-    console.log(`[migrate] applied ${f}`);
+    logger.info({ migration: f }, 'applied');
   }
 }

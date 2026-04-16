@@ -8,111 +8,39 @@ import {
 } from 'react-leaflet';
 import L from 'leaflet';
 import type { Point } from './api';
+import { buildSegments, downsampleGroups, splitByTimeGaps } from './route';
 
-const MAX_POINTS = 4000;
-const GRADIENT_CHUNKS = 64;
 const MAX_ZOOM = 20;
-// Break the route whenever consecutive fixes are more than this far apart in
-// time. Bridging such gaps would draw straight "teleport" lines across
-// unrelated locations (car trips, power-off periods, etc.).
-const GAP_MS = 5 * 60 * 1000;
 
-// Split a time-sorted list of points into groups, starting a new group
-// whenever the time delta to the previous point exceeds GAP_MS.
-function splitByTimeGaps(points: Point[]): Point[][] {
-  if (points.length === 0) return [];
-  const groups: Point[][] = [[points[0]]];
-  let prevTime = new Date(points[0].created_at).getTime();
-  for (let i = 1; i < points.length; i++) {
-    const cur = points[i];
-    const curTime = new Date(cur.created_at).getTime();
-    const dt = curTime - prevTime;
-    if (Number.isFinite(dt) && dt > GAP_MS) {
-      groups.push([cur]);
-    } else {
-      groups[groups.length - 1].push(cur);
-    }
-    prevTime = curTime;
-  }
-  return groups;
-}
+// Snap distance in screen pixels. Converting through `latLngToContainerPoint`
+// makes the threshold zoom-invariant: 30 px is 30 px on the user's screen
+// whether they're looking at a continent (zoom 3) or a street (zoom 18). The
+// previous degree² radius was ~1 km regardless of zoom, which was useless at
+// both extremes (too wide when zoomed out, too narrow when zoomed in).
+const MAX_CLICK_DIST_PX = 30;
+const MAX_CLICK_DIST_PX_SQ = MAX_CLICK_DIST_PX * MAX_CLICK_DIST_PX;
 
-// Downsample each group independently while sharing a global point budget
-// proportional to group size. Preserves segment boundaries (no merging) and
-// always keeps the first/last fix of each group so endpoints stay anchored.
-function downsampleGroups(groups: Point[][]): Point[][] {
-  const total = groups.reduce((s, g) => s + g.length, 0);
-  if (total <= MAX_POINTS) return groups;
-  return groups.map((g) => {
-    if (g.length <= 2) return g;
-    const target = Math.max(2, Math.floor((g.length * MAX_POINTS) / total));
-    const step = Math.ceil(g.length / target);
-    const out: Point[] = [];
-    for (let i = 0; i < g.length; i += step) out.push(g[i]);
-    const last = g[g.length - 1];
-    if (out[out.length - 1] !== last) out.push(last);
-    return out;
-  });
-}
-
-// Blue (240°) → Purple (285°) → Red (360°) with purple exactly at t=0.5.
-function gradientColor(t: number): string {
-  const h =
-    t < 0.5
-      ? 240 + (285 - 240) * (t / 0.5)
-      : 285 + (360 - 285) * ((t - 0.5) / 0.5);
-  return `hsl(${h.toFixed(1)}, 78%, 58%)`;
-}
-
-type Segment = { positions: [number, number][]; color: string };
-
-// Build gradient-colored polyline chunks for every group. Gradient t is
-// computed against the global sampled-point index so colors still convey
-// progression across the whole query window, not just within one group.
-function buildSegments(groups: Point[][]): Segment[] {
-  const total = groups.reduce((s, g) => s + g.length, 0);
-  if (total < 2) return [];
-  const segs: Segment[] = [];
-  let globalIdx = 0;
-  for (const group of groups) {
-    const n = group.length;
-    if (n >= 2) {
-      const chunks = Math.min(GRADIENT_CHUNKS, n - 1);
-      for (let c = 0; c < chunks; c++) {
-        const start = Math.floor((c * (n - 1)) / chunks);
-        const end = Math.floor(((c + 1) * (n - 1)) / chunks) + 1;
-        const positions = group
-          .slice(start, end)
-          .map((p) => [p.latitude, p.longitude] as [number, number]);
-        const mid = globalIdx + (start + end - 1) / 2;
-        const t = total <= 1 ? 0 : mid / (total - 1);
-        segs.push({ positions, color: gradientColor(t) });
-      }
-    }
-    globalIdx += n;
-  }
-  return segs;
-}
-
-// Max squared-degree distance for a click to snap to a point. ~0.01° ≈ 1 km
-// at mid-latitudes — generous enough for any zoom level where the route is
-// visible, but prevents snapping to a point when clicking far from the track.
-const MAX_CLICK_DIST_SQ = 0.01 * 0.01;
-
-function findNearestPoint(points: Point[], lat: number, lng: number): Point | null {
+function findNearestPoint(
+  points: Point[],
+  map: L.Map,
+  clickLat: number,
+  clickLng: number,
+): Point | null {
   if (points.length === 0) return null;
+  const clickPt = map.latLngToContainerPoint([clickLat, clickLng]);
   let best = points[0];
-  let bestDist = Infinity;
+  let bestDistSq = Infinity;
   for (const p of points) {
-    const dLat = p.latitude - lat;
-    const dLng = p.longitude - lng;
-    const d = dLat * dLat + dLng * dLng;
-    if (d < bestDist) {
-      bestDist = d;
+    const pt = map.latLngToContainerPoint([p.latitude, p.longitude]);
+    const dx = pt.x - clickPt.x;
+    const dy = pt.y - clickPt.y;
+    const d = dx * dx + dy * dy;
+    if (d < bestDistSq) {
+      bestDistSq = d;
       best = p;
     }
   }
-  if (bestDist > MAX_CLICK_DIST_SQ) return null;
+  if (bestDistSq > MAX_CLICK_DIST_PX_SQ) return null;
   return best;
 }
 
@@ -125,6 +53,20 @@ function FitBounds({ points }: { points: Point[] }) {
     );
     map.fitBounds(bounds, { padding: [60, 60], maxZoom: 17 });
   }, [points, map]);
+  return null;
+}
+
+// Capture the Leaflet `Map` instance into a ref owned by the parent so the
+// click handler (which lives outside the MapContainer subtree) can call
+// `latLngToContainerPoint` for pixel-space snap math. Runs once per mount.
+function MapRefCapture({ mapRef }: { mapRef: React.MutableRefObject<L.Map | null> }) {
+  const map = useMap();
+  useEffect(() => {
+    mapRef.current = map;
+    return () => {
+      mapRef.current = null;
+    };
+  }, [map, mapRef]);
   return null;
 }
 
@@ -283,7 +225,7 @@ export default function MapView({ points }: { points: Point[] }) {
     [points],
   );
   const sampled = useMemo(() => groups.flat(), [groups]);
-  const segments = useMemo(() => buildSegments(groups), [groups]);
+  const { segments, singletons } = useMemo(() => buildSegments(groups), [groups]);
 
   // One halo polyline per group — keeps the subtle shadow under the route but
   // honors the same time-gap breaks so it doesn't bridge disconnected sessions.
@@ -307,6 +249,9 @@ export default function MapView({ points }: { points: Point[] }) {
   const cacheRef = useRef(new Map<string, string>());
   const requestIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
+  // Map ref populated by `MapRefCapture`. Used by the click handler to
+  // project lat/lng into screen pixels for zoom-invariant snap distance.
+  const mapRef = useRef<L.Map | null>(null);
 
   // Reset selection when the underlying points change (new query).
   useEffect(() => {
@@ -349,15 +294,30 @@ export default function MapView({ points }: { points: Point[] }) {
 
   const handleRouteClick = useCallback(
     (e: L.LeafletMouseEvent) => {
-      const nearest = findNearestPoint(sampled, e.latlng.lat, e.latlng.lng);
+      const map = mapRef.current;
+      if (!map) return;
+      const nearest = findNearestPoint(sampled, map, e.latlng.lat, e.latlng.lng);
       if (nearest) selectPoint(nearest);
     },
     [sampled, selectPoint],
   );
 
-  const hasRoute = sampled.length >= 2;
-  const first = hasRoute ? sampled[0] : null;
-  const last = hasRoute ? sampled[sampled.length - 1] : null;
+  // Start/end markers are anchors for the polyline endpoints, not for any
+  // isolated singleton fix. Deriving them from the first/last polyline
+  // group prevents the white-filled start/end ring from drawing over (and
+  // visually swallowing) a singleton CircleMarker that happens to sit at
+  // position 0 or length-1 of `sampled`.
+  const first = useMemo(() => {
+    for (const g of groups) if (g.length >= 2) return g[0];
+    return null;
+  }, [groups]);
+  const last = useMemo(() => {
+    for (let i = groups.length - 1; i >= 0; i--) {
+      const g = groups[i];
+      if (g.length >= 2) return g[g.length - 1];
+    }
+    return null;
+  }, [groups]);
 
   return (
     <div className="map-wrapper">
@@ -404,6 +364,26 @@ export default function MapView({ points }: { points: Point[] }) {
               lineJoin: 'round',
             }}
             eventHandlers={{ click: handleRouteClick }}
+          />
+        ))}
+
+        {/* Isolated fixes — groups of a single point after time-gap split.
+            Rendered on their own so the on-map count matches the status
+            bar. Color is the gradient value at their chronological index,
+            so a lone point in the middle of a query window picks up the
+            mid-gradient hue rather than looking like an unrelated marker. */}
+        {singletons.map((s, i) => (
+          <CircleMarker
+            key={`singleton-${i}`}
+            center={[s.point.latitude, s.point.longitude]}
+            radius={5}
+            pathOptions={{
+              color: s.color,
+              fillColor: s.color,
+              fillOpacity: 0.9,
+              weight: 2,
+            }}
+            eventHandlers={{ click: () => selectPoint(s.point) }}
           />
         ))}
 
@@ -454,6 +434,7 @@ export default function MapView({ points }: { points: Point[] }) {
         )}
 
         <FitBounds points={sampled} />
+        <MapRefCapture mapRef={mapRef} />
       </MapContainer>
 
       {selected && (

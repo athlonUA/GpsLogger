@@ -18,9 +18,33 @@ function readStoredDeviceId(): string {
   }
 }
 
+// Parse an ISO datetime string from the URL query string. Returns undefined
+// if the param is missing or unparseable so callers can fall back to the
+// default 24 h window. The wire format is ISO UTC (from `Date.toISOString`)
+// so the URL is time-zone stable across browsers — sharing a link between
+// two users in different zones produces the same absolute time window.
+function readUrlDate(key: string): Date | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const raw = new URLSearchParams(window.location.search).get(key);
+  if (!raw) return undefined;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? undefined : d;
+}
+
 export default function App() {
-  const initialFrom = useMemo(() => new Date(Date.now() - 24 * 60 * 60 * 1000), []);
-  const initialTo = useMemo(() => new Date(), []);
+  // Defaults fall back to a 24 h window ending now. URL params (if valid)
+  // override on first render so reloads / shared links hydrate the same
+  // range the previous session was looking at.
+  const initialFrom = useMemo(
+    () => readUrlDate('from') ?? new Date(Date.now() - 24 * 60 * 60 * 1000),
+    [],
+  );
+  const initialTo = useMemo(() => readUrlDate('to') ?? new Date(), []);
+  // `defaultFrom`/`defaultTo` are the always-fresh values used by Logout to
+  // reset the range to "last 24 h" rather than to whatever URL the session
+  // was loaded with.
+  const defaultFrom = useMemo(() => new Date(Date.now() - 24 * 60 * 60 * 1000), []);
+  const defaultTo = useMemo(() => new Date(), []);
 
   const [deviceId, setDeviceId] = useState<string>(() => readStoredDeviceId());
   const [from, setFrom] = useState(toLocalInputValue(initialFrom));
@@ -44,6 +68,28 @@ export default function App() {
       /* storage disabled — in-memory state still works for this session */
     }
   }, [deviceId]);
+
+  // Mirror the date range into the URL so the page is reloadable /
+  // shareable. `replaceState` keeps the browser history clean — every
+  // keystroke in the datetime-local inputs would otherwise push a new
+  // entry. Invalid `Date` values (shouldn't happen via the input, but
+  // defensively) skip the write instead of throwing.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const fromDate = new Date(from);
+      const toDate = new Date(to);
+      if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) return;
+      params.set('from', fromDate.toISOString());
+      params.set('to', toDate.toISOString());
+      const qs = params.toString();
+      const next = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
+      window.history.replaceState(null, '', next);
+    } catch {
+      /* non-browser or locked history API — non-fatal */
+    }
+  }, [from, to]);
 
   const onVisualize = useCallback(async () => {
     if (!deviceId) {
@@ -75,9 +121,22 @@ export default function App() {
     setDeviceId('');
     setPoints([]);
     setError(null);
-    setFrom(toLocalInputValue(initialFrom));
-    setTo(toLocalInputValue(initialTo));
-  }, [initialFrom, initialTo]);
+    setFrom(toLocalInputValue(defaultFrom));
+    setTo(toLocalInputValue(defaultTo));
+    // Clear query params too, so the refreshed URL reflects the logged-out
+    // state. Hash is preserved in case routing is ever added.
+    if (typeof window !== 'undefined') {
+      try {
+        window.history.replaceState(
+          null,
+          '',
+          `${window.location.pathname}${window.location.hash}`,
+        );
+      } catch {
+        /* non-fatal */
+      }
+    }
+  }, [defaultFrom, defaultTo]);
 
   const pointsLabel = truncated
     ? `${points.length.toLocaleString()} points (truncated — narrow the time range)`

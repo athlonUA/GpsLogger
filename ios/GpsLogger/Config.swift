@@ -142,6 +142,23 @@ enum Config {
     /// of reacquisition, filtering the worst multipath convergence fixes.
     static let resumeMaxAccuracyMeters: CLLocationDistance = 20
 
+    /// Identifier for the `BGAppRefreshTask` that wakes the app in
+    /// background so `SyncService` can drain the local upload queue when
+    /// the foreground `Timer` is suspended. Must match an entry in the
+    /// `BGTaskSchedulerPermittedIdentifiers` Info.plist array (populated
+    /// from `project.yml`) and the argument passed to
+    /// `BGTaskScheduler.shared.register(forTaskWithIdentifier:)`. By
+    /// convention we prefix with the bundle identifier.
+    static let backgroundRefreshTaskId = "com.gpslogger.personal.refresh"
+
+    /// Earliest-begin delay for the next `BGAppRefreshTaskRequest`. iOS
+    /// applies an internal floor around 15 min for BGAppRefresh regardless
+    /// of what the client requests; anything sooner is silently clamped.
+    /// 15 min is a practical compromise — frequent enough that a suspended
+    /// phone still ships points within an acceptable window, infrequent
+    /// enough to stay inside iOS's energy budget.
+    static let backgroundRefreshMinInterval: TimeInterval = 15 * 60
+
     /// Info.plist key for the optional API key. Populated at build time
     /// from `$(API_KEY)` in the gitignored xcconfig, the same mechanism
     /// used for `API_BASE_URL`. When set, SyncService sends it as a
