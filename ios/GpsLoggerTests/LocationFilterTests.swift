@@ -334,6 +334,70 @@ final class LocationFilterTests: XCTestCase {
         }
     }
 
+    // MARK: - Deadlock escape valve (1.2.6)
+
+    func testGapAccuracyStaysTightAtRelaxBoundary() {
+        // Boundary: dt == resumeRelaxSeconds exactly. Still inside the
+        // tight tier — gate should reject the 30 m fix.
+        var filter = LocationFilter(
+            resumeGap: 60,
+            resumeMaxAccuracy: 20,
+            resumeRelax: 120
+        )
+        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
+        feed(&filter, a)
+        let b = makeFix(lat: 50.4510, lon: 30.5240,
+                        horizontalAccuracy: 30, timestamp: date(120))
+        XCTAssertEqual(
+            filter.consume(b, now: date(120.5)),
+            .discard(.poorResumeAccuracy(meters: 30)),
+            "at dt == resumeRelax the tight 20 m ceiling must still apply"
+        )
+    }
+
+    func testGapAccuracyEscapesAfterRelaxThreshold() {
+        // Core deadlock-escape test. 20–50 m fixes must start being
+        // accepted once dt exceeds resumeRelaxSeconds — otherwise the
+        // filter self-reinforces into the 17-minute blackout observed in
+        // the 2026-04-16 production session.
+        var filter = LocationFilter(
+            resumeGap: 60,
+            resumeMaxAccuracy: 20,
+            resumeRelax: 120
+        )
+        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
+        feed(&filter, a)
+        // dt = 180 s (well past the 120 s relax threshold). hAcc = 30 m
+        // would have been rejected under the old tight-forever gate;
+        // under the 1.2.6 relaxed tier the normal 50 m ceiling applies
+        // and the fix is accepted.
+        let b = makeFix(lat: 50.4510, lon: 30.5240,
+                        horizontalAccuracy: 30, timestamp: date(180))
+        guard case .accept = filter.consume(b, now: date(180.5)) else {
+            return XCTFail("after dt > resumeRelax, hAcc 30 m must be accepted")
+        }
+    }
+
+    func testGapAccuracyRelaxDoesNotWeakenNormalCeiling() {
+        // After relax, the normal 50 m ceiling still applies — a 60 m fix
+        // is still poor accuracy and must be rejected via the normal gate,
+        // not let through as part of the escape valve.
+        var filter = LocationFilter(
+            resumeGap: 60,
+            resumeMaxAccuracy: 20,
+            resumeRelax: 120
+        )
+        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
+        feed(&filter, a)
+        let b = makeFix(lat: 50.4510, lon: 30.5240,
+                        horizontalAccuracy: 60, timestamp: date(300))
+        XCTAssertEqual(
+            filter.consume(b, now: date(300.5)),
+            .discard(.poorAccuracy(meters: 60)),
+            "relaxed tier must still reject > 50 m as poorAccuracy"
+        )
+    }
+
     // MARK: - Helpers
 
     private let baseTime = Date(timeIntervalSince1970: 1_700_000_000)

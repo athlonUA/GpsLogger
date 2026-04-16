@@ -23,9 +23,18 @@ import CoreLocation
 ///   3. Accuracy value: `horizontalAccuracy ≤ maxHorizontalAccuracyMeters`.
 ///   4. Chronology: `Δt > 0` vs. the last accepted fix (rejects replayed /
 ///      cached fixes).
-///  4b. Gap-aware accuracy: if `Δt > resumeGapSeconds`, require
-///      `horizontalAccuracy ≤ resumeMaxAccuracyMeters` — filters multipath
-///      convergence fixes after extended indoor / tunnel / background gaps.
+///  4b. Gap-aware accuracy (three-tier, tightened in 1.2.2, relaxed in 1.2.6):
+///      - `Δt ≤ resumeGapSeconds (60 s)` — normal 50 m ceiling applies.
+///      - `resumeGapSeconds < Δt ≤ resumeRelaxSeconds (120 s)` — tightened
+///        to `resumeMaxAccuracyMeters (20 m)` to filter multipath
+///        convergence after a short indoor / tunnel gap.
+///      - `Δt > resumeRelaxSeconds (120 s)` — **relaxed back to 50 m** so
+///        a sustained-marginal-signal scenario cannot self-reinforce into
+///        a multi-minute accepted-fix blackout. Production observation
+///        (v1.2.5, 2026-04-16): a 60 s tram signal dip cascaded into a
+///        17-minute rejection loop because every new fix fell in the
+///        20–50 m band, keeping `Δt` growing and the gate tight
+///        indefinitely. The 120 s relax threshold bounds that worst case.
 ///   5. Implied speed ≤ `maxPlausibleSpeedMps` — intentionally very relaxed
 ///      (500 km/h), only catches teleport-class glitches.
 ///   6. Single-point look-ahead buffer rejects the classic
@@ -77,6 +86,7 @@ struct LocationFilter {
     private let maxFixAge: TimeInterval
     private let resumeGap: TimeInterval
     private let resumeMaxAccuracy: CLLocationDistance
+    private let resumeRelax: TimeInterval
 
     init(
         maxAccuracy: CLLocationDistance = Config.maxHorizontalAccuracyMeters,
@@ -87,7 +97,8 @@ struct LocationFilter {
         pendingTimeout: TimeInterval = Config.pendingTimeoutSeconds,
         maxFixAge: TimeInterval = Config.maxFixAgeSeconds,
         resumeGap: TimeInterval = Config.resumeGapSeconds,
-        resumeMaxAccuracy: CLLocationDistance = Config.resumeMaxAccuracyMeters
+        resumeMaxAccuracy: CLLocationDistance = Config.resumeMaxAccuracyMeters,
+        resumeRelax: TimeInterval = Config.resumeRelaxSeconds
     ) {
         self.maxAccuracy = maxAccuracy
         self.minDistance = minDistance
@@ -98,6 +109,7 @@ struct LocationFilter {
         self.maxFixAge = maxFixAge
         self.resumeGap = resumeGap
         self.resumeMaxAccuracy = resumeMaxAccuracy
+        self.resumeRelax = resumeRelax
     }
 
     mutating func reset() {
@@ -188,12 +200,18 @@ struct LocationFilter {
             return .discard(.staleTimestamp)
         }
 
-        // 4b. Gap-aware accuracy tightening. After a long signal gap the GPS
-        //     receiver is in convergence mode — its first fixes are likely to
-        //     suffer multipath displacement despite reporting optimistic
-        //     horizontalAccuracy. Require a tighter ceiling until the receiver
-        //     stabilises.
-        if dt > resumeGap, loc.horizontalAccuracy > resumeMaxAccuracy {
+        // 4b. Gap-aware accuracy — three-tier gate. Between `resumeGap` and
+        //     `resumeRelax`, require a tighter ceiling (typical post-indoor
+        //     multipath convergence completes in 30–90 s, so the 20 m
+        //     ceiling catches those first degraded fixes). Beyond
+        //     `resumeRelax`, fall back to the normal 50 m ceiling: if the
+        //     receiver still hasn't produced a sub-20 m fix after two full
+        //     minutes, the problem is no longer "convergence" — it is
+        //     sustained marginal signal — and continuing to reject is a
+        //     self-reinforcing deadlock, not a defense. See the 1.2.6
+        //     fix-notes in `README.md`.
+        if dt > resumeGap, dt <= resumeRelax,
+           loc.horizontalAccuracy > resumeMaxAccuracy {
             return .discard(.poorResumeAccuracy(meters: loc.horizontalAccuracy))
         }
 

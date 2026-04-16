@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (49 cases across 4 test files)
+### iOS unit tests (52 cases across 4 test files)
 
 ```
 cd ios
@@ -13,7 +13,7 @@ xcodebuild test -project GpsLogger.xcodeproj -scheme GpsLoggerTests \
     -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
-**`LocationFilterTests` (23 cases)** — every gate in the filter
+**`LocationFilterTests` (26 cases)** — every gate in the filter
 pipeline end-to-end:
 
 - validity gate (negative `horizontalAccuracy` → discard `.invalidFix`)
@@ -40,11 +40,17 @@ pipeline end-to-end:
   rejects fixes whose timestamp is > 10 s *ahead* of wall-clock, which
   happens on system-clock skew backward (NTP correction, manual time
   change, DST edge)
-- **gap-aware accuracy** (1.2.2): after `Δt > 60 s`, accuracy ceiling
-  tightens from 50 m to 20 m (`discard:poorResumeAccuracy`); good
-  accuracy (≤ 20 m) is accepted even after a gap; mediocre accuracy
-  (20–50 m) is accepted during continuous tracking; first-ever fix
-  uses the normal 50 m ceiling (no dt to compare)
+- **gap-aware accuracy** (1.2.2, three-tier in 1.2.6): after
+  `Δt > 60 s`, accuracy ceiling tightens from 50 m to 20 m
+  (`discard:poorResumeAccuracy`); good accuracy (≤ 20 m) is accepted
+  even after a gap; mediocre accuracy (20–50 m) is accepted during
+  continuous tracking; first-ever fix uses the normal 50 m ceiling
+  (no dt to compare)
+- **deadlock escape valve** (1.2.6): at `Δt > 120 s` the gate falls
+  back to the normal 50 m ceiling so sustained marginal signal cannot
+  self-reinforce; boundary `Δt == 120 s` still tight; extreme `Δt`
+  with > 50 m hAcc still rejected as `poorAccuracy` (the relax tier
+  restores the normal gate, it does not disable it)
 - regression: stationary GPS fix (speed = 0, valid vertical accuracy)
   must still be accepted — the source gate must not confuse a
   standing-still user with a network-derived fix
@@ -533,7 +539,8 @@ docker exec gpslogger-db-1 psql -U postgres -d gpslogger -c \
 | `≥ 0` | `> 0` | growing with distance from real position | Regular GPS degradation — the 50 m `poorAccuracy` gate should have clipped the worst. |
 | `≥ 0` | `> 0` | normal | Multipath / transient glitch — spike buffer should have handled it. |
 | any | any | any, but `logged_at − fix_timestamp > 10 s` | Cached fix replay — `discard:staleDelivery` gate (1.2.2) should have rejected it. |
-| `≥ 0` | `> 0` | 20–50 m, first fix after gap > 60 s | Post-indoor multipath convergence — `discard:poorResumeAccuracy` gate (1.2.2) should have rejected it. |
+| `≥ 0` | `> 0` | 20–50 m, first fix after gap > 60 s and ≤ 120 s | Post-indoor multipath convergence — `discard:poorResumeAccuracy` gate (1.2.2) should have rejected it. |
+| `≥ 0` | `> 0` | 20–50 m, first fix after gap > 120 s | **Expected behavior post-1.2.6**: the relaxed tier accepts these. If a long stretch of 20–50 m fixes is rejected instead, the gap-aware bounds in `Config` may have been retightened — review `resumeRelaxSeconds`. |
 | `-1` | `> 0` | normal (5–30 m), first 1–3 fixes after a cold boot / airplane-mode toggle / first-ever install | GNSS cold start with Doppler lock still acquiring. The receiver has a valid 3D fix (positive `vertical_accuracy`) but has not yet computed velocity. The source gate correctly rejects these as `discard:nonGpsSource` — not a bug, but it explains why the trace starts 5–15 s later than the tap on "Start". |
 | any | any | `logged_at` more than 10 s *ahead* of `fix_timestamp` (wall-clock jumped backward) | System clock skew (NTP correction, manual time change, DST edge). `discard:staleDelivery` (1.2.4 symmetric gate) rejects. |
 

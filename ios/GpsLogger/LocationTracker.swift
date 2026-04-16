@@ -69,6 +69,20 @@ final class LocationTracker: NSObject, ObservableObject {
     private var stationary = StationaryDetector()
     private let classifier = MotionClassifier()
 
+    /// Consecutive-discard counter. Resets on any `.accept`,
+    /// `.spikeReplaced`, or `.committedPending` decision; `.buffered` is
+    /// neither accept nor reject and does not disturb the counter. Used
+    /// only for observability — when the counter crosses the log
+    /// threshold we print a WARN line so long rejection streaks are
+    /// visible in Console.app without needing a Postgres query. The
+    /// filter itself does not branch on this value.
+    private var discardStreak = 0
+    /// Emit a WARN every N consecutive discards. 20 at ~1 s cadence is
+    /// ~20 s of sustained rejection — rare enough under normal operation
+    /// to catch real deadlocks, coarse enough not to spam the log on
+    /// legitimate short signal dips.
+    private static let discardStreakLogThreshold = 20
+
     /// Private serial queue for all database writes triggered by
     /// CoreLocation callbacks. CoreLocation delivers to the main queue;
     /// `Database.insert` / `Database.logDiagnostic` go through a
@@ -146,6 +160,20 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private func beginUpdates() {
         manager.startUpdatingLocation()
+        // Significant-location-changes is a secondary wake path. iOS can
+        // suspend or kill the app under memory pressure even with
+        // `.location` bg mode active; when that happens, regular
+        // `didUpdateLocations` callbacks stop until `distanceFilter` is
+        // crossed. SLC is cellular-triangulation powered (no extra GPS
+        // radio cost), fires on ~500 m displacements, and critically
+        // **relaunches the app** via `UIApplicationLaunchOptionsLocationKey`
+        // even from terminated state. On relaunch, `AppContainer.init`
+        // reconstructs the tracker and calls `start()` → `beginUpdates()`
+        // → the regular update stream resumes. Defense in depth against
+        // long background blackouts; no behavior change under normal
+        // operation because SLC fixes flow through the same filter path
+        // and either get accepted or correctly rejected on poor accuracy.
+        manager.startMonitoringSignificantLocationChanges()
         DispatchQueue.main.async { [weak self] in
             self?.isTracking = true
         }
@@ -153,6 +181,7 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private func stopUpdates() {
         manager.stopUpdatingLocation()
+        manager.stopMonitoringSignificantLocationChanges()
         DispatchQueue.main.async { [weak self] in
             self?.isTracking = false
         }
@@ -350,6 +379,19 @@ extension LocationTracker: CLLocationManagerDelegate {
                 database.logDiagnostic(snapshot)
             }
 
+            // Update the consecutive-discard observability counter. Any
+            // non-discard decision resets it; `.buffered` is intentionally
+            // a no-op so that a single held-back spike doesn't spuriously
+            // reset a real streak. The counter is for logging only.
+            switch decision {
+            case .accept, .spikeReplaced, .committedPending:
+                discardStreak = 0
+            case .buffered:
+                break
+            case .discard:
+                discardStreak += 1
+            }
+
             switch decision {
             case .accept(let accepted):
                 maybePersist(accepted)
@@ -359,6 +401,14 @@ extension LocationTracker: CLLocationManagerDelegate {
 
             case .discard(let reason):
                 logDiscard(reason, loc)
+                // Unconditional (not DEBUG-only) so sustained deadlocks in
+                // release builds show up in Console.app without needing
+                // the Postgres fix_diagnostics query. Triggered on every
+                // multiple of the threshold so the spam is bounded.
+                if discardStreak > 0
+                    && discardStreak % Self.discardStreakLogThreshold == 0 {
+                    print("[tracker] WARN: \(discardStreak) consecutive discards, latest=\(diagnosticTag(decision)) hAcc=\(Int(loc.horizontalAccuracy))m")
+                }
 
             case .spikeReplaced(let dropped, let accepted):
                 #if DEBUG

@@ -391,6 +391,29 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **Filter deadlock escape valve** (1.2.6):
+  - Gap-aware accuracy gate changed from two-tier (normal ≤ 60 s / tight
+    forever) to three-tier (normal ≤ 60 s / tight 60–120 s / relaxed
+    > 120 s). Fixes a self-reinforcing deadlock observed in the
+    2026-04-16 production session where a 60 s tram-tunnel signal dip
+    cascaded into a 17-minute accepted-fix blackout: every new fix
+    landed in the 20–50 m band, the gate stayed tight, `dt` kept
+    growing, and the receiver never produced a sub-20 m fix while the
+    user was under marginal signal. At `dt > 120 s` the ceiling now
+    falls back to the normal 50 m, bounding the worst case at two
+    minutes instead of seventeen. Multipath convergence defense for the
+    typical 30–90 s post-indoor reacquisition is unchanged.
+  - `LocationTracker` counts consecutive discards; every 20 rejections
+    in a row emits an unconditional `[tracker] WARN: N consecutive
+    discards` line so compound deadlocks are visible in Console.app
+    without needing the `fix_diagnostics` Postgres query.
+  - `LocationTracker` now also subscribes to
+    `startMonitoringSignificantLocationChanges` as a secondary wake
+    path. SLC is cellular-triangulation powered (no extra GPS radio
+    cost), fires on ~500 m displacements, and relaunches the app via
+    `UIApplicationLaunchOptionsLocationKey` even from terminated state.
+    Defense in depth for genuine iOS-kill scenarios where regular
+    background location updates alone won't resurrect the tracker.
 - **GPS audit follow-ups** (1.2.5):
   - Stale-delivery gate is now symmetric: `abs(delivery_age) > 10 s`
     rejects both cached replays (timestamp behind wall-clock) and
@@ -574,7 +597,7 @@ cd backend && node --test test/
 # gradientColor, buildSegments — the pure functions behind the route view)
 cd frontend && npm test
 
-# iOS unit tests (49 cases across LocationFilter, Database drain,
+# iOS unit tests (52 cases across LocationFilter, Database drain,
 # MotionClassifier classify, and StationaryDetector state machine)
 cd ios && xcodegen generate && xcodebuild test \
     -project GpsLogger.xcodeproj \

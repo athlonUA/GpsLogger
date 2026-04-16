@@ -142,6 +142,24 @@ enum Config {
     /// of reacquisition, filtering the worst multipath convergence fixes.
     static let resumeMaxAccuracyMeters: CLLocationDistance = 20
 
+    /// Deadlock-escape threshold for the gap-aware accuracy gate. The gate
+    /// tightens from 50 m to 20 m once `dt > resumeGapSeconds`, which is the
+    /// correct defense against multipath convergence after a short indoor /
+    /// tunnel gap. Under *sustained* marginal signal, the gate was observed in
+    /// production (v1.2.5, 2026-04-16 session) to self-reinforce: every
+    /// rejection pushed `dt` further, every new fix still landed in the
+    /// 20–50 m band, and the gate never released — producing a 17-minute
+    /// accepted-fix blackout despite the chip delivering one CLLocation
+    /// sample every ~5 s.
+    ///
+    /// This constant bounds the worst case. Once `dt` exceeds it, the gate
+    /// falls back to the normal 50 m ceiling so at least some movement data
+    /// is recorded. 120 s is large enough to still filter the vast majority
+    /// of real post-indoor multipath (which typically converges in 30–90 s)
+    /// yet small enough that a user who keeps walking through marginal
+    /// signal will see fixes reappear within two minutes, not seventeen.
+    static let resumeRelaxSeconds: TimeInterval = 120
+
     /// Identifier for the `BGAppRefreshTask` that wakes the app in
     /// background so `SyncService` can drain the local upload queue when
     /// the foreground `Timer` is suspended. Must match an entry in the
