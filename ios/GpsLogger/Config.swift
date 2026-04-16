@@ -122,4 +122,23 @@ enum Config {
     /// `stationaryRadiusMeters` so a single borderline jitter point can't
     /// toggle the mode. 30 m adds ~10 m of hysteresis.
     static let stationaryResumeMeters: CLLocationDistance = 30
+
+    /// Maximum age of a CLLocation fix relative to wall-clock time. CoreLocation
+    /// may deliver cached locations after a signal gap — Apple's documentation
+    /// explicitly recommends checking fix age. 10 s is generous enough to never
+    /// reject fresh fixes (normal delivery latency is 0.5–2 s) while catching
+    /// any cached replay from a previous signal window.
+    static let maxFixAgeSeconds: TimeInterval = 10
+
+    /// After a gap longer than this between accepted fixes, the accuracy
+    /// threshold tightens to `resumeMaxAccuracyMeters`. 60 s covers normal
+    /// sample intervals; longer gaps indicate signal loss (indoor, background,
+    /// tunnel) where the first returning fixes are disproportionately likely
+    /// to be multipath-degraded.
+    static let resumeGapSeconds: TimeInterval = 60
+
+    /// Tighter accuracy ceiling applied to the first fix after a gap exceeding
+    /// `resumeGapSeconds`. 20 m is achievable for outdoor GNSS within 5–15 s
+    /// of reacquisition, filtering the worst multipath convergence fixes.
+    static let resumeMaxAccuracyMeters: CLLocationDistance = 20
 }

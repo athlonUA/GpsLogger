@@ -298,6 +298,11 @@ final class LocationTracker: NSObject, ObservableObject {
             print("[tracker] discard speed=\(Int(mps * 3.6))kmh @ \(coord)")
         case .tooClose:
             break // extremely chatty, and redundant with distanceFilter
+        case .staleDelivery:
+            let age = Int(Date().timeIntervalSince(loc.timestamp))
+            print("[tracker] discard stale delivery age=\(age)s @ \(coord)")
+        case .poorResumeAccuracy(let m):
+            print("[tracker] discard resume accuracy=\(Int(m))m @ \(coord)")
         }
         #endif
     }
@@ -381,6 +386,8 @@ extension LocationTracker: CLLocationManagerDelegate {
             case .staleTimestamp: return "discard:staleTimestamp"
             case .implausibleSpeed: return "discard:implausibleSpeed"
             case .tooClose: return "discard:tooClose"
+            case .staleDelivery: return "discard:staleDelivery"
+            case .poorResumeAccuracy: return "discard:poorResumeAccuracy"
             }
         }
     }

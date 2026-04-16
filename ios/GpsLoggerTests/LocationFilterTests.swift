@@ -18,7 +18,7 @@ final class LocationFilterTests: XCTestCase {
     func testRejectsFixWithNegativeHorizontalAccuracy() {
         var filter = LocationFilter()
         let fix = makeFix(lat: 0, lon: 0, horizontalAccuracy: -1)
-        XCTAssertEqual(filter.consume(fix), .discard(.invalidFix))
+        XCTAssertEqual(feed(&filter,fix), .discard(.invalidFix))
     }
 
     // MARK: - Source gate (park-canopy / WPS fallback defense)
@@ -29,7 +29,7 @@ final class LocationFilterTests: XCTestCase {
         // defense against the park-canopy teleport anomaly.
         var filter = LocationFilter()
         let fix = makeFix(lat: 0, lon: 0, speed: -1)
-        XCTAssertEqual(filter.consume(fix), .discard(.nonGpsSource))
+        XCTAssertEqual(feed(&filter,fix), .discard(.nonGpsSource))
     }
 
     func testRejectsFixWithNegativeVerticalAccuracy() {
@@ -37,7 +37,7 @@ final class LocationFilterTests: XCTestCase {
         // network positioning has no altitude.
         var filter = LocationFilter()
         let fix = makeFix(lat: 0, lon: 0, verticalAccuracy: -1)
-        XCTAssertEqual(filter.consume(fix), .discard(.nonGpsSource))
+        XCTAssertEqual(feed(&filter,fix), .discard(.nonGpsSource))
     }
 
     func testRejectsFixWithZeroVerticalAccuracy() {
@@ -45,7 +45,7 @@ final class LocationFilterTests: XCTestCase {
         // report a positive meters-scale value.
         var filter = LocationFilter()
         let fix = makeFix(lat: 0, lon: 0, verticalAccuracy: 0)
-        XCTAssertEqual(filter.consume(fix), .discard(.nonGpsSource))
+        XCTAssertEqual(feed(&filter,fix), .discard(.nonGpsSource))
     }
 
     func testAcceptsStationaryGpsFix() {
@@ -53,7 +53,7 @@ final class LocationFilterTests: XCTestCase {
         // positive vertical accuracy. Must not be confused with network fixes.
         var filter = LocationFilter()
         let fix = makeFix(lat: 0, lon: 0, speed: 0)
-        guard case .accept = filter.consume(fix) else {
+        guard case .accept = feed(&filter,fix) else {
             return XCTFail("stationary GPS fix should be accepted")
         }
     }
@@ -63,7 +63,7 @@ final class LocationFilterTests: XCTestCase {
         // as non-GPS, not mistakenly let through by the accuracy gate.
         var filter = LocationFilter()
         let fix = makeFix(lat: 0, lon: 0, horizontalAccuracy: 5, verticalAccuracy: -1, speed: -1)
-        XCTAssertEqual(filter.consume(fix), .discard(.nonGpsSource))
+        XCTAssertEqual(feed(&filter,fix), .discard(.nonGpsSource))
     }
 
     func testWPSBurstAllDropped() {
@@ -73,7 +73,7 @@ final class LocationFilterTests: XCTestCase {
         // stays pinned to the last real GPS fix.
         var filter = LocationFilter()
         let gps = makeFix(lat: 50.450, lon: 30.523, timestamp: date(0))
-        guard case .accept = filter.consume(gps) else {
+        guard case .accept = feed(&filter,gps) else {
             return XCTFail("initial GPS fix should be accepted")
         }
 
@@ -92,7 +92,7 @@ final class LocationFilterTests: XCTestCase {
                 speed: -1,
                 timestamp: date(Double(i + 1))
             )
-            XCTAssertEqual(filter.consume(wps), .discard(.nonGpsSource))
+            XCTAssertEqual(feed(&filter,wps), .discard(.nonGpsSource))
         }
         // lastAccepted must still be the original real fix.
         XCTAssertEqual(filter.lastAccepted?.coordinate.latitude, 50.450)
@@ -105,7 +105,7 @@ final class LocationFilterTests: XCTestCase {
     func testRejectsFixWorseThanMaxAccuracy() {
         var filter = LocationFilter()
         let fix = makeFix(lat: 0, lon: 0, horizontalAccuracy: 80)
-        XCTAssertEqual(filter.consume(fix), .discard(.poorAccuracy(meters: 80)))
+        XCTAssertEqual(feed(&filter,fix), .discard(.poorAccuracy(meters: 80)))
     }
 
     // MARK: - Chronology / speed gates
@@ -114,19 +114,19 @@ final class LocationFilterTests: XCTestCase {
         var filter = LocationFilter()
         let t0 = Date()
         let a = makeFix(lat: 0, lon: 0, timestamp: t0)
-        _ = filter.consume(a)
+        _ = feed(&filter,a)
         // Same timestamp → dt == 0 → stale.
         let b = makeFix(lat: 0.001, lon: 0.001, timestamp: t0)
-        XCTAssertEqual(filter.consume(b), .discard(.staleTimestamp))
+        XCTAssertEqual(feed(&filter,b), .discard(.staleTimestamp))
     }
 
     func testRejectsImplausibleSpeed() {
         // 5 km displacement in 1 s → 18000 km/h. Far above 500 km/h ceiling.
         var filter = LocationFilter()
         let a = makeFix(lat: 0, lon: 0, timestamp: date(0))
-        _ = filter.consume(a)
+        _ = feed(&filter,a)
         let b = makeFix(lat: 0.05, lon: 0, timestamp: date(1))
-        guard case .discard(.implausibleSpeed) = filter.consume(b) else {
+        guard case .discard(.implausibleSpeed) = feed(&filter,b) else {
             return XCTFail("teleport should be flagged as implausible speed")
         }
     }
@@ -135,10 +135,10 @@ final class LocationFilterTests: XCTestCase {
 
     func testRejectsTooClose() {
         var filter = LocationFilter()
-        _ = filter.consume(makeFix(lat: 0, lon: 0, timestamp: date(0)))
+        _ = feed(&filter,makeFix(lat: 0, lon: 0, timestamp: date(0)))
         // ~0.5 m — well under the 10 m minimum.
         let b = makeFix(lat: 0.000005, lon: 0, timestamp: date(1))
-        XCTAssertEqual(filter.consume(b), .discard(.tooClose))
+        XCTAssertEqual(feed(&filter,b), .discard(.tooClose))
     }
 
     func testSpikePatternDropsBufferedPoint() {
@@ -148,15 +148,15 @@ final class LocationFilterTests: XCTestCase {
         // reaches the spike buffer branch rather than being rejected upfront.
         var filter = LocationFilter()
         let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        _ = filter.consume(a)
+        _ = feed(&filter,a)
 
         // ~1 km east of A.
         let b = makeFix(lat: 50.4500, lon: 30.5370, timestamp: date(10))
-        XCTAssertEqual(filter.consume(b), .buffered)
+        XCTAssertEqual(feed(&filter,b), .buffered)
 
         // Back at A's position.
         let c = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(20))
-        guard case .spikeReplaced(let dropped, _) = filter.consume(c) else {
+        guard case .spikeReplaced(let dropped, _) = feed(&filter,c) else {
             return XCTFail("A → B(far) → C(back near A) must trigger spike replacement")
         }
         XCTAssertEqual(dropped.coordinate.longitude, 30.5370)
@@ -166,7 +166,7 @@ final class LocationFilterTests: XCTestCase {
     func testFirstFixAccepted() {
         var filter = LocationFilter()
         let fix = makeFix(lat: 50.45, lon: 30.52)
-        guard case .accept(let accepted) = filter.consume(fix) else {
+        guard case .accept(let accepted) = feed(&filter,fix) else {
             return XCTFail("first valid fix should be accepted")
         }
         XCTAssertEqual(accepted.coordinate.latitude, 50.45)
@@ -184,11 +184,11 @@ final class LocationFilterTests: XCTestCase {
 
         // A at t=0.
         let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        _ = filter.consume(a)
+        _ = feed(&filter,a)
 
         // B at t=10, ~1 km east — buffered as spike candidate.
         let b = makeFix(lat: 50.4500, lon: 30.5370, timestamp: date(10))
-        XCTAssertEqual(filter.consume(b), .buffered)
+        XCTAssertEqual(feed(&filter,b), .buffered)
         XCTAssertNotNil(filter.pending)
 
         // C arrives 100 s later (far beyond the 30 s pendingTimeout). The
@@ -198,7 +198,7 @@ final class LocationFilterTests: XCTestCase {
         // jump threshold itself — this way we're testing the pending
         // cleanup in isolation, not the new-spike path.
         let c = makeFix(lat: 50.4501, lon: 30.5232, timestamp: date(110))
-        let decision = filter.consume(c)
+        let decision = feed(&filter,c)
         // pending must be nil after consume; C is accepted as normal
         // progression from A (distance ~13 m, above minDistance = 10 m).
         XCTAssertNil(filter.pending, "stale pending must be dropped before evaluating the next fix")
@@ -211,19 +211,109 @@ final class LocationFilterTests: XCTestCase {
         // Sanity check: pending that arrives within the timeout window
         // is retained and the normal spike logic runs.
         var filter = LocationFilter(pendingTimeout: 30)
-        _ = filter.consume(makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0)))
+        _ = feed(&filter,makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0)))
 
         // B ~1 km east, buffered.
-        _ = filter.consume(makeFix(lat: 50.4500, lon: 30.5370, timestamp: date(10)))
+        _ = feed(&filter,makeFix(lat: 50.4500, lon: 30.5370, timestamp: date(10)))
         XCTAssertNotNil(filter.pending)
 
         // C arrives at t=20, only 10 s after B — well under the 30 s
         // timeout. Pending must still be there when C is processed.
         // C is back near A, forming the classic spike pattern.
         let c = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(20))
-        let decision = filter.consume(c)
+        let decision = feed(&filter,c)
         guard case .spikeReplaced = decision else {
             return XCTFail("fresh A→B→C pattern must still produce spikeReplaced, got \(decision)")
+        }
+    }
+
+    // MARK: - Stale-delivery gate
+
+    func testRejectsStaleDeliveredFix() {
+        // A fix whose timestamp is > maxFixAge behind wall-clock time is a
+        // cached replay from a previous signal window. Must be rejected
+        // before any other gate runs.
+        var filter = LocationFilter()
+        let fix = makeFix(lat: 50.45, lon: 30.52, timestamp: date(0))
+        XCTAssertEqual(
+            filter.consume(fix, now: date(15)),   // 15 s delivery age > 10 s
+            .discard(.staleDelivery)
+        )
+    }
+
+    func testAcceptsFixWithinAgeThreshold() {
+        var filter = LocationFilter()
+        let fix = makeFix(lat: 50.45, lon: 30.52, timestamp: date(0))
+        // 2 s delivery latency — well under the 10 s ceiling.
+        guard case .accept = filter.consume(fix, now: date(2)) else {
+            return XCTFail("fix within age threshold should be accepted")
+        }
+    }
+
+    func testStaleDeliveryGateRunsBeforeOtherGates() {
+        // A fix that would pass every other gate (valid GNSS, good accuracy,
+        // healthy speed) but has a stale delivery timestamp must be rejected
+        // as staleDelivery, not accepted or caught by a later gate.
+        var filter = LocationFilter()
+        let fix = makeFix(lat: 50.45, lon: 30.52, horizontalAccuracy: 5,
+                          timestamp: date(0))
+        XCTAssertEqual(
+            filter.consume(fix, now: date(15)),
+            .discard(.staleDelivery)
+        )
+    }
+
+    // MARK: - Gap-aware accuracy
+
+    func testRejectsMediacreAccuracyAfterGap() {
+        // After a signal gap > 60 s, the accuracy ceiling tightens from
+        // 50 m to 20 m to filter GPS convergence / multipath drift.
+        var filter = LocationFilter()
+        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
+        feed(&filter, a)
+        // 120 s gap, hAcc = 30 m — above the 20 m resume ceiling.
+        let b = makeFix(lat: 50.4510, lon: 30.5240,
+                        horizontalAccuracy: 30, timestamp: date(120))
+        XCTAssertEqual(
+            filter.consume(b, now: date(120.5)),
+            .discard(.poorResumeAccuracy(meters: 30))
+        )
+    }
+
+    func testAcceptsGoodAccuracyAfterGap() {
+        var filter = LocationFilter()
+        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
+        feed(&filter, a)
+        // 120 s gap, hAcc = 15 m — under the 20 m resume ceiling.
+        let b = makeFix(lat: 50.4510, lon: 30.5240,
+                        horizontalAccuracy: 15, timestamp: date(120))
+        guard case .accept = filter.consume(b, now: date(120.5)) else {
+            return XCTFail("good-accuracy fix should be accepted even after a gap")
+        }
+    }
+
+    func testAcceptsMediacreAccuracyWithoutGap() {
+        // Without a gap (dt = 5 s, well under the 60 s threshold), the
+        // normal 50 m ceiling applies — 30 m accuracy is fine.
+        var filter = LocationFilter()
+        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
+        feed(&filter, a)
+        let b = makeFix(lat: 50.4510, lon: 30.5240,
+                        horizontalAccuracy: 30, timestamp: date(5))
+        guard case .accept = filter.consume(b, now: date(5.5)) else {
+            return XCTFail("mediocre accuracy should be accepted during continuous tracking")
+        }
+    }
+
+    func testGapAccuracyDoesNotAffectFirstFix() {
+        // The very first fix has no lastAccepted and therefore no dt.
+        // Gap-aware accuracy should not interfere — the normal 50 m
+        // ceiling applies.
+        var filter = LocationFilter()
+        let fix = makeFix(lat: 50.45, lon: 30.52, horizontalAccuracy: 30,
+                          timestamp: date(0))
+        guard case .accept = filter.consume(fix, now: date(0.5)) else {
+            return XCTFail("first fix with 30 m accuracy should be accepted")
         }
     }
 
@@ -255,5 +345,16 @@ final class LocationFilterTests: XCTestCase {
             speed: speed,
             timestamp: timestamp ?? baseTime
         )
+    }
+
+    /// Feed a fix with `now` auto-set to 0.5 s after the fix's own
+    /// timestamp, keeping the stale-delivery gate out of the way for
+    /// tests that target other gates.
+    @discardableResult
+    private func feed(
+        _ filter: inout LocationFilter,
+        _ loc: CLLocation
+    ) -> LocationFilter.Decision {
+        filter.consume(loc, now: loc.timestamp.addingTimeInterval(0.5))
     }
 }

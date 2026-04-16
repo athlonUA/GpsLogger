@@ -9,6 +9,8 @@ import CoreLocation
 /// modes would introduce false negatives against legitimate users.
 ///
 /// Applied in order:
+///   0. Delivery age: `now − timestamp ≤ maxFixAgeSeconds` — rejects cached
+///      locations that CoreLocation replays after a signal gap.
 ///   1. Validity: `horizontalAccuracy ≥ 0` (CoreLocation's invalid-fix sentinel).
 ///   2. Source discrimination: `speed ≥ 0` AND `verticalAccuracy > 0`. GNSS
 ///      fixes populate both (Doppler velocity + 3D solution); Wi-Fi / cell
@@ -21,6 +23,9 @@ import CoreLocation
 ///   3. Accuracy value: `horizontalAccuracy ≤ maxHorizontalAccuracyMeters`.
 ///   4. Chronology: `Δt > 0` vs. the last accepted fix (rejects replayed /
 ///      cached fixes).
+///  4b. Gap-aware accuracy: if `Δt > resumeGapSeconds`, require
+///      `horizontalAccuracy ≤ resumeMaxAccuracyMeters` — filters multipath
+///      convergence fixes after extended indoor / tunnel / background gaps.
 ///   5. Implied speed ≤ `maxPlausibleSpeedMps` — intentionally very relaxed
 ///      (500 km/h), only catches teleport-class glitches.
 ///   6. Single-point look-ahead buffer rejects the classic
@@ -56,6 +61,8 @@ struct LocationFilter {
         case staleTimestamp
         case implausibleSpeed(metersPerSecond: Double)
         case tooClose
+        case staleDelivery
+        case poorResumeAccuracy(meters: Double)
     }
 
     private(set) var lastAccepted: CLLocation?
@@ -67,6 +74,9 @@ struct LocationFilter {
     private let spikeJump: CLLocationDistance
     private let spikeReturn: CLLocationDistance
     private let pendingTimeout: TimeInterval
+    private let maxFixAge: TimeInterval
+    private let resumeGap: TimeInterval
+    private let resumeMaxAccuracy: CLLocationDistance
 
     init(
         maxAccuracy: CLLocationDistance = Config.maxHorizontalAccuracyMeters,
@@ -74,7 +84,10 @@ struct LocationFilter {
         maxSpeed: CLLocationSpeed = Config.maxPlausibleSpeedMps,
         spikeJump: CLLocationDistance = Config.spikeJumpMeters,
         spikeReturn: CLLocationDistance = Config.spikeReturnMeters,
-        pendingTimeout: TimeInterval = Config.pendingTimeoutSeconds
+        pendingTimeout: TimeInterval = Config.pendingTimeoutSeconds,
+        maxFixAge: TimeInterval = Config.maxFixAgeSeconds,
+        resumeGap: TimeInterval = Config.resumeGapSeconds,
+        resumeMaxAccuracy: CLLocationDistance = Config.resumeMaxAccuracyMeters
     ) {
         self.maxAccuracy = maxAccuracy
         self.minDistance = minDistance
@@ -82,6 +95,9 @@ struct LocationFilter {
         self.spikeJump = spikeJump
         self.spikeReturn = spikeReturn
         self.pendingTimeout = pendingTimeout
+        self.maxFixAge = maxFixAge
+        self.resumeGap = resumeGap
+        self.resumeMaxAccuracy = resumeMaxAccuracy
     }
 
     mutating func reset() {
@@ -91,7 +107,16 @@ struct LocationFilter {
 
     /// Feed a new raw fix. Mutates internal state and returns what the caller
     /// should persist.
-    mutating func consume(_ loc: CLLocation) -> Decision {
+    mutating func consume(_ loc: CLLocation, now: Date = Date()) -> Decision {
+        // 0. Stale-delivery gate. CoreLocation may deliver cached locations
+        //    after a signal gap. A fix whose timestamp is more than maxFixAge
+        //    seconds behind wall-clock time was computed during a previous
+        //    signal window and is being replayed.
+        let deliveryAge = now.timeIntervalSince(loc.timestamp)
+        if deliveryAge > maxFixAge {
+            return .discard(.staleDelivery)
+        }
+
         // Stale-pending cleanup. The spike buffer holds a single "suspicious"
         // fix waiting one tick for confirmation. If the app was backgrounded
         // or CoreLocation stalled, the pending fix may be minutes or hours
@@ -140,6 +165,15 @@ struct LocationFilter {
         //    occasionally replays an older cached fix; ignore them.
         guard dt > 0 else {
             return .discard(.staleTimestamp)
+        }
+
+        // 4b. Gap-aware accuracy tightening. After a long signal gap the GPS
+        //     receiver is in convergence mode — its first fixes are likely to
+        //     suffer multipath displacement despite reporting optimistic
+        //     horizontalAccuracy. Require a tighter ceiling until the receiver
+        //     stabilises.
+        if dt > resumeGap, loc.horizontalAccuracy > resumeMaxAccuracy {
+            return .discard(.poorResumeAccuracy(meters: loc.horizontalAccuracy))
         }
 
         let distFromLast = loc.distance(from: last)
