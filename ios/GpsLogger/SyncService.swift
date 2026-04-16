@@ -43,6 +43,12 @@ final class SyncService {
     private var pointsInFlight = false
     private var diagnosticsInFlight = false
 
+    /// Exponential backoff: doubles on any sync failure, resets to the
+    /// base interval on success. Caps at 300 s (5 min) to bound battery
+    /// drain when the backend is down for an extended period.
+    private var currentInterval: TimeInterval = Config.syncIntervalSeconds
+    private static let maxInterval: TimeInterval = 300
+
     init(database: Database, appState: AppState, deviceId: String, session: URLSession = .shared) {
         self.database = database
         self.appState = appState
@@ -52,11 +58,8 @@ final class SyncService {
 
     func start() {
         stop()
-        let t = Timer(timeInterval: Config.syncIntervalSeconds, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        currentInterval = Config.syncIntervalSeconds
+        scheduleTimer()
         // Kick off an immediate attempt so leftover rows drain quickly on launch.
         tick()
     }
@@ -64,6 +67,34 @@ final class SyncService {
     func stop() {
         timer?.invalidate()
         timer = nil
+    }
+
+    private func scheduleTimer() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: currentInterval, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    /// Called from syncQueue after a drain cycle completes. Adjusts the
+    /// timer interval based on whether the cycle succeeded.
+    private func adjustBackoff(success: Bool) {
+        let newInterval: TimeInterval
+        if success {
+            newInterval = Config.syncIntervalSeconds
+        } else {
+            newInterval = min(currentInterval * 2, Self.maxInterval)
+        }
+        guard newInterval != currentInterval else { return }
+        currentInterval = newInterval
+        DispatchQueue.main.async { [weak self] in
+            self?.scheduleTimer()
+        }
+        #if DEBUG
+        print("[sync] backoff interval → \(Int(newInterval))s")
+        #endif
     }
 
     private func tick() {
@@ -110,6 +141,7 @@ final class SyncService {
                         state.unsyncedCount = max(0, state.unsyncedCount - delta)
                     }
                 }
+                self.adjustBackoff(success: success)
                 self.pointsInFlight = false
             }
         }
@@ -149,6 +181,9 @@ final class SyncService {
                     let ids = batch.map { $0.id }
                     self.database.deleteDiagnostics(ids: ids)
                 }
+                // Diagnostics failures also trigger backoff, but only if
+                // the points channel didn't already reset it to success.
+                if !success { self.adjustBackoff(success: false) }
                 self.diagnosticsInFlight = false
             }
         }
@@ -162,6 +197,10 @@ final class SyncService {
         req.httpMethod = "POST"
         req.timeoutInterval = 15
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let apiKey = Config.apiKey
+        if !apiKey.isEmpty {
+            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
 
         do {
             req.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])

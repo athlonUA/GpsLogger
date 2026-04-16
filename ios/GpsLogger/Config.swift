@@ -141,4 +141,19 @@ enum Config {
     /// `resumeGapSeconds`. 20 m is achievable for outdoor GNSS within 5–15 s
     /// of reacquisition, filtering the worst multipath convergence fixes.
     static let resumeMaxAccuracyMeters: CLLocationDistance = 20
+
+    /// Info.plist key for the optional API key. Populated at build time
+    /// from `$(API_KEY)` in the gitignored xcconfig, the same mechanism
+    /// used for `API_BASE_URL`. When set, SyncService sends it as a
+    /// `Bearer` token on every POST.
+    static let apiKeyInfoKey = "API_KEY"
+
+    /// Effective API key. Empty string means unauthenticated (LAN-only use).
+    static var apiKey: String {
+        if let raw = Bundle.main.object(forInfoDictionaryKey: apiKeyInfoKey) as? String,
+           !raw.isEmpty {
+            return raw
+        }
+        return ""
+    }
 }

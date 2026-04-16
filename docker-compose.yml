@@ -61,6 +61,7 @@ services:
       PGUSER: postgres
       PGPASSWORD: postgres
       PGDATABASE: gpslogger
+      API_KEY: ${API_KEY:-}
       TZ: UTC
     ports:
       - "3000:3000"

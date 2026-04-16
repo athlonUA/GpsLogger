@@ -29,13 +29,13 @@ final class DatabaseTests: XCTestCase {
                 createdAt: Date(timeIntervalSince1970: 1_760_000_000 + Double(i))
             )
         }
-        XCTAssertEqual(db.initialCount(), 5)
+        XCTAssertEqual(db.initialCount()!, 5)
 
         let batch = db.fetchBatch(limit: 100)
         XCTAssertEqual(batch.count, 5)
 
         db.delete(ids: batch.map { $0.id })
-        XCTAssertEqual(db.initialCount(), 0, "after delete, points table must be empty")
+        XCTAssertEqual(db.initialCount()!, 0, "after delete, points table must be empty")
         XCTAssertTrue(db.fetchBatch(limit: 100).isEmpty)
     }
 
@@ -49,7 +49,7 @@ final class DatabaseTests: XCTestCase {
                 createdAt: Date(timeIntervalSince1970: 1_760_000_000 + Double(i))
             )
         }
-        XCTAssertEqual(db.initialCount(), 250)
+        XCTAssertEqual(db.initialCount()!, 250)
 
         var drained = 0
         var ticks = 0
@@ -63,7 +63,7 @@ final class DatabaseTests: XCTestCase {
         }
         XCTAssertEqual(drained, 250)
         XCTAssertEqual(ticks, 3, "250 rows with batch=100 should drain in exactly 3 ticks")
-        XCTAssertEqual(db.initialCount(), 0)
+        XCTAssertEqual(db.initialCount()!, 0)
     }
 
     // MARK: - diagnostics

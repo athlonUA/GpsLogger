@@ -58,10 +58,14 @@ router.get('/', async (req, res, next) => {
       values.push(v.to);
       clauses.push(`created_at <= $${values.length}`);
     }
-    const sql = `SELECT id, latitude, longitude, created_at FROM points WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC`;
+    const LIMIT = 10_000;
+    const sql = `SELECT id, latitude, longitude, created_at FROM points WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC LIMIT ${LIMIT + 1}`;
     const { rows } = await pool.query(sql, values);
 
-    res.json(rows);
+    const truncated = rows.length > LIMIT;
+    if (truncated) rows.length = LIMIT;
+
+    res.json({ data: rows, truncated });
   } catch (err) {
     next(err);
   }

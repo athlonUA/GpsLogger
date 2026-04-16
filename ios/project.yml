@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.2.2"
-    CURRENT_PROJECT_VERSION: "7"
+    MARKETING_VERSION: "1.2.3"
+    CURRENT_PROJECT_VERSION: "8"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
 targets:
@@ -30,8 +30,8 @@ targets:
       path: GpsLogger/Info-generated.plist
       properties:
         CFBundleDisplayName: GpsLogger
-        CFBundleShortVersionString: "1.2.2"
-        CFBundleVersion: "7"
+        CFBundleShortVersionString: "1.2.3"
+        CFBundleVersion: "8"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
@@ -59,6 +59,7 @@ targets:
         # personal LAN IPs out of git while producing a self-contained
         # physical-device build.
         API_BASE_URL: $(API_BASE_URL)
+        API_KEY: $(API_KEY)
 
     entitlements:
       path: GpsLogger/GpsLogger.entitlements

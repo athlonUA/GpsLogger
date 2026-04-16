@@ -95,7 +95,7 @@ final class Database {
         }
 
         // --- points (upload queue) ---
-        exec("""
+        execRequired("""
             CREATE TABLE IF NOT EXISTS points (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 latitude REAL NOT NULL,
@@ -114,7 +114,7 @@ final class Database {
         exec("CREATE INDEX IF NOT EXISTS idx_points_created_at ON points(created_at);")
 
         // --- fix_diagnostics (debug observability) ---
-        exec("""
+        execRequired("""
             CREATE TABLE IF NOT EXISTS fix_diagnostics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 logged_at TEXT NOT NULL,
@@ -144,6 +144,15 @@ final class Database {
         if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
             let msg = String(cString: sqlite3_errmsg(db))
             print("[db] exec error: \(msg) for \(sql)")
+        }
+    }
+
+    /// Schema-critical exec: crash if the statement fails, because the app
+    /// cannot function without its tables. Used only in `init`.
+    private func execRequired(_ sql: String) {
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            let msg = String(cString: sqlite3_errmsg(db))
+            fatalError("[db] schema exec failed: \(msg) for \(sql)")
         }
     }
 
@@ -277,23 +286,22 @@ final class Database {
     }
 
     /// One-time count used to seed the in-memory unsynced counter at launch.
-    /// Not called during normal operation — the in-memory counter is authoritative after init.
-    func initialCount() -> Int {
+    /// Returns `nil` on any SQLite failure so the caller can distinguish
+    /// "zero rows" from "query failed".
+    func initialCount() -> Int? {
         queue.sync {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM points;", -1, &stmt, nil) == SQLITE_OK else {
                 print("[db] initialCount prepare failed: \(String(cString: sqlite3_errmsg(db)))")
-                return 0
+                return nil
             }
             let status = sqlite3_step(stmt)
             if status == SQLITE_ROW {
                 return Int(sqlite3_column_int64(stmt, 0))
             }
-            if status != SQLITE_DONE {
-                print("[db] initialCount step failed: status=\(status) \(String(cString: sqlite3_errmsg(db)))")
-            }
-            return 0
+            print("[db] initialCount step failed: status=\(status) \(String(cString: sqlite3_errmsg(db)))")
+            return nil
         }
     }
 

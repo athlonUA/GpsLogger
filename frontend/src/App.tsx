@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchPoints, type Point } from './api';
 import MapView from './Map';
 
@@ -26,8 +26,10 @@ export default function App() {
   const [from, setFrom] = useState(toLocalInputValue(initialFrom));
   const [to, setTo] = useState(toLocalInputValue(initialTo));
   const [points, setPoints] = useState<Point[]>([]);
+  const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Persist device ID on every change. An empty value clears the key so a
   // page reload returns the UI to its initial (logged-out) state.
@@ -48,14 +50,22 @@ export default function App() {
       setError('Device ID is required');
       return;
     }
+    // Cancel any in-flight request before starting a new one.
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+
     setError(null);
     setLoading(true);
     try {
-      const data = await fetchPoints(deviceId, new Date(from), new Date(to));
-      setPoints(data);
+      const result = await fetchPoints(deviceId, new Date(from), new Date(to), ac.signal);
+      setPoints(result.data);
+      setTruncated(result.truncated);
     } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return;
       setError(e instanceof Error ? e.message : String(e));
       setPoints([]);
+      setTruncated(false);
     } finally {
       setLoading(false);
     }
@@ -69,12 +79,16 @@ export default function App() {
     setTo(toLocalInputValue(initialTo));
   }, [initialFrom, initialTo]);
 
+  const pointsLabel = truncated
+    ? `${points.length.toLocaleString()} points (truncated — narrow the time range)`
+    : `${points.length.toLocaleString()} points`;
+
   const status = error
     ? error
     : loading
       ? 'Loading…'
       : points.length > 0
-        ? `${points.length.toLocaleString()} points`
+        ? pointsLabel
         : deviceId
           ? 'Select range and click Visualize'
           : 'Enter device ID to begin';

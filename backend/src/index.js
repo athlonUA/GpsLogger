@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { migrate } from './db.js';
+import { migrate, pool } from './db.js';
 import pointsRouter from './routes/points.js';
 import diagnosticsRouter from './routes/diagnostics.js';
 
@@ -14,7 +14,35 @@ app.use((req, _res, next) => {
   next();
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+// Optional bearer-token auth for write endpoints. When API_KEY is set,
+// POST /points and POST /diagnostics require `Authorization: Bearer <key>`.
+// GET /health and GET /points are unprotected so the frontend and Docker
+// healthcheck keep working without a token.
+const apiKey = process.env.API_KEY || '';
+if (apiKey) {
+  app.use('/points', (req, res, next) => {
+    if (req.method !== 'POST') return next();
+    const auth = req.headers.authorization || '';
+    if (auth === `Bearer ${apiKey}`) return next();
+    res.status(401).json({ error: 'unauthorized' });
+  });
+  app.use('/diagnostics', (req, res, next) => {
+    if (req.method !== 'POST') return next();
+    const auth = req.headers.authorization || '';
+    if (auth === `Bearer ${apiKey}`) return next();
+    res.status(401).json({ error: 'unauthorized' });
+  });
+  console.log('[auth] API_KEY is set — POST endpoints require Bearer token');
+}
+
+app.get('/health', async (_req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false, error: 'database unreachable' });
+  }
+});
 
 app.use('/points', pointsRouter);
 app.use('/diagnostics', diagnosticsRouter);

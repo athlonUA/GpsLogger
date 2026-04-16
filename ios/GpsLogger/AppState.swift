@@ -12,7 +12,15 @@ final class AppState: ObservableObject {
     @Published var unsyncedCount: Int = 0
     @Published var deviceId: String = ""
 
-    func seed(_ count: Int) {
-        unsyncedCount = count
+    /// Seed the counter from the DB row count. `nil` means the count
+    /// query failed — default to 0 and log a warning so the counter
+    /// is at least visible (will self-correct on first sync drain).
+    func seed(_ count: Int?) {
+        if let count {
+            unsyncedCount = count
+        } else {
+            print("[state] WARNING: initial count unavailable, defaulting to 0")
+            unsyncedCount = 0
+        }
     }
 }

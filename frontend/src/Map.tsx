@@ -94,6 +94,11 @@ function buildSegments(groups: Point[][]): Segment[] {
   return segs;
 }
 
+// Max squared-degree distance for a click to snap to a point. ~0.01° ≈ 1 km
+// at mid-latitudes — generous enough for any zoom level where the route is
+// visible, but prevents snapping to a point when clicking far from the track.
+const MAX_CLICK_DIST_SQ = 0.01 * 0.01;
+
 function findNearestPoint(points: Point[], lat: number, lng: number): Point | null {
   if (points.length === 0) return null;
   let best = points[0];
@@ -107,6 +112,7 @@ function findNearestPoint(points: Point[], lat: number, lng: number): Point | nu
       best = p;
     }
   }
+  if (bestDist > MAX_CLICK_DIST_SQ) return null;
   return best;
 }
 
