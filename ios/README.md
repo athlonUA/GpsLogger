@@ -261,25 +261,30 @@ covers every device you've built for.
   → StationaryDetector before it lands in `points`):
   1. **`CLLocationManager.distanceFilter = 10 m`** and a defensive
      per-insert distance check (LocationFilter's minDistance rule).
-  2. **`LocationFilter`** — seven rules in order:
-     (a) validity — `horizontalAccuracy ≥ 0`.
-     (b) **source gate** — `speed ≥ 0` AND `verticalAccuracy > 0`.
+  2. **`LocationFilter`** — nine rules in order:
+     (a) **delivery age** (1.2.2) — `|now − timestamp| ≤ 10 s`. Rejects
+     cached locations that CoreLocation replays after a signal gap.
+     (b) validity — `horizontalAccuracy ≥ 0`.
+     (c) **source gate** — `speed ≥ 0` AND `verticalAccuracy > 0`.
      GNSS fixes populate both (Doppler velocity + 3D solution);
      Wi-Fi / cell-tower fallback fixes leave them at Apple's
      documented sentinel negatives. This is the load-bearing defense
      against stale-BSSID Wi-Fi Positioning "teleport" fixes that
      otherwise pass the accuracy gate.
-     (c) accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
-     (d) chronology — `Δt > 0` vs the last accepted fix (rejects
+     (d) accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
+     (e) chronology — `Δt > 0` vs the last accepted fix (rejects
      replayed cached fixes).
-     (e) implausible speed — rejects implied speeds > 500 km/h.
-     (f) spike buffer — a fix > 750 m from the last accepted point is
+     (f) **gap-aware accuracy** (1.2.2) — if `Δt > 60 s`, tightens
+     the accuracy ceiling from 50 m to 20 m, filtering multipath
+     convergence fixes after extended indoor / background signal loss.
+     (g) implausible speed — rejects implied speeds > 500 km/h.
+     (h) spike buffer — a fix > 750 m from the last accepted point is
      held one tick; if the next fix returns within 100 m of the last
      accepted point, the buffered fix is confirmed as a spike and
      dropped. A `pending` fix older than
      `Config.pendingTimeoutSeconds` (30 s) is discarded silently so
      an app-backgrounding event cannot corrupt the next session.
-     (g) minimum distance — ≥ 10 m from the last accepted fix.
+     (i) minimum distance — ≥ 10 m from the last accepted fix.
   3. **`StationaryDetector`** — after accepted fixes stay within 20 m
      of a candidate anchor for 150 s, suppresses subsequent fixes
      until one lands more than 30 m from the cluster center. The
@@ -297,6 +302,10 @@ covers every device you've built for.
   machine in `locationManagerDidChangeAuthorization` also resets
   `LocationFilter` and `StationaryDetector` on a re-grant so stale
   anchors from a previous session don't bleed into the new one.
+- **Post-indoor GPS reacquisition defense (1.2.2)**: two new
+  `LocationFilter` gates address cached-fix replay and multipath
+  convergence drift after extended indoor or background signal loss.
+  See filter pipeline rules (a) and (f) above.
 - **Correctness + resilience (1.2.1)**: `Database.insert` and
   `logDiagnostic` return `Bool`, so the in-memory unsynced counter
   only increments on confirmed SQLite success. All SQLite writes from

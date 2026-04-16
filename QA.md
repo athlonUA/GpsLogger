@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (41 cases across 4 test files)
+### iOS unit tests (48 cases across 4 test files)
 
 ```
 cd ios
@@ -13,7 +13,7 @@ xcodebuild test -project GpsLogger.xcodeproj -scheme GpsLoggerTests \
     -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
-**`LocationFilterTests` (15 cases)** — every gate in the filter
+**`LocationFilterTests` (22 cases)** — every gate in the filter
 pipeline end-to-end:
 
 - validity gate (negative `horizontalAccuracy` → discard `.invalidFix`)
@@ -33,6 +33,14 @@ pipeline end-to-end:
   `Config.pendingTimeoutSeconds` is dropped silently before the next
   fix is evaluated, so an app-backgrounding event cannot leave stale
   spike state across sessions
+- **stale-delivery gate** (1.2.2): fix with timestamp > 10 s behind wall
+  clock is rejected as `discard:staleDelivery`; gate runs before all
+  other gates; fix within threshold is accepted
+- **gap-aware accuracy** (1.2.2): after `Δt > 60 s`, accuracy ceiling
+  tightens from 50 m to 20 m (`discard:poorResumeAccuracy`); good
+  accuracy (≤ 20 m) is accepted even after a gap; mediocre accuracy
+  (20–50 m) is accepted during continuous tracking; first-ever fix
+  uses the normal 50 m ceiling (no dt to compare)
 - regression: stationary GPS fix (speed = 0, valid vertical accuracy)
   must still be accepted — the source gate must not confuse a
   standing-still user with a network-derived fix
@@ -418,6 +426,8 @@ docker exec gpslogger-db-1 psql -U postgres -d gpslogger -c \
 | `≥ 0` | `> 0` | stuck at 5–15 m while coordinates drift | CoreLocation sensor-fusion drift bug — filter can't catch this, needs a plateau detector. |
 | `≥ 0` | `> 0` | growing with distance from real position | Regular GPS degradation — the 50 m `poorAccuracy` gate should have clipped the worst. |
 | `≥ 0` | `> 0` | normal | Multipath / transient glitch — spike buffer should have handled it. |
+| any | any | any, but `logged_at − fix_timestamp > 10 s` | Cached fix replay — `discard:staleDelivery` gate (1.2.2) should have rejected it. |
+| `≥ 0` | `> 0` | 20–50 m, first fix after gap > 60 s | Post-indoor multipath convergence — `discard:poorResumeAccuracy` gate (1.2.2) should have rejected it. |
 
 If the bad rows show `decision = 'discard:nonGpsSource'` they never made it
 into `points`; the fix is already doing its job and the anomaly should not

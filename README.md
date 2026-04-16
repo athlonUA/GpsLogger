@@ -353,6 +353,13 @@ flowchart LR
     an older anchor timestamp (NTP correction, DST transition, cached
     replay) and resets the candidate instead of stalling forever in
     Phase A.
+- **Post-indoor GPS reacquisition defense** (1.2.2):
+  - `LocationFilter` rejects cached CoreLocation fixes whose timestamp
+    is more than 10 s behind wall-clock time (stale-delivery gate).
+  - After a gap > 60 s between accepted fixes, the accuracy ceiling
+    tightens from 50 m to 20 m, filtering multipath convergence fixes
+    that report optimistic `horizontalAccuracy` after extended indoor
+    or background signal loss (gap-aware accuracy gate).
   - `locationManager(_:didFailWithError:)` now switches on `CLError.code`:
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
@@ -361,6 +368,10 @@ flowchart LR
   than 10 m: `CLLocationManager.distanceFilter = 10` and a defensive
   per-insert check.
 - **`LocationFilter` (second gate, GPS noise).** Rules applied in order:
+  0. **Delivery age** (1.2.2) — `|now − timestamp| ≤ 10 s`. CoreLocation
+     may replay cached locations after a signal gap; Apple's documentation
+     explicitly recommends checking fix age. Rejects stale cached fixes
+     before any other gate runs.
   1. Validity — `horizontalAccuracy ≥ 0`.
   2. **Source discrimination** — `speed ≥ 0` AND `verticalAccuracy > 0`.
      GNSS fixes populate both (Doppler velocity + 3D solution); Wi-Fi /
@@ -374,6 +385,11 @@ flowchart LR
   3. Accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
   4. Chronology — `Δt > 0` vs. the last accepted fix (rejects replayed /
      cached fixes).
+  4b. **Gap-aware accuracy** (1.2.2) — if `Δt > 60 s`, tightens the
+     accuracy ceiling from 50 m to 20 m. After extended signal loss
+     (indoor, tunnel, background) the GPS receiver's first convergence
+     fixes are disproportionately likely to suffer multipath displacement
+     despite reporting optimistic `horizontalAccuracy`.
   5. Speed ceiling — rejects implied speeds > 500 km/h (teleport-class
      glitches only; every real surface transport mode passes).
   6. Spike buffer — a fix > 750 m from the last accepted point is held one
