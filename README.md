@@ -391,6 +391,54 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **Audit-driven simplification** (1.2.9). An independent review
+  of the filter stack against 9,300 real `fix_diagnostics` rows
+  across two devices over four days found that several gates were
+  firing at ~0% of real traffic, one gate had flipped from defense
+  to deadlock-then-relaxation in successive releases, and the
+  accuracy ceiling was letting through a tail of fixes that were
+  visibly distorting the rendered trace without adding any
+  completeness.
+  - **Tightened accuracy ceiling** (`Config.maxHorizontalAccuracyMeters`
+    50 → 25 m). Empirical iPhone 13 Pro Max p90 = 14 m (near-lossless
+    at 25 m). iPhone 8 p90 = 32 m under canopy; the tightened ceiling
+    produces honest gaps on the older device instead of the earlier
+    regime of persisted `accept` rows at 30–50 m HA that were
+    responsible for the "the trace goes through a building"
+    artifacts.
+  - **Removed the three-tier `poorResumeAccuracy` gate** introduced
+    in 1.2.2 and relaxed in 1.2.6. Audit showed 269 lifetime hits
+    (all on iPhone 8) concentrated in a single 2026-04-16 session
+    whose deadlock the 1.2.6 relaxation was then added to escape —
+    zero hits ever on iPhone 13 Pro Max. Subsumed by the tighter
+    single 25 m ceiling.
+  - **Mode-aware spike buffer** (`Config.spikeJumpMeters`
+    750 → 250 m, with `Config.spikeJumpMetersAutomotive` = 750 m
+    under `.automotive`). Observed multipath jumps of 410 m on
+    iPhone 8 under canopy had been passing the old blanket 750 m
+    threshold; the tightened walking/cycling default catches them.
+    `LocationTracker.apply(mode:)` flips the threshold via
+    `LocationFilter.setAutomotive(_:)` on every MotionClassifier mode
+    change, so legitimate 130 km/h × 5 s ≈ 180 m vehicle deltas
+    continue to pass.
+  - **Stationary suppressions now logged** to `fix_diagnostics` as
+    `<filter-decision>:stationarySuppress` (e.g.
+    `accept:stationarySuppress`). Previously stationary decisions
+    were invisible post-hoc, so the detector could not be tuned
+    against real data. Backend / schema unchanged — the `decision`
+    column is free text ≤ 64 chars.
+  - **Kalman `cos(origin.lat)` cached at reset time** instead of
+    recomputed on every `enuOffset` / `latLonFromENU` invocation.
+    Micro-optimization; no numerical behavior change. Preserves the
+    existing public static signatures for callers that don't have a
+    cached cosine (e.g. the round-trip unit test).
+  - **Deliberately not done**: Kalman smoother removal, map-matching
+    re-introduction, filter-tuning-per-device, attempting to detect
+    multipath from post-filter residuals. All rejected on empirical
+    grounds (Kalman smoother is doing real work on the clean device
+    even if it can't repair biased measurements; everything else is
+    out of scope for a platform that does not expose raw GNSS
+    pseudoranges).
 - **Silent-failure detectors** (1.2.8):
   Three classes of "the app looks fine, nothing is being recorded"
   scenarios now surface as impairment banners instead of failing
@@ -565,24 +613,24 @@ flowchart LR
      and a stale BSSID registration delivers a plausible-looking fix
      hundreds of meters to kilometers off the true position. Accuracy
      gating alone cannot catch it.
-  3. Accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
+  3. Accuracy value — drops fixes with `horizontalAccuracy > 25 m`
+     (tightened from 50 m in 1.2.9 after empirical HA distribution on
+     two devices over four days showed the previous ceiling was
+     letting through a long tail of 30–50 m fixes without meaningful
+     completeness benefit; see the 1.2.9 audit subsection below).
   4. Chronology — `Δt > 0` vs. the last accepted fix (rejects replayed /
      cached fixes).
-  4b. **Gap-aware accuracy** (1.2.2, three-tier in 1.2.6) — if
-     `Δt > 60 s`, tightens the accuracy ceiling from 50 m to 20 m.
-     After extended signal loss (indoor, tunnel, background) the GPS
-     receiver's first convergence fixes are disproportionately likely
-     to suffer multipath displacement despite reporting optimistic
-     `horizontalAccuracy`. **1.2.6 escape valve**: if `Δt > 120 s` the
-     ceiling falls back to the normal 50 m so sustained marginal signal
-     cannot self-reinforce into a multi-minute blackout (see the 1.2.6
-     hardening subsection above).
   5. Speed ceiling — rejects implied speeds > 500 km/h (teleport-class
      glitches only; every real surface transport mode passes).
-  6. Spike buffer — a fix > 750 m from the last accepted point is held one
-     tick. If the next fix returns within 100 m of the last accepted point,
-     the buffered point is confirmed as a spike and dropped
-     (A → B(far) → C(near A)).
+  6. Spike buffer — a fix farther than the spike-jump threshold from
+     the last accepted point is held one tick. If the next fix returns
+     within 100 m of the last accepted point, the buffered point is
+     confirmed as a spike and dropped (A → B(far) → C(near A)). The
+     threshold is **mode-aware** (1.2.9): 250 m for
+     walking/cycling, 750 m under `MotionClassifier.Mode == .automotive`.
+     Pedestrian default tightened from the blanket 750 m after real
+     multipath jumps of 410 m on iPhone 8 were observed slipping
+     through.
   7. Minimum distance — ≥ 10 m from the last accepted fix.
 - **`KalmanSmoother` (third stage, jitter smoothing).** Layered between
   `LocationFilter.accept` and `StationaryDetector.consume`. 2D
@@ -713,7 +761,7 @@ cd backend && node --test test/
 # behind the route view)
 cd frontend && npm test
 
-# iOS unit tests (68 cases across LocationFilter, KalmanSmoother,
+# iOS unit tests (64 cases across LocationFilter, KalmanSmoother,
 # TrackingImpairment mappings, Database drain, MotionClassifier classify,
 # and StationaryDetector state machine)
 cd ios && xcodegen generate && xcodebuild test \
@@ -777,8 +825,8 @@ GpsLogger/
     │   ├── GpsLogger.entitlements
     │   └── Info.plist
     └── GpsLoggerTests/
-        ├── LocationFilterTests.swift       26 cases covering every filter gate + pending-timeout + deadlock-escape
-        ├── KalmanSmootherTests.swift        7 cases covering first-fix passthrough, noise attenuation, outlier damping, reset paths, ENU round-trip
+        ├── LocationFilterTests.swift       20 cases covering every filter gate + pending-timeout + automotive spike-jump widening (1.2.9)
+        ├── KalmanSmootherTests.swift        9 cases covering first-fix passthrough, noise attenuation, outlier damping, reset paths, ENU round-trip
         ├── DatabaseTests.swift              7 cases locking in the drain/retention invariants
         ├── MotionClassifierTests.swift     10 cases for the pure classification rules
         ├── StationaryDetectorTests.swift   11 cases for the Phase-A/B state machine + clock-skew guard + gap-reset

@@ -381,6 +381,21 @@ final class LocationTracker: NSObject, ObservableObject {
             self?.motionMode = mode
         }
 
+        // 1.2.9: widen the spike-jump threshold when motion is motorized.
+        // Pedestrian / cycling default is 250 m; automotive is 750 m to
+        // accommodate legitimate high-speed sample deltas. `.unknown`
+        // leaves the current threshold untouched for the same reason
+        // `activityType` stays put — low-confidence readings shouldn't
+        // flap the filter back to its default mid-trip.
+        switch mode {
+        case .pedestrian, .cycling:
+            filter.setAutomotive(false)
+        case .automotive:
+            filter.setAutomotive(true)
+        case .unknown:
+            break
+        }
+
         let target: CLActivityType?
         switch mode {
         case .pedestrian, .cycling:
@@ -439,9 +454,16 @@ final class LocationTracker: NSObject, ObservableObject {
     ///      tightly than raw ones, which *improves* stationary detection
     ///      rather than hurting it (less jitter → fewer spurious
     ///      cluster-breaks).
-    private func maybePersist(_ loc: CLLocation) {
+    ///
+    /// Returns the stationary detector's decision so the caller can
+    /// include it in the `fix_diagnostics` tag (1.2.9) — otherwise
+    /// stationary suppressions were invisible in post-hoc queries and
+    /// the detector could not be tuned against real data.
+    @discardableResult
+    private func maybePersist(_ loc: CLLocation) -> StationaryDetector.Decision {
         let smoothed = smoother.consume(loc)
-        switch stationary.consume(smoothed) {
+        let decision = stationary.consume(smoothed)
+        switch decision {
         case .accept:
             persist(smoothed)
         case .suppress:
@@ -449,6 +471,7 @@ final class LocationTracker: NSObject, ObservableObject {
             print("[tracker] suppress stationary @ \(smoothed.coordinate.latitude),\(smoothed.coordinate.longitude)")
             #endif
         }
+        return decision
     }
 
     private func logDiscard(_ reason: LocationFilter.Reason, _ loc: CLLocation) {
@@ -470,8 +493,6 @@ final class LocationTracker: NSObject, ObservableObject {
         case .staleDelivery:
             let age = Int(Date().timeIntervalSince(loc.timestamp))
             print("[tracker] discard stale delivery age=\(age)s @ \(coord)")
-        case .poorResumeAccuracy(let m):
-            print("[tracker] discard resume accuracy=\(Int(m))m @ \(coord)")
         }
         #endif
     }
@@ -528,26 +549,44 @@ extension LocationTracker: CLLocationManagerDelegate {
         for loc in locations.sorted(by: { $0.timestamp < $1.timestamp }) {
             let decision = filter.consume(loc)
 
-            // Debug observability: snapshot every raw fix with its full
-            // set of CLLocation fields and the filter verdict. Offloaded
-            // to `persistQueue` so the synchronous SQLite insert does not
-            // block the CoreLocation main-thread callback. Order is
-            // preserved because `persistQueue` is serial.
-            let snapshot = FixDiagnostic(
-                fixTimestamp: loc.timestamp,
-                latitude: loc.coordinate.latitude,
-                longitude: loc.coordinate.longitude,
-                horizontalAccuracy: loc.horizontalAccuracy,
-                verticalAccuracy: loc.verticalAccuracy,
-                altitude: loc.altitude,
-                speed: loc.speed,
-                speedAccuracy: loc.speedAccuracy,
-                course: loc.course,
-                courseAccuracy: loc.courseAccuracy,
-                decision: diagnosticTag(decision)
-            )
-            persistQueue.async { [database] in
-                database.logDiagnostic(snapshot)
+            // Run the downstream pipeline first (smoother → stationary →
+            // persist) so the fix_diagnostics row can reflect both the
+            // filter verdict AND the stationary verdict. The previous
+            // arrangement wrote the diagnostic before the pipeline ran and
+            // therefore could not distinguish an accept-that-got-persisted
+            // from an accept-that-stationary-suppressed. 1.2.9 adds the
+            // stationary-suppress suffix to the tag — see `diagnosticTag`.
+            var stationarySuppressed = false
+            switch decision {
+            case .accept(let accepted):
+                stationarySuppressed = maybePersist(accepted) == .suppress
+
+            case .buffered:
+                break // waiting for next fix to confirm
+
+            case .discard(let reason):
+                logDiscard(reason, loc)
+
+            case .spikeReplaced(let dropped, let accepted):
+                #if DEBUG
+                print("[tracker] discard spike @ \(dropped.coordinate.latitude),\(dropped.coordinate.longitude)")
+                #endif
+                if let accepted = accepted {
+                    stationarySuppressed = maybePersist(accepted) == .suppress
+                }
+
+            case .committedPending(let pending, let alsoAccept):
+                let pendingDecision = maybePersist(pending)
+                var alsoDecision: StationaryDetector.Decision = .accept
+                if let alsoAccept = alsoAccept {
+                    alsoDecision = maybePersist(alsoAccept)
+                }
+                // A compound-emission fix collapses to one diagnostic
+                // row; flag `stationarySuppress` if either emission
+                // suppressed. Rare enough (`committedPending` is itself
+                // uncommon) that the minor granularity loss is fine.
+                stationarySuppressed = pendingDecision == .suppress
+                    || alsoDecision == .suppress
             }
 
             // Update the consecutive-discard observability counter. Any
@@ -563,50 +602,67 @@ extension LocationTracker: CLLocationManagerDelegate {
                 discardStreak += 1
             }
 
-            switch decision {
-            case .accept(let accepted):
-                maybePersist(accepted)
+            // Unconditional (not DEBUG-only) so sustained deadlocks in
+            // release builds show up in Console.app without needing
+            // the Postgres fix_diagnostics query. Triggered on every
+            // multiple of the threshold so the spam is bounded.
+            if case .discard = decision,
+               discardStreak > 0,
+               discardStreak % Self.discardStreakLogThreshold == 0 {
+                print("[tracker] WARN: \(discardStreak) consecutive discards, latest=\(diagnosticTag(decision, stationarySuppressed: false)) hAcc=\(Int(loc.horizontalAccuracy))m")
+            }
 
-            case .buffered:
-                break // waiting for next fix to confirm
-
-            case .discard(let reason):
-                logDiscard(reason, loc)
-                // Unconditional (not DEBUG-only) so sustained deadlocks in
-                // release builds show up in Console.app without needing
-                // the Postgres fix_diagnostics query. Triggered on every
-                // multiple of the threshold so the spam is bounded.
-                if discardStreak > 0
-                    && discardStreak % Self.discardStreakLogThreshold == 0 {
-                    print("[tracker] WARN: \(discardStreak) consecutive discards, latest=\(diagnosticTag(decision)) hAcc=\(Int(loc.horizontalAccuracy))m")
-                }
-
-            case .spikeReplaced(let dropped, let accepted):
-                #if DEBUG
-                print("[tracker] discard spike @ \(dropped.coordinate.latitude),\(dropped.coordinate.longitude)")
-                #endif
-                if let accepted = accepted {
-                    maybePersist(accepted)
-                }
-
-            case .committedPending(let pending, let alsoAccept):
-                maybePersist(pending)
-                if let alsoAccept = alsoAccept {
-                    maybePersist(alsoAccept)
-                }
+            // Debug observability: snapshot every raw fix with its full
+            // set of CLLocation fields plus the composed filter +
+            // stationary verdict. Offloaded to `persistQueue` so the
+            // synchronous SQLite insert does not block the CoreLocation
+            // main-thread callback. Order is preserved because
+            // `persistQueue` is serial.
+            let snapshot = FixDiagnostic(
+                fixTimestamp: loc.timestamp,
+                latitude: loc.coordinate.latitude,
+                longitude: loc.coordinate.longitude,
+                horizontalAccuracy: loc.horizontalAccuracy,
+                verticalAccuracy: loc.verticalAccuracy,
+                altitude: loc.altitude,
+                speed: loc.speed,
+                speedAccuracy: loc.speedAccuracy,
+                course: loc.course,
+                courseAccuracy: loc.courseAccuracy,
+                decision: diagnosticTag(decision, stationarySuppressed: stationarySuppressed)
+            )
+            persistQueue.async { [database] in
+                database.logDiagnostic(snapshot)
             }
         }
     }
 
-    /// Short string tag describing what `LocationFilter` decided about a raw
-    /// fix. Used only by `fix_diagnostics` — never affects control flow.
-    private func diagnosticTag(_ decision: LocationFilter.Decision) -> String {
+    /// Compose the `fix_diagnostics.decision` tag from the filter verdict
+    /// and the downstream stationary detector's verdict (1.2.9). Used
+    /// for observability only — never affects control flow.
+    ///
+    /// Tag format:
+    ///   - Filter discards: `discard:<reason>` (stationary never consulted).
+    ///   - Filter accepts (`accept` / `spikeReplaced` / `committedPending`
+    ///     / `buffered`): base tag verbatim, plus `:stationarySuppress`
+    ///     suffix if at least one emission to the stationary detector
+    ///     was suppressed as jitter.
+    ///
+    /// The suffix is what lets post-hoc SQL distinguish "persisted to
+    /// `points`" from "accepted by filter but dropped by stationary",
+    /// which was previously indistinguishable.
+    private func diagnosticTag(
+        _ decision: LocationFilter.Decision,
+        stationarySuppressed: Bool
+    ) -> String {
+        let base: String
         switch decision {
-        case .accept: return "accept"
-        case .buffered: return "buffered"
-        case .spikeReplaced: return "spikeReplaced"
-        case .committedPending: return "committedPending"
+        case .accept: base = "accept"
+        case .buffered: base = "buffered"
+        case .spikeReplaced: base = "spikeReplaced"
+        case .committedPending: base = "committedPending"
         case .discard(let reason):
+            // Discards never reach the stationary stage; return straight away.
             switch reason {
             case .invalidFix: return "discard:invalidFix"
             case .nonGpsSource: return "discard:nonGpsSource"
@@ -615,9 +671,9 @@ extension LocationTracker: CLLocationManagerDelegate {
             case .implausibleSpeed: return "discard:implausibleSpeed"
             case .tooClose: return "discard:tooClose"
             case .staleDelivery: return "discard:staleDelivery"
-            case .poorResumeAccuracy: return "discard:poorResumeAccuracy"
             }
         }
+        return stationarySuppressed ? "\(base):stationarySuppress" : base
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {

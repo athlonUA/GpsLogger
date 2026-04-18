@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (68 cases across 6 test files)
+### iOS unit tests (64 cases across 6 test files)
 
 ```
 cd ios
@@ -13,7 +13,7 @@ xcodebuild test -project GpsLogger.xcodeproj -scheme GpsLoggerTests \
     -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
-**`LocationFilterTests` (26 cases)** — every gate in the filter
+**`LocationFilterTests` (20 cases)** — every gate in the filter
 pipeline end-to-end:
 
 - validity gate (negative `horizontalAccuracy` → discard `.invalidFix`)
@@ -24,11 +24,14 @@ pipeline end-to-end:
   teleport" anomaly.
 - source gate runs before the accuracy value gate (so a pristine
   `horizontalAccuracy = 5 m` but `speed = -1` fix is still rejected)
-- accuracy value gate (`horizontalAccuracy > 50 m` → discard `.poorAccuracy`)
+- accuracy value gate (`horizontalAccuracy > 25 m` → discard `.poorAccuracy`,
+  tightened from 50 m in 1.2.9)
 - chronology gate (`Δt ≤ 0` → discard `.staleTimestamp`)
 - implausible-speed gate (500 km/h ceiling)
 - minimum-distance gate (`< 10 m` → discard `.tooClose`)
-- spike buffer (A → B(far > 750 m) → C(near A) → drop B)
+- spike buffer (A → B(far > 250 m walking / > 750 m automotive) →
+  C(near A) → drop B), with pedestrian threshold tightened from
+  blanket 750 m in 1.2.9
 - **pending timeout** (1.2.1): a buffered spike older than
   `Config.pendingTimeoutSeconds` is dropped silently before the next
   fix is evaluated, so an app-backgrounding event cannot leave stale
@@ -40,17 +43,12 @@ pipeline end-to-end:
   rejects fixes whose timestamp is > 10 s *ahead* of wall-clock, which
   happens on system-clock skew backward (NTP correction, manual time
   change, DST edge)
-- **gap-aware accuracy** (1.2.2, three-tier in 1.2.6): after
-  `Δt > 60 s`, accuracy ceiling tightens from 50 m to 20 m
-  (`discard:poorResumeAccuracy`); good accuracy (≤ 20 m) is accepted
-  even after a gap; mediocre accuracy (20–50 m) is accepted during
-  continuous tracking; first-ever fix uses the normal 50 m ceiling
-  (no dt to compare)
-- **deadlock escape valve** (1.2.6): at `Δt > 120 s` the gate falls
-  back to the normal 50 m ceiling so sustained marginal signal cannot
-  self-reinforce; boundary `Δt == 120 s` still tight; extreme `Δt`
-  with > 50 m hAcc still rejected as `poorAccuracy` (the relax tier
-  restores the normal gate, it does not disable it)
+- **automotive spike-jump widening** (1.2.9): pedestrian default
+  `spikeJumpMeters` is 250 m; `filter.setAutomotive(true)` switches
+  it to 750 m so legitimate high-speed sample deltas pass. Test
+  fabricates a ~500 m A→B jump: under walking the jump is buffered
+  as suspicious, under automotive the same jump is accepted as real
+  motion
 - regression: stationary GPS fix (speed = 0, valid vertical accuracy)
   must still be accepted — the source gate must not confuse a
   standing-still user with a network-derived fix
@@ -115,7 +113,7 @@ the 1.2.1 clock-skew guard, and the 1.2.7 gap-reset guard:
   is accepted rather than suppressed
 - `reset()` clears both candidate and stationaryCenter
 
-**`KalmanSmootherTests` (7 cases)** — observable contract of the 1.2.7
+**`KalmanSmootherTests` (9 cases)** — observable contract of the 1.2.7
 2D constant-velocity Kalman filter:
 
 - first-fix passthrough: output coordinate equals input (no state yet
@@ -145,7 +143,7 @@ mapping helpers. Pure static functions, testable without mocking
 - `CLAccuracyAuthorization.fullAccuracy` → no impairment
 - `CLAccuracyAuthorization.reducedAccuracy` → `.reducedAccuracy`
   (iOS 14+ Precise Location toggle off; the silent-black-trace case
-  our 50 m filter ceiling would otherwise hide)
+  our 25 m filter ceiling would otherwise hide)
 - `UIBackgroundRefreshStatus.available` → no impairment
 - `.denied` → `.backgroundRefreshDenied`
 - `.restricted` (Screen Time / MDM policy) → `.backgroundRefreshDenied`
@@ -553,152 +551,6 @@ API_KEY=rotated docker compose up -d backend
   time out) are the ones that actually double the interval up to the
   5-min cap.
 
-## 1.2.6 deadlock-fix regression plan
-
-Targeted field regression for the three-tier gap-aware gate introduced
-in 1.2.6. Verifies:
-
-- **G1** — tight 20 m ceiling still fires for `60 s < dt ≤ 120 s` (no
-  silent weakening of the multipath-convergence defense from 1.2.2).
-- **G2** — escape valve relaxes the ceiling back to 50 m at `dt > 120 s`
-  (no more multi-minute `poorResumeAccuracy` blackouts like the
-  2026-04-16 session).
-- **G3** — normal outdoor tracking is indistinguishable from 1.2.5.
-
-Prereqs: iPhone on 1.2.6 (version string in the app footer reads
-`v1.2.6 (11)`), `docker compose ps` shows all four services healthy,
-Console.app attached to the device with filter `process = GpsLogger` +
-string = `[tracker]` (keeps the `WARN: N consecutive discards` line
-visible live), and the Device ID copied from the app footer —
-substituted as `<DEV>` in every query below. All four scenarios cover
-~30 min of field time total.
-
-### 15. Gap-aware tight gate after short indoor visit (1.2.6, G1)
-
-Verifies the `60 s < dt ≤ 120 s` tier still fires after a brief
-building entry — this is the case the gate was designed for in 1.2.2
-and must not be silently weakened by the 1.2.6 relax tier.
-
-- Stand outside for 2–3 min until the unsynced counter is ticking
-  steadily.
-- Enter a store/building, stay 2–3 min, exit, walk 60–90 s at normal
-  pace.
-- Expected: the trace resumes **60–120 s after exit**, not sooner.
-- If wrong (trace resumes < 30 s after exit, visible zigzag on a
-  straight sidewalk), query the post-exit window and expect 3–20 rows
-  of `discard:poorResumeAccuracy` at 20–50 m in the first 60–120 s:
-
-  ```sql
-  SELECT fix_timestamp, horizontal_accuracy, decision
-    FROM fix_diagnostics
-   WHERE device_id = '<DEV>'
-     AND fix_timestamp BETWEEN '<exit-utc>'
-                           AND '<exit-utc>'::timestamptz + INTERVAL '3 minutes'
-   ORDER BY fix_timestamp;
-  ```
-
-  If all rows are `accept` starting immediately on exit, the tight
-  gate isn't engaging — check `Config.resumeGapSeconds` and
-  `Config.resumeMaxAccuracyMeters` in the running binary.
-
-### 16. Deadlock escape after long indoor + marginal exit (1.2.6, G2)
-
-Verifies the `dt > 120 s` relax tier fires cleanly. Creates the
-compound-degradation scenario that historically deadlocked the filter.
-
-- Phone in pocket, GPS tracking on. Enter a building for ≥ 10 min.
-- Exit but remain in marginal signal for 3 min (under an awning, along
-  a tall wall, narrow alley). Do not remove the phone from the pocket.
-- Step into clear sky and walk for 2 min.
-- Expected: the trace resumes **within 120 s of exit**. Console.app
-  shows **at most one** `[tracker] WARN: 20 consecutive discards …`
-  line. A second WARN (`40 consecutive discards`) means the escape
-  isn't relaxing the gate.
-- If wrong, query the 5-min window after exit:
-
-  ```sql
-  SELECT fix_timestamp, horizontal_accuracy, decision
-    FROM fix_diagnostics
-   WHERE device_id = '<DEV>'
-     AND fix_timestamp BETWEEN '<exit-utc>'
-                           AND '<exit-utc>'::timestamptz + INTERVAL '5 minutes'
-   ORDER BY fix_timestamp;
-  ```
-
-  The longest consecutive run of `discard:poorResumeAccuracy` must not
-  exceed ~120 s of wall-clock time. If it does:
-
-  1. Confirm the running build is 1.2.6:
-     `plutil -p .../GpsLogger.app/Info.plist | grep CFBundleShortVersionString`.
-  2. Confirm `LocationFilter.swift`'s gap-aware gate has the `dt <= resumeRelax`
-     conjunct (the three-tier rule comment mentions the 1.2.6 fix).
-
-### 17. Transit through signal-weak corridor (1.2.6, G2 — regression case)
-
-Exact reproduction of the 2026-04-16 production session where a 60 s
-tram signal dip cascaded into a 17-minute blackout. Highest-reproducibility
-scenario for the deadlock.
-
-- Board a tram or bus that passes through a tunnel / underpass / dense
-  downtown for ≥ 60 s.
-- Continue on the same vehicle for ≥ 10 min past the signal-weak section.
-- Expected: short straight-line segments (< 5 min gap) where the
-  tunnel was are a frontend rendering choice and fine. **On the data
-  side**, no accepted-fix gap longer than ~180 s anywhere in the ride.
-- If wrong, compute the gaps between consecutive accepts:
-
-  ```sql
-  SELECT fix_timestamp, horizontal_accuracy,
-         EXTRACT(EPOCH FROM (fix_timestamp - LAG(fix_timestamp)
-                             OVER (ORDER BY fix_timestamp)))::int AS secs_since_prev
-    FROM fix_diagnostics
-   WHERE device_id = '<DEV>'
-     AND fix_timestamp BETWEEN '<board>' AND '<alight>'
-     AND decision = 'accept'
-   ORDER BY fix_timestamp;
-  ```
-
-  Maximum `secs_since_prev` among accepts should be < 180 s. Any value
-  ≥ 300 s is a regression against the 1.2.6 fix — pull the full slice
-  (all decisions, not just accepts) for that gap and escalate with the
-  slice attached.
-
-### 18. Normal outdoor walk (1.2.6, G3 — no regression)
-
-Baseline sanity check that the 1.2.6 change has not altered normal
-outdoor tracking quality.
-
-- 20 min walk on a clear-sky route, ideally one previously walked on
-  1.2.5 so numbers are comparable.
-- Query the window:
-
-  ```sql
-  SELECT
-    COUNT(*) FILTER (WHERE decision = 'accept') AS accepts,
-    COUNT(*) FILTER (WHERE decision = 'accept' AND horizontal_accuracy <= 10)         AS under_10m,
-    COUNT(*) FILTER (WHERE decision = 'accept' AND horizontal_accuracy BETWEEN 10 AND 20) AS in_10_20m,
-    COUNT(*) FILTER (WHERE decision = 'accept' AND horizontal_accuracy > 20)          AS over_20m
-    FROM fix_diagnostics
-   WHERE device_id = '<DEV>'
-     AND fix_timestamp BETWEEN '<start>' AND '<end>';
-  ```
-
-- Expected for continuous outdoor walking at ~1 m/s with `distanceFilter`
-  = 10 m over 20 min: `accepts` ≈ 100–150, `under_10m + in_10_20m`
-  ≥ 90 % of `accepts`, `over_20m` is small. Every `over_20m` accept
-  should correspond to a `dt > 120 s` event (the escape path).
-- If wrong — `over_20m` > 20 % of accepts during continuous walking —
-  sample the offending rows and confirm their `dt` to the prior accept
-  is > 120 s. Any `over_20m` accept with `dt` in the `60–120 s` band
-  is a regression against the 1.2.2 tight-gate guarantee — the escape
-  valve is firing when it shouldn't.
-
-**Out of scope for the 1.2.6 round.** These were explicitly not changed
-and don't need retesting here — scenarios #1–14 above already cover
-them: source gate (Wi-Fi/cell fallback), spike buffer, stationary
-detector, sync/backoff/idempotency, BGTaskScheduler, backend API,
-frontend visualization, Docker stack.
-
 ## 1.2.7 sampling-density + Kalman regression plan
 
 Targeted field regression for the 1.2.7 overhaul of the sampling path
@@ -864,9 +716,153 @@ the smoother.
 
 **Out of scope for the 1.2.7 round.** Unchanged and not retested
 here: source gate (#22 is a sanity touch, not a re-validation),
-`LocationFilter`'s gap-aware three-tier gate (1.2.6), spike buffer,
-sync/backoff, BGTaskScheduler, backend API, frontend visualization
-logic, Docker stack. Scenarios #1–18 cover those.
+spike buffer, sync/backoff, BGTaskScheduler, backend API, frontend
+visualization logic, Docker stack. Scenarios #1–14 cover those.
+
+(The 1.2.6 three-tier gap-aware gate regression scenarios were
+removed from QA.md in the 1.2.9 round along with the gate itself.)
+
+## 1.2.9 audit-driven simplification regression plan
+
+Targeted field regression for the 1.2.9 subtractions. Verifies:
+
+- **S1** — tightened 25 m accuracy ceiling produces honest gaps on
+  iPhone 8 under canopy instead of 30–50 m accepts. iPhone 13 Pro Max
+  loses < 1% of fixes (near-lossless).
+- **S2** — 250 m pedestrian spike threshold catches multipath jumps
+  that the old 750 m blanket let through.
+- **S3** — automotive mode widens the spike threshold so legitimate
+  high-speed vehicle deltas still pass.
+- **S4** — stationary-suppress decisions now appear in
+  `fix_diagnostics` as `<base>:stationarySuppress` tags.
+- **S5** — the removed `poorResumeAccuracy` gate is well and truly
+  gone: no `discard:poorResumeAccuracy` rows appear in the diagnostic
+  stream regardless of gap length.
+
+Prereqs: iPhone on 1.2.9 (footer reads `v1.2.9 (14)`),
+`docker compose ps` healthy, Device ID copied as `<DEV>`.
+
+### 23. Ceiling tightening, iPhone 8 under canopy (1.2.9, S1)
+
+Primary validation that the ceiling change is doing what the audit
+expected: fewer persisted-accept rows on iPhone 8 under tree cover.
+
+- Walk a ~30 min route that includes 5–10 min under continuous tree
+  canopy (Turia park in Valencia, Casa de Campo in Madrid).
+- Query accepted HA distribution vs the 2026-04-18 baseline:
+
+  ```sql
+  SELECT
+    COUNT(*) FILTER (WHERE decision = 'accept') AS accepts,
+    ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY horizontal_accuracy)
+       FILTER (WHERE decision = 'accept')::numeric, 1) AS ha_p50,
+    ROUND(percentile_cont(0.9) WITHIN GROUP (ORDER BY horizontal_accuracy)
+       FILTER (WHERE decision = 'accept')::numeric, 1) AS ha_p90,
+    COUNT(*) FILTER (WHERE decision = 'accept'
+                       AND horizontal_accuracy > 25) AS over_ceiling
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<start>' AND '<end>';
+  ```
+
+- Expected: `over_ceiling = 0` (the new gate rejects HA > 25 m
+  unconditionally), `accepts` count is lower than the pre-1.2.9
+  baseline by roughly the fraction of canopy time.
+- iPhone 13 Pro Max: same query, `accepts` should be close to
+  baseline (p90 = 14 m sits well under the new ceiling).
+
+### 24. Pedestrian spike threshold catches multipath (1.2.9, S2)
+
+Verifies the 250 m walking threshold catches what the old 750 m
+missed. Harder to provoke deliberately — rely on post-hoc detection.
+
+- After a session under canopy or in urban canyon, query for buffered
+  fixes that would have slipped through the old threshold:
+
+  ```sql
+  SELECT fix_timestamp, decision, horizontal_accuracy, latitude, longitude
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND decision IN ('buffered', 'spikeReplaced')
+     AND fix_timestamp > '<session_start>'
+   ORDER BY fix_timestamp;
+  ```
+
+- Expected on a canopy-heavy iPhone 8 session: at least a handful of
+  `buffered` rows where the raw jump was in the 250–750 m range.
+  Zero on a clean iPhone 13 Pro Max session is fine and expected.
+- If a `spikeReplaced` row appears alongside it, the buffer ran its
+  full A→B→C cycle — ideal confirmation.
+
+### 25. Automotive widens spike threshold on real trip (1.2.9, S3)
+
+- On a car / bus / tram ride ≥ 20 min, confirm:
+
+  ```sql
+  SELECT fix_timestamp, decision, horizontal_accuracy
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<ride_start>' AND '<ride_end>'
+     AND decision = 'buffered'
+   ORDER BY fix_timestamp;
+  ```
+
+- Expected: very few or zero `buffered` rows. Automotive threshold
+  (750 m) should easily accommodate any legitimate sample-delta on
+  Spanish highways or Metrovalencia track.
+- If many `buffered` rows show up during a real ride, either
+  `MotionClassifier` isn't reaching `.automotive` in time, or Motion
+  & Fitness permission is denied (surfaces as
+  `TrackingImpairment.motionPermissionDenied` in the UI banner —
+  first thing to check).
+
+### 26. Stationary decisions now visible in diagnostics (1.2.9, S4)
+
+- Sit still with the phone for ≥ 3 min after a walk (coffee stop,
+  waiting at a bus shelter).
+- Query:
+
+  ```sql
+  SELECT decision, COUNT(*)
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<stop_start>' AND '<stop_end>'
+   GROUP BY decision
+   ORDER BY COUNT(*) DESC;
+  ```
+
+- Expected: a mix of `accept` (during the first ~150 s as the
+  window fills) and `accept:stationarySuppress` (once the detector
+  declares stationary and suppresses further fixes). Before 1.2.9
+  only `accept` rows existed and the post-150 s suppressions were
+  invisible.
+- The exact ratio depends on phone cadence but both tags should be
+  non-zero.
+
+### 27. No residual `poorResumeAccuracy` ever (1.2.9, S5)
+
+- Walk a route with at least one multi-minute signal blackout
+  (indoor shop, parking garage entry and exit).
+- Query:
+
+  ```sql
+  SELECT COUNT(*) FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND decision = 'discard:poorResumeAccuracy'
+     AND fix_timestamp > '<upgrade_time>';
+  ```
+
+- Expected: **0**. The gate is gone; a single `discard:poorAccuracy`
+  at the 25 m ceiling is the only accuracy-based rejection that
+  remains.
+- Non-zero would indicate an old build is still uploading (check
+  app footer), or the ENUM migration was incomplete.
+
+**Out of scope for the 1.2.9 round.** Kalman smoother (intentionally
+kept per the audit — it does real work on clean GNSS even if it can't
+repair biased measurements), stationary detector, sync/backoff,
+BGTaskScheduler, backend API, frontend visualization, Docker stack.
+Scenarios #1–22 cover those.
 
 ## Inspecting fix_diagnostics after an anomaly
 

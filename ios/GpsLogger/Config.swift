@@ -53,12 +53,19 @@ enum Config {
     static let minDistanceMeters: CLLocationDistance = 10
 
     /// Primary quality signal: discard any fix whose reported horizontal
-    /// accuracy is worse than this. 50 m is a practical ceiling — indoor /
-    /// urban-canyon fixes worse than this are almost always unusable, while
-    /// legitimate outdoor fixes are normally well under 30 m. This single
-    /// rule is the most reliable defense against GPS noise and is
-    /// movement-type agnostic (works identically for walking, driving, trains).
-    static let maxHorizontalAccuracyMeters: CLLocationDistance = 50
+    /// accuracy is worse than this. 25 m is the tightened ceiling
+    /// (1.2.9) — empirical data across four days and two devices showed
+    /// the previous 50 m ceiling was letting through a long tail of
+    /// 30–50 m fixes, especially on iPhone 8 under Mediterranean tree
+    /// canopy (259 persisted accepts with HA > 30 m in a single hour
+    /// vs 1 on iPhone 13 Pro Max). Those fixes were distorting the
+    /// rendered trace by up to half a city block without improving
+    /// completeness in any measurable way. 25 m produces near-lossless
+    /// behavior on a clean GNSS device (iPhone 13 Pro Max sits at
+    /// p90 = 14 m) and honest gaps-instead-of-lies on iPhone 8 under
+    /// canopy, which is the correct trade for a visualization-focused
+    /// tracker. Still movement-type agnostic.
+    static let maxHorizontalAccuracyMeters: CLLocationDistance = 25
 
     /// Extremely relaxed speed ceiling, used **only** to catch teleport-class
     /// glitches (impossible physics), never to gate normal movement.
@@ -73,17 +80,32 @@ enum Config {
     /// mode so it cannot produce false negatives against legitimate users.
     static let maxPlausibleSpeedMps: CLLocationSpeed = 500.0 * 1000.0 / 3600.0
 
-    /// A new point farther than this from the last accepted point is treated
-    /// as *suspicious* and held back one tick, waiting for the next fix to
-    /// confirm or reject it (A → B → C spike pattern, see `LocationFilter`).
+    /// A new point farther than this from the last accepted point is
+    /// treated as *suspicious* and held back one tick for A → B → C
+    /// spike resolution (see `LocationFilter`).
     ///
-    /// Intentionally sized so normal movement **never** triggers buffering,
-    /// including high-speed rail:
-    ///   - 350 km/h ≈ 97 m/s → 5 s sample delta ≈ 485 m (< 750 m)
-    ///   - 130 km/h ≈ 36 m/s → 5 s sample delta ≈ 180 m (< 750 m)
-    /// Only genuine teleports (several hundred meters into an unrelated
-    /// street, with no real motion to explain them) cross this threshold.
-    static let spikeJumpMeters: CLLocationDistance = 750
+    /// Walking / cycling default: **250 m** (1.2.9, tightened from the
+    /// blanket 750 m). On 2026-04-18, iPhone 8 under canopy produced
+    /// two genuine multipath jumps of 410 m that the old threshold let
+    /// through. 250 m catches them while still exceeding any legitimate
+    /// sample delta observed in the dataset (max < 50 m for walking,
+    /// < 100 m for cycling).
+    ///
+    /// For automotive / rail, the threshold widens to
+    /// `spikeJumpMetersAutomotive` — see that constant for rationale.
+    /// Mode selection is driven by `MotionClassifier`; `LocationTracker`
+    /// calls `LocationFilter.setAutomotive(_:)` on every mode change.
+    static let spikeJumpMeters: CLLocationDistance = 250
+
+    /// Wider spike-jump threshold applied under
+    /// `MotionClassifier.Mode == .automotive`. Sized so normal
+    /// high-speed transport never triggers buffering:
+    ///   - 350 km/h ≈ 97 m/s → 5 s sample delta ≈ 485 m (< 750)
+    ///   - 130 km/h ≈ 36 m/s → 5 s sample delta ≈ 180 m (< 750)
+    /// Only genuine teleports on a motorway cross 750 m between samples.
+    /// Pedestrian / cyclist traces never reach this mode so the loose
+    /// threshold is not in effect for them.
+    static let spikeJumpMetersAutomotive: CLLocationDistance = 750
 
     /// Companion to `spikeJumpMeters`: if — after a suspicious point was
     /// buffered — the *next* fix lands within this radius of the last
@@ -131,35 +153,35 @@ enum Config {
     /// any cached replay from a previous signal window.
     static let maxFixAgeSeconds: TimeInterval = 10
 
-    /// After a gap longer than this between accepted fixes, the accuracy
-    /// threshold tightens to `resumeMaxAccuracyMeters`. 60 s covers normal
-    /// sample intervals; longer gaps indicate signal loss (indoor, background,
-    /// tunnel) where the first returning fixes are disproportionately likely
-    /// to be multipath-degraded.
-    static let resumeGapSeconds: TimeInterval = 60
-
-    /// Tighter accuracy ceiling applied to the first fix after a gap exceeding
-    /// `resumeGapSeconds`. 20 m is achievable for outdoor GNSS within 5–15 s
-    /// of reacquisition, filtering the worst multipath convergence fixes.
-    static let resumeMaxAccuracyMeters: CLLocationDistance = 20
-
-    /// Deadlock-escape threshold for the gap-aware accuracy gate. The gate
-    /// tightens from 50 m to 20 m once `dt > resumeGapSeconds`, which is the
-    /// correct defense against multipath convergence after a short indoor /
-    /// tunnel gap. Under *sustained* marginal signal, the gate was observed in
-    /// production (v1.2.5, 2026-04-16 session) to self-reinforce: every
-    /// rejection pushed `dt` further, every new fix still landed in the
-    /// 20–50 m band, and the gate never released — producing a 17-minute
-    /// accepted-fix blackout despite the chip delivering one CLLocation
-    /// sample every ~5 s.
+    /// How long no-fix-seen counts as "lost the user" for the
+    /// `StationaryDetector`. Used only by the gap-reset guard in
+    /// `StationaryDetector.consume`: if the inter-sample gap exceeds
+    /// this, the candidate anchor is treated as stale and the returning
+    /// fix starts a fresh cluster instead of inheriting the old window.
     ///
-    /// This constant bounds the worst case. Once `dt` exceeds it, the gate
-    /// falls back to the normal 50 m ceiling so at least some movement data
-    /// is recorded. 120 s is large enough to still filter the vast majority
-    /// of real post-indoor multipath (which typically converges in 30–90 s)
-    /// yet small enough that a user who keeps walking through marginal
-    /// signal will see fixes reappear within two minutes, not seventeen.
-    static let resumeRelaxSeconds: TimeInterval = 120
+    /// This is a separate knob from `kalmanResetGapSeconds` (10 s) on
+    /// purpose. The two subsystems model different things:
+    ///
+    ///   | threshold                      | what it protects against           |
+    ///   | ------------------------------ | ---------------------------------- |
+    ///   | `kalmanResetGapSeconds = 10 s` | stale velocity prior (Kalman state |
+    ///   |                                | decays fast — 10 s with no         |
+    ///   |                                | evidence already makes `v` a poor  |
+    ///   |                                | predictor, so we re-seed)          |
+    ///   | `resumeGapSeconds      = 60 s` | stale cluster anchor (a candidate  |
+    ///   |                                | is only valid while we actually    |
+    ///   |                                | keep seeing points near it; after  |
+    ///   |                                | 60 s of silence we don't know      |
+    ///   |                                | what the user did)                 |
+    ///
+    /// There used to be a third gap-aware threshold in `LocationFilter`
+    /// (1.2.2 three-tier `poorResumeAccuracy` gate with 60 s / 120 s
+    /// tiers) which was removed in 1.2.9 — empirical data showed the
+    /// middle tier fired only in one deadlocked session the 1.2.6
+    /// relaxation was then added to escape, and zero times in any
+    /// iPhone 13 Pro Max history. A single 25 m accuracy ceiling
+    /// (`maxHorizontalAccuracyMeters`) supersedes it.
+    static let resumeGapSeconds: TimeInterval = 60
 
     /// Process-noise acceleration standard deviation (m/s²) for the
     /// 2D constant-velocity Kalman filter applied to accepted fixes.

@@ -65,6 +65,12 @@ struct KalmanSmoother {
     /// fix after a reset). Remains fixed for the lifetime of one
     /// non-reset window so the local x/y math is self-consistent.
     private var origin: CLLocationCoordinate2D?
+    /// Cached `cos(origin.latitude · π/180)`. `origin` is by contract
+    /// constant across a non-reset window, so its cosine is too; caching
+    /// here eliminates two `cos` calls per `consume` (ENU forward +
+    /// inverse) without changing numerical behaviour. Set at reset time;
+    /// read by `enuOffset` / `latLonFromENU`.
+    private var originCosLat: Double = 1.0
     /// Timestamp of the last processed fix. Used for `dt` and the gap
     /// reset rule.
     private var lastTimestamp: Date?
@@ -89,6 +95,7 @@ struct KalmanSmoother {
 
     mutating func reset() {
         origin = nil
+        originCosLat = 1.0
         lastTimestamp = nil
         state = [0, 0, 0, 0]
         covariance = Self.identity(4)
@@ -121,6 +128,7 @@ struct KalmanSmoother {
         // velocity would "hold" the zero prior for too long).
         guard let anchor = origin else {
             origin = loc.coordinate
+            originCosLat = cos(loc.coordinate.latitude * .pi / 180.0)
             lastTimestamp = loc.timestamp
             state = [0, 0, 0, 0]
             covariance = [
@@ -139,7 +147,11 @@ struct KalmanSmoother {
         let lastT = lastTimestamp ?? loc.timestamp
         let dt = loc.timestamp.timeIntervalSince(lastT)
 
-        let (measX, measY) = Self.enuOffset(origin: anchor, coord: loc.coordinate)
+        let (measX, measY) = Self.enuOffset(
+            origin: anchor,
+            cosLat: originCosLat,
+            coord: loc.coordinate
+        )
 
         // ---- Predict ----
         // x_pred = F x
@@ -225,7 +237,12 @@ struct KalmanSmoother {
         posVariance: Double
     ) -> CLLocation {
         guard let anchor = origin else { return loc }
-        let smoothed = Self.latLonFromENU(origin: anchor, x: x, y: y)
+        let smoothed = Self.latLonFromENU(
+            origin: anchor,
+            cosLat: originCosLat,
+            x: x,
+            y: y
+        )
         let smoothedAccuracy = sqrt(max(posVariance, 0))
         return CLLocation(
             coordinate: smoothed,
@@ -319,14 +336,31 @@ struct KalmanSmoother {
     private static let metersPerDegreeLat: Double = 6_371_000.0 * .pi / 180.0
 
     /// Local east/north offsets (meters) from `origin` to `coord`. The
-    /// longitude-axis scaling uses `cos(origin.latitude)` rather than
-    /// recomputing at every fix — this is the standard equirectangular
-    /// approximation and introduces negligible error within one session.
+    /// longitude-axis scaling uses `cos(origin.latitude)` — this is the
+    /// standard equirectangular approximation and introduces negligible
+    /// error within one session. Convenience overload; the hot path
+    /// (`consume`) uses `cosLat`-taking variant below to avoid re-
+    /// computing the cosine on every call.
     static func enuOffset(
         origin: CLLocationCoordinate2D,
         coord: CLLocationCoordinate2D
     ) -> (x: Double, y: Double) {
-        let cosLat = cos(origin.latitude * .pi / 180.0)
+        enuOffset(
+            origin: origin,
+            cosLat: cos(origin.latitude * .pi / 180.0),
+            coord: coord
+        )
+    }
+
+    /// Hot-path variant of `enuOffset` that accepts a precomputed
+    /// `cos(origin.latitude · π/180)`. `origin` is constant across a
+    /// non-reset Kalman window so caching the cosine saves one
+    /// trigonometric call per `consume` (1.2.9, R8 from the audit).
+    static func enuOffset(
+        origin: CLLocationCoordinate2D,
+        cosLat: Double,
+        coord: CLLocationCoordinate2D
+    ) -> (x: Double, y: Double) {
         let dx = (coord.longitude - origin.longitude) * metersPerDegreeLat * cosLat
         let dy = (coord.latitude - origin.latitude) * metersPerDegreeLat
         return (dx, dy)
@@ -334,13 +368,29 @@ struct KalmanSmoother {
 
     /// Inverse of `enuOffset`: recover lat/lon from ENU meters around
     /// `origin`. Kept symmetric with the forward mapping so round-trip
-    /// identity holds to the same sub-meter tolerance.
+    /// identity holds to the same sub-meter tolerance. Convenience
+    /// overload; hot path uses the `cosLat`-taking variant below.
     static func latLonFromENU(
         origin: CLLocationCoordinate2D,
         x: Double,
         y: Double
     ) -> CLLocationCoordinate2D {
-        let cosLat = cos(origin.latitude * .pi / 180.0)
+        latLonFromENU(
+            origin: origin,
+            cosLat: cos(origin.latitude * .pi / 180.0),
+            x: x,
+            y: y
+        )
+    }
+
+    /// Hot-path variant of `latLonFromENU` that accepts a precomputed
+    /// `cos(origin.latitude · π/180)`.
+    static func latLonFromENU(
+        origin: CLLocationCoordinate2D,
+        cosLat: Double,
+        x: Double,
+        y: Double
+    ) -> CLLocationCoordinate2D {
         let lat = origin.latitude + y / metersPerDegreeLat
         let lon = origin.longitude + x / (metersPerDegreeLat * cosLat)
         return CLLocationCoordinate2D(latitude: lat, longitude: lon)

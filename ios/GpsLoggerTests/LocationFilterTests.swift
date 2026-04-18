@@ -280,122 +280,29 @@ final class LocationFilterTests: XCTestCase {
         )
     }
 
-    // MARK: - Gap-aware accuracy
+    // MARK: - Automotive spike-jump threshold (1.2.9)
 
-    func testRejectsMediacreAccuracyAfterGap() {
-        // After a signal gap > 60 s, the accuracy ceiling tightens from
-        // 50 m to 20 m to filter GPS convergence / multipath drift.
-        var filter = LocationFilter()
+    func testAutomotiveModeWidensSpikeJumpThreshold() {
+        // Pedestrian default is 250 m; `setAutomotive(true)` widens it
+        // to 750 m so a car at 130 km/h (≈ 180 m per 5 s) does not trip
+        // the gate on its own legitimate displacement. Same A → B → C
+        // pattern, but B is 500 m away: caught as a spike under walking,
+        // accepted as real motion under automotive.
+        var walking = LocationFilter()
+        var driving = LocationFilter()
+        driving.setAutomotive(true)
         let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        feed(&filter, a)
-        // 120 s gap, hAcc = 30 m — above the 20 m resume ceiling.
-        let b = makeFix(lat: 50.4510, lon: 30.5240,
-                        horizontalAccuracy: 30, timestamp: date(120))
-        XCTAssertEqual(
-            filter.consume(b, now: date(120.5)),
-            .discard(.poorResumeAccuracy(meters: 30))
-        )
-    }
-
-    func testAcceptsGoodAccuracyAfterGap() {
-        var filter = LocationFilter()
-        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        feed(&filter, a)
-        // 120 s gap, hAcc = 15 m — under the 20 m resume ceiling.
-        let b = makeFix(lat: 50.4510, lon: 30.5240,
-                        horizontalAccuracy: 15, timestamp: date(120))
-        guard case .accept = filter.consume(b, now: date(120.5)) else {
-            return XCTFail("good-accuracy fix should be accepted even after a gap")
+        feed(&walking, a)
+        feed(&driving, a)
+        // B is ~500 m east of A.
+        let b = makeFix(lat: 50.4500, lon: 30.5300, timestamp: date(5))
+        // Walking path: B is suspicious and gets buffered.
+        XCTAssertEqual(walking.consume(b, now: date(5.5)), .buffered)
+        // Automotive path: B is within the wider envelope and goes
+        // straight through as a normal accept.
+        guard case .accept = driving.consume(b, now: date(5.5)) else {
+            return XCTFail("500 m jump should be accepted under automotive threshold")
         }
-    }
-
-    func testAcceptsMediacreAccuracyWithoutGap() {
-        // Without a gap (dt = 5 s, well under the 60 s threshold), the
-        // normal 50 m ceiling applies — 30 m accuracy is fine.
-        var filter = LocationFilter()
-        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        feed(&filter, a)
-        let b = makeFix(lat: 50.4510, lon: 30.5240,
-                        horizontalAccuracy: 30, timestamp: date(5))
-        guard case .accept = filter.consume(b, now: date(5.5)) else {
-            return XCTFail("mediocre accuracy should be accepted during continuous tracking")
-        }
-    }
-
-    func testGapAccuracyDoesNotAffectFirstFix() {
-        // The very first fix has no lastAccepted and therefore no dt.
-        // Gap-aware accuracy should not interfere — the normal 50 m
-        // ceiling applies.
-        var filter = LocationFilter()
-        let fix = makeFix(lat: 50.45, lon: 30.52, horizontalAccuracy: 30,
-                          timestamp: date(0))
-        guard case .accept = filter.consume(fix, now: date(0.5)) else {
-            return XCTFail("first fix with 30 m accuracy should be accepted")
-        }
-    }
-
-    // MARK: - Deadlock escape valve (1.2.6)
-
-    func testGapAccuracyStaysTightAtRelaxBoundary() {
-        // Boundary: dt == resumeRelaxSeconds exactly. Still inside the
-        // tight tier — gate should reject the 30 m fix.
-        var filter = LocationFilter(
-            resumeGap: 60,
-            resumeMaxAccuracy: 20,
-            resumeRelax: 120
-        )
-        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        feed(&filter, a)
-        let b = makeFix(lat: 50.4510, lon: 30.5240,
-                        horizontalAccuracy: 30, timestamp: date(120))
-        XCTAssertEqual(
-            filter.consume(b, now: date(120.5)),
-            .discard(.poorResumeAccuracy(meters: 30)),
-            "at dt == resumeRelax the tight 20 m ceiling must still apply"
-        )
-    }
-
-    func testGapAccuracyEscapesAfterRelaxThreshold() {
-        // Core deadlock-escape test. 20–50 m fixes must start being
-        // accepted once dt exceeds resumeRelaxSeconds — otherwise the
-        // filter self-reinforces into the 17-minute blackout observed in
-        // the 2026-04-16 production session.
-        var filter = LocationFilter(
-            resumeGap: 60,
-            resumeMaxAccuracy: 20,
-            resumeRelax: 120
-        )
-        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        feed(&filter, a)
-        // dt = 180 s (well past the 120 s relax threshold). hAcc = 30 m
-        // would have been rejected under the old tight-forever gate;
-        // under the 1.2.6 relaxed tier the normal 50 m ceiling applies
-        // and the fix is accepted.
-        let b = makeFix(lat: 50.4510, lon: 30.5240,
-                        horizontalAccuracy: 30, timestamp: date(180))
-        guard case .accept = filter.consume(b, now: date(180.5)) else {
-            return XCTFail("after dt > resumeRelax, hAcc 30 m must be accepted")
-        }
-    }
-
-    func testGapAccuracyRelaxDoesNotWeakenNormalCeiling() {
-        // After relax, the normal 50 m ceiling still applies — a 60 m fix
-        // is still poor accuracy and must be rejected via the normal gate,
-        // not let through as part of the escape valve.
-        var filter = LocationFilter(
-            resumeGap: 60,
-            resumeMaxAccuracy: 20,
-            resumeRelax: 120
-        )
-        let a = makeFix(lat: 50.4500, lon: 30.5230, timestamp: date(0))
-        feed(&filter, a)
-        let b = makeFix(lat: 50.4510, lon: 30.5240,
-                        horizontalAccuracy: 60, timestamp: date(300))
-        XCTAssertEqual(
-            filter.consume(b, now: date(300.5)),
-            .discard(.poorAccuracy(meters: 60)),
-            "relaxed tier must still reject > 50 m as poorAccuracy"
-        )
     }
 
     // MARK: - Helpers

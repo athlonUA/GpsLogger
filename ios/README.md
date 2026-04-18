@@ -290,25 +290,29 @@ covers every device you've built for.
      documented sentinel negatives. This is the load-bearing defense
      against stale-BSSID Wi-Fi Positioning "teleport" fixes that
      otherwise pass the accuracy gate.
-     (d) accuracy value — drops fixes with `horizontalAccuracy > 50 m`.
+     (d) accuracy value — drops fixes with
+     `horizontalAccuracy > 25 m` (1.2.9, tightened from 50 m based
+     on empirical HA distribution).
      (e) chronology — `Δt > 0` vs the last accepted fix (rejects
      replayed cached fixes).
-     (f) **gap-aware accuracy** (1.2.2, three-tier in 1.2.6) — if
-     `Δt > 60 s`, tightens the accuracy ceiling from 50 m to 20 m,
-     filtering multipath convergence fixes after extended indoor /
-     background signal loss. **1.2.6 escape valve**: if `Δt > 120 s`
-     the ceiling falls back to the normal 50 m so sustained marginal
-     signal cannot self-reinforce into a multi-minute blackout (see
-     the 1.2.6 hardening bullet below for the production incident
-     that motivated the fix).
-     (g) implausible speed — rejects implied speeds > 500 km/h.
-     (h) spike buffer — a fix > 750 m from the last accepted point is
-     held one tick; if the next fix returns within 100 m of the last
-     accepted point, the buffered fix is confirmed as a spike and
-     dropped. A `pending` fix older than
-     `Config.pendingTimeoutSeconds` (30 s) is discarded silently so
-     an app-backgrounding event cannot corrupt the next session.
-     (i) minimum distance — ≥ 10 m from the last accepted fix.
+     (f) implausible speed — rejects implied speeds > 500 km/h.
+     (g) spike buffer — a fix farther than the spike-jump threshold
+     from the last accepted point is held one tick; if the next fix
+     returns within 100 m of the last accepted point, the buffered
+     fix is confirmed as a spike and dropped. Threshold is
+     **mode-aware** (1.2.9): 250 m for walking / cycling, 750 m
+     under `MotionClassifier.Mode == .automotive`. Pedestrian default
+     tightened from the blanket 750 m after real 410 m multipath
+     jumps on iPhone 8 slipped through; automotive keeps 750 m so
+     legitimate high-speed sample deltas pass. A `pending` fix older
+     than `Config.pendingTimeoutSeconds` (30 s) is discarded silently
+     so an app-backgrounding event cannot corrupt the next session.
+     (h) minimum distance — ≥ 10 m from the last accepted fix.
+
+     Removed in 1.2.9: a three-tier `poorResumeAccuracy` gate that
+     fired on only one deadlocked iPhone 8 session in the whole
+     dataset and zero times ever on iPhone 13 Pro Max; the single
+     25 m ceiling subsumes its intent.
   2. **`KalmanSmoother` (1.2.7)** — 2D constant-velocity Kalman filter
      in local ENU meters. State `[x, y, vx, vy]`, process-noise
      acceleration σ = 2 m/s² (multi-modal), measurement noise R from
@@ -340,10 +344,14 @@ covers every device you've built for.
   machine in `locationManagerDidChangeAuthorization` also resets
   `LocationFilter` and `StationaryDetector` on a re-grant so stale
   anchors from a previous session don't bleed into the new one.
-- **Post-indoor GPS reacquisition defense (1.2.2)**: two new
-  `LocationFilter` gates address cached-fix replay and multipath
-  convergence drift after extended indoor or background signal loss.
-  See filter pipeline rules (a) and (f) above.
+- **Post-indoor GPS reacquisition defense (1.2.2)**: stale-delivery
+  gate on `LocationFilter` addresses cached-fix replay after a
+  signal gap. See filter pipeline rule (a) above. *Historical note:*
+  a companion multipath-convergence gate (`poorResumeAccuracy`) was
+  part of this release; it was removed in 1.2.9 after empirical
+  evidence showed it triggered almost exclusively in one deadlocked
+  session. The tighter 25 m single ceiling handles the original
+  multipath-convergence concern without the deadlock failure mode.
 - **Background drain + error-aware backoff (1.2.4)**: `SyncService`
   classifies HTTP outcomes into a `SyncResult` enum — 2xx `.success`,
   network errors / 408 / 429 / 5xx `.retryable` (exponential backoff
@@ -370,6 +378,57 @@ covers every device you've built for.
   a multi-hour app relaunch is a first fix, not a first fix after gap,
   so the gap-aware rule is bypassed by design — the other gates
   (stale-delivery, validity, source, 50 m accuracy) have already run.
+- **Audit-driven simplification (1.2.9)**: an independent review of
+  `LocationFilter` / `KalmanSmoother` / `StationaryDetector` against
+  9,300 `fix_diagnostics` rows from two devices over four days drove
+  the following subtractions. No functionality was added.
+
+  1. **Tightened accuracy ceiling** from 50 m to 25 m. iPhone 13 Pro
+     Max p90 = 14 m (near-lossless). iPhone 8 under canopy p90 =
+     32 m; the tighter ceiling produces honest gaps instead of the
+     earlier regime of `accept` rows at 30–50 m that were distorting
+     traces by up to half a city block.
+  2. **Deleted the three-tier `poorResumeAccuracy` gate** (60 s /
+     120 s tiers from 1.2.2 / 1.2.6). Audit: 269 lifetime hits, all
+     on iPhone 8, concentrated in a single deadlocked session that
+     1.2.6 was specifically added to escape. Zero hits ever on
+     iPhone 13 Pro Max. The single 25 m ceiling subsumes its intent
+     without the self-reinforcing deadlock failure mode.
+  3. **Mode-aware spike buffer**. Pedestrian / cycling threshold
+     tightened from 750 m to 250 m after real multipath jumps of
+     410 m on iPhone 8 were observed slipping through. Automotive
+     mode (`MotionClassifier.Mode == .automotive`) keeps the
+     original 750 m so legitimate high-speed sample deltas pass.
+     `LocationTracker.apply(mode:)` flips via
+     `LocationFilter.setAutomotive(_:)` on every mode change.
+  4. **Stationary suppressions now logged** to `fix_diagnostics` as
+     `<filter-decision>:stationarySuppress`. Stationary decisions
+     used to be invisible post-hoc; without that signal, the
+     detector could not be empirically tuned. The refactor moves
+     the diagnostic snapshot write to *after* the full
+     filter → smoother → stationary pipeline so the composed tag
+     can include both verdicts.
+  5. **Kalman `cos(origin.lat)` cached at reset** instead of
+     recomputed on every `enuOffset` / `latLonFromENU` call.
+     Numerical behavior unchanged; saves two trig calls per fix.
+     Preserves the public static signatures for the round-trip
+     unit test.
+  6. **Gap-threshold documentation**. Config now includes a table
+     enumerating the two remaining "lost the user" thresholds:
+     `kalmanResetGapSeconds = 10 s` (velocity-staleness; a
+     velocity prior older than 10 s is not a useful predictor)
+     vs `resumeGapSeconds = 60 s` (cluster-validity; a candidate
+     anchor with no observed fixes in 60 s can't be trusted).
+     Different semantics, different thresholds, documented once so
+     future edits don't have to rediscover the distinction.
+
+  Deliberately *not* done, per the same audit: Kalman smoother
+  removal (it's doing real work on clean GNSS, even if it cannot
+  repair biased measurements on degraded GNSS), per-device
+  filter tuning, map-matching re-introduction, multipath-from-
+  residual detection. All rejected on empirical or platform
+  grounds.
+
 - **Silent-failure detectors (1.2.8)**: three classes of "everything
   looks fine but nothing records" scenarios now surface as impairment
   banners instead of failing quietly. All three are backed by
@@ -448,21 +507,16 @@ covers every device you've built for.
   noise σ_a defaults to 2 m/s² (multi-modal: walking, cycling,
   typical driving); future transport modes can tune it without
   touching the filter interface.
-- **Filter deadlock escape valve (1.2.6)**: the gap-aware accuracy
-  gate is now three-tier (see filter rule (f) above). Fixes a
-  self-reinforcing deadlock observed in the 2026-04-16 production
-  session where a 60 s tram-tunnel signal dip cascaded into a
-  17-minute accepted-fix blackout: every new fix landed in the
-  20–50 m band, the gate stayed tight, `Δt` kept growing, and the
-  receiver never produced a sub-20 m fix under sustained marginal
-  signal. At `Δt > 120 s` the ceiling now relaxes back to 50 m,
-  bounding the worst case at two minutes instead of seventeen.
-  Multipath-convergence defense for the typical 30–90 s post-indoor
-  reacquisition is unchanged. `LocationTracker` also counts
+- **Discard-streak observability (1.2.6)**: `LocationTracker` counts
   consecutive discards and emits an unconditional
   `[tracker] WARN: N consecutive discards` line every 20 rejections
-  so compound deadlocks are visible in Console.app without needing
-  the `fix_diagnostics` Postgres query.
+  so compound deadlocks are visible in Console.app without needing a
+  `fix_diagnostics` Postgres query. *Historical note:* 1.2.6 also
+  shipped a "deadlock escape valve" — a third tier in the gap-aware
+  accuracy gate — that was removed in 1.2.9. Audit evidence showed
+  the gate mostly just caused the deadlock its own escape valve was
+  added to escape; a single 25 m accuracy ceiling subsumes the
+  original multipath-convergence concern more cleanly.
 - **Correctness + resilience (1.2.1)**: `Database.insert` and
   `logDiagnostic` return `Bool`, so the in-memory unsynced counter
   only increments on confirmed SQLite success. All SQLite writes from

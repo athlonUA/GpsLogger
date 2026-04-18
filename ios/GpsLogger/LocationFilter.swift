@@ -3,10 +3,12 @@ import CoreLocation
 
 /// Lightweight, deterministic GPS noise filter.
 ///
-/// Philosophy: remove obvious glitches, never reject real movement. Filtering
-/// is intentionally movement-type agnostic — the same thresholds apply to
-/// walking, driving, and high-speed rail — because classifying transport
-/// modes would introduce false negatives against legitimate users.
+/// Philosophy: remove obvious glitches, never reject real movement.
+/// Filtering is mostly movement-type agnostic — the same thresholds
+/// apply to walking, driving, and trains — with one exception: the
+/// spike-jump threshold widens under `.automotive` mode so fast-moving
+/// vehicles don't trip a pedestrian-scale detector. See
+/// `setAutomotive(_:)`.
 ///
 /// Applied in order:
 ///   0. Delivery age: `now − timestamp ≤ maxFixAgeSeconds` — rejects cached
@@ -20,28 +22,27 @@ import CoreLocation
 ///      Positioning database can deliver a well-formed-looking fix (good
 ///      `horizontalAccuracy`) that is hundreds of meters to kilometers from
 ///      the true position.
-///   3. Accuracy value: `horizontalAccuracy ≤ maxHorizontalAccuracyMeters`.
+///   3. Accuracy value: `horizontalAccuracy ≤ maxHorizontalAccuracyMeters`
+///      (25 m in 1.2.9, tightened from 50 m based on empirical HA
+///      distribution across two devices over four days — see
+///      `Config.maxHorizontalAccuracyMeters`).
 ///   4. Chronology: `Δt > 0` vs. the last accepted fix (rejects replayed /
 ///      cached fixes).
-///  4b. Gap-aware accuracy (three-tier, tightened in 1.2.2, relaxed in 1.2.6):
-///      - `Δt ≤ resumeGapSeconds (60 s)` — normal 50 m ceiling applies.
-///      - `resumeGapSeconds < Δt ≤ resumeRelaxSeconds (120 s)` — tightened
-///        to `resumeMaxAccuracyMeters (20 m)` to filter multipath
-///        convergence after a short indoor / tunnel gap.
-///      - `Δt > resumeRelaxSeconds (120 s)` — **relaxed back to 50 m** so
-///        a sustained-marginal-signal scenario cannot self-reinforce into
-///        a multi-minute accepted-fix blackout. Production observation
-///        (v1.2.5, 2026-04-16): a 60 s tram signal dip cascaded into a
-///        17-minute rejection loop because every new fix fell in the
-///        20–50 m band, keeping `Δt` growing and the gate tight
-///        indefinitely. The 120 s relax threshold bounds that worst case.
 ///   5. Implied speed ≤ `maxPlausibleSpeedMps` — intentionally very relaxed
 ///      (500 km/h), only catches teleport-class glitches.
 ///   6. Single-point look-ahead buffer rejects the classic
 ///      A → B(far jump) → C(back near A) spike pattern, where "far" is
-///      `spikeJumpMeters` (750 m — beyond any realistic sample delta) and
-///      "near" is `spikeReturnMeters` (100 m).
+///      `spikeJumpMeters` (250 m default / 750 m under `.automotive`
+///      mode — tightened from the blanket 750 m in 1.2.9 after empirical
+///      multipath jumps of 410 m on iPhone 8 slipped through) and "near"
+///      is `spikeReturnMeters` (100 m).
 ///   7. Minimum distance ≥ `minDistanceMeters` from the last accepted fix.
+///
+/// Removed in 1.2.9: a three-tier `poorResumeAccuracy` gate (60 s / 120 s
+/// tiers) that fired in only one deadlocked session across the whole
+/// iPhone 8 history (zero hits ever on the 13 Pro Max). The single
+/// accuracy ceiling subsumes its intent without the self-reinforcing
+/// deadlock failure mode that motivated the tier-relaxation patch.
 ///
 /// The filter is a plain value type with no CoreLocation-manager coupling, so
 /// every rule is unit-testable in isolation by constructing `CLLocation`s with
@@ -71,7 +72,6 @@ struct LocationFilter {
         case implausibleSpeed(metersPerSecond: Double)
         case tooClose
         case staleDelivery
-        case poorResumeAccuracy(meters: Double)
     }
 
     private(set) var lastAccepted: CLLocation?
@@ -80,41 +80,56 @@ struct LocationFilter {
     private let maxAccuracy: CLLocationDistance
     private let minDistance: CLLocationDistance
     private let maxSpeed: CLLocationSpeed
-    private let spikeJump: CLLocationDistance
+    private let spikeJumpWalking: CLLocationDistance
+    private let spikeJumpAutomotive: CLLocationDistance
     private let spikeReturn: CLLocationDistance
     private let pendingTimeout: TimeInterval
     private let maxFixAge: TimeInterval
-    private let resumeGap: TimeInterval
-    private let resumeMaxAccuracy: CLLocationDistance
-    private let resumeRelax: TimeInterval
+    /// Current spike-jump threshold in meters. Mutated via
+    /// `setAutomotive(_:)` as the `MotionClassifier` mode changes —
+    /// walking/cycling runs at the tight default (`spikeJumpWalking`)
+    /// because pedestrian sample deltas never exceed tens of meters;
+    /// vehicles switch to the loose `spikeJumpAutomotive` so a car at
+    /// 130 km/h with a 5 s sample gap doesn't trip the gate on its
+    /// legitimate 180 m displacement.
+    private var spikeJump: CLLocationDistance
 
     init(
         maxAccuracy: CLLocationDistance = Config.maxHorizontalAccuracyMeters,
         minDistance: CLLocationDistance = Config.minDistanceMeters,
         maxSpeed: CLLocationSpeed = Config.maxPlausibleSpeedMps,
-        spikeJump: CLLocationDistance = Config.spikeJumpMeters,
+        spikeJumpWalking: CLLocationDistance = Config.spikeJumpMeters,
+        spikeJumpAutomotive: CLLocationDistance = Config.spikeJumpMetersAutomotive,
         spikeReturn: CLLocationDistance = Config.spikeReturnMeters,
         pendingTimeout: TimeInterval = Config.pendingTimeoutSeconds,
-        maxFixAge: TimeInterval = Config.maxFixAgeSeconds,
-        resumeGap: TimeInterval = Config.resumeGapSeconds,
-        resumeMaxAccuracy: CLLocationDistance = Config.resumeMaxAccuracyMeters,
-        resumeRelax: TimeInterval = Config.resumeRelaxSeconds
+        maxFixAge: TimeInterval = Config.maxFixAgeSeconds
     ) {
         self.maxAccuracy = maxAccuracy
         self.minDistance = minDistance
         self.maxSpeed = maxSpeed
-        self.spikeJump = spikeJump
+        self.spikeJumpWalking = spikeJumpWalking
+        self.spikeJumpAutomotive = spikeJumpAutomotive
+        self.spikeJump = spikeJumpWalking
         self.spikeReturn = spikeReturn
         self.pendingTimeout = pendingTimeout
         self.maxFixAge = maxFixAge
-        self.resumeGap = resumeGap
-        self.resumeMaxAccuracy = resumeMaxAccuracy
-        self.resumeRelax = resumeRelax
     }
 
     mutating func reset() {
         lastAccepted = nil
         pending = nil
+    }
+
+    /// Widen (or narrow) the spike-jump threshold to match the current
+    /// transport mode. Called from `LocationTracker.apply(mode:)` whenever
+    /// `MotionClassifier` emits a new mode. Pedestrian/cycling: 250 m —
+    /// tight enough to catch real multipath jumps (observed 410 m on
+    /// iPhone 8 in Valencia). Automotive: 750 m — loose enough that
+    /// legitimate high-speed displacement (e.g. 130 km/h × 5 s ≈ 180 m)
+    /// never accidentally triggers buffering, with headroom for rail
+    /// (350 km/h × 5 s ≈ 485 m).
+    mutating func setAutomotive(_ isAutomotive: Bool) {
+        spikeJump = isAutomotive ? spikeJumpAutomotive : spikeJumpWalking
     }
 
     /// Feed a new raw fix. Mutates internal state and returns what the caller
@@ -194,25 +209,10 @@ struct LocationFilter {
         }
 
         let dt = loc.timestamp.timeIntervalSince(last.timestamp)
-        // 2. Out-of-order / duplicate-timestamp samples — CoreLocation
+        // 4. Out-of-order / duplicate-timestamp samples — CoreLocation
         //    occasionally replays an older cached fix; ignore them.
         guard dt > 0 else {
             return .discard(.staleTimestamp)
-        }
-
-        // 4b. Gap-aware accuracy — three-tier gate. Between `resumeGap` and
-        //     `resumeRelax`, require a tighter ceiling (typical post-indoor
-        //     multipath convergence completes in 30–90 s, so the 20 m
-        //     ceiling catches those first degraded fixes). Beyond
-        //     `resumeRelax`, fall back to the normal 50 m ceiling: if the
-        //     receiver still hasn't produced a sub-20 m fix after two full
-        //     minutes, the problem is no longer "convergence" — it is
-        //     sustained marginal signal — and continuing to reject is a
-        //     self-reinforcing deadlock, not a defense. See the 1.2.6
-        //     fix-notes in `README.md`.
-        if dt > resumeGap, dt <= resumeRelax,
-           loc.horizontalAccuracy > resumeMaxAccuracy {
-            return .discard(.poorResumeAccuracy(meters: loc.horizontalAccuracy))
         }
 
         let distFromLast = loc.distance(from: last)
