@@ -1,11 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  fetchMatchedPoints,
-  fetchPoints,
-  MatchingDisabledError,
-  type FetchResult,
-  type Point,
-} from './api';
+import { fetchPoints, type Point } from './api';
 import MapView from './Map';
 
 const DEVICE_ID_STORAGE_KEY = 'device_id';
@@ -52,24 +46,11 @@ export default function App() {
   const defaultFrom = useMemo(() => new Date(Date.now() - 24 * 60 * 60 * 1000), []);
   const defaultTo = useMemo(() => new Date(), []);
 
-  const initialMatched = useMemo(() => {
-    if (typeof window === 'undefined') return false;
-    return new URLSearchParams(window.location.search).get('matched') === '1';
-  }, []);
-
   const [deviceId, setDeviceId] = useState<string>(() => readStoredDeviceId());
   const [from, setFrom] = useState(toLocalInputValue(initialFrom));
   const [to, setTo] = useState(toLocalInputValue(initialTo));
-  const [matched, setMatched] = useState<boolean>(initialMatched);
   const [points, setPoints] = useState<Point[]>([]);
   const [truncated, setTruncated] = useState(false);
-  const [matchStats, setMatchStats] = useState<{
-    matched: number;
-    total: number;
-  } | null>(null);
-  /** Backend reported that OSRM is not configured. Latch this so the
-   *  toggle UI can self-disable and we stop hitting the endpoint. */
-  const [matchingUnavailable, setMatchingUnavailable] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -88,11 +69,11 @@ export default function App() {
     }
   }, [deviceId]);
 
-  // Mirror the date range + matched toggle into the URL so the page is
-  // reloadable / shareable. `replaceState` keeps the browser history
-  // clean — every keystroke in the datetime-local inputs would otherwise
-  // push a new entry. Invalid `Date` values (shouldn't happen via the
-  // input, but defensively) skip the write instead of throwing.
+  // Mirror the date range into the URL so the page is reloadable /
+  // shareable. `replaceState` keeps the browser history clean — every
+  // keystroke in the datetime-local inputs would otherwise push a new
+  // entry. Invalid `Date` values (shouldn't happen via the input, but
+  // defensively) skip the write instead of throwing.
   useEffect(() => {
     if (typeof window === 'undefined') return;
     try {
@@ -102,18 +83,13 @@ export default function App() {
       if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) return;
       params.set('from', fromDate.toISOString());
       params.set('to', toDate.toISOString());
-      if (matched) {
-        params.set('matched', '1');
-      } else {
-        params.delete('matched');
-      }
       const qs = params.toString();
       const next = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
       window.history.replaceState(null, '', next);
     } catch {
       /* non-browser or locked history API — non-fatal */
     }
-  }, [from, to, matched]);
+  }, [from, to]);
 
   const onVisualize = useCallback(async () => {
     if (!deviceId) {
@@ -127,56 +103,10 @@ export default function App() {
 
     setError(null);
     setLoading(true);
-    setMatchStats(null);
-    // Use matched endpoint only when the toggle is on AND the backend
-    // has not reported the feature disabled in a previous call. A 503
-    // latch prevents repeated round trips once we learn OSRM is absent.
-    const useMatched = matched && !matchingUnavailable;
     try {
-      let result: FetchResult;
-      if (useMatched) {
-        try {
-          result = await fetchMatchedPoints(
-            deviceId,
-            new Date(from),
-            new Date(to),
-            ac.signal,
-          );
-        } catch (e) {
-          if (e instanceof MatchingDisabledError) {
-            // OSRM is not configured — latch the UI into raw mode and
-            // retry the same window without the matched path, so the
-            // user still sees their data.
-            setMatchingUnavailable(true);
-            result = await fetchPoints(
-              deviceId,
-              new Date(from),
-              new Date(to),
-              ac.signal,
-            );
-          } else {
-            throw e;
-          }
-        }
-      } else {
-        result = await fetchPoints(
-          deviceId,
-          new Date(from),
-          new Date(to),
-          ac.signal,
-        );
-      }
+      const result = await fetchPoints(deviceId, new Date(from), new Date(to), ac.signal);
       setPoints(result.data);
       setTruncated(result.truncated);
-      if (
-        typeof result.matched_count === 'number' &&
-        typeof result.total_count === 'number'
-      ) {
-        setMatchStats({
-          matched: result.matched_count,
-          total: result.total_count,
-        });
-      }
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
       setError(e instanceof Error ? e.message : String(e));
@@ -185,14 +115,12 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [deviceId, from, to, matched, matchingUnavailable]);
+  }, [deviceId, from, to]);
 
   const onLogout = useCallback(() => {
     setDeviceId('');
     setPoints([]);
     setError(null);
-    setMatched(false);
-    setMatchStats(null);
     setFrom(toLocalInputValue(defaultFrom));
     setTo(toLocalInputValue(defaultTo));
     // Clear query params too, so the refreshed URL reflects the logged-out
@@ -210,13 +138,9 @@ export default function App() {
     }
   }, [defaultFrom, defaultTo]);
 
-  const matchLabel =
-    matchStats && matchStats.total > 0
-      ? ` · ${matchStats.matched.toLocaleString()} / ${matchStats.total.toLocaleString()} snapped to roads`
-      : '';
   const pointsLabel = truncated
-    ? `${points.length.toLocaleString()} points (truncated — narrow the time range)${matchLabel}`
-    : `${points.length.toLocaleString()} points${matchLabel}`;
+    ? `${points.length.toLocaleString()} points (truncated — narrow the time range)`
+    : `${points.length.toLocaleString()} points`;
 
   const status = error
     ? error
@@ -258,17 +182,6 @@ export default function App() {
             value={to}
             onChange={(e) => setTo(e.target.value)}
           />
-        </label>
-        <label className="panel__toggle" title={matchingUnavailable
-            ? 'Map-matching service not configured on the backend'
-            : 'Snap points to OSM roads / paths (OSRM)'}>
-          <input
-            type="checkbox"
-            checked={matched && !matchingUnavailable}
-            onChange={(e) => setMatched(e.target.checked)}
-            disabled={loading || matchingUnavailable}
-          />
-          Snap to roads
         </label>
         <button onClick={onVisualize} disabled={loading || !deviceId}>
           {loading ? 'Loading…' : 'Visualize'}

@@ -1,15 +1,8 @@
 import { Router } from 'express';
 import { pool } from '../db.js';
 import { validateBatch, validateRange } from '../validate.js';
-import { matchTrace } from '../matcher.js';
 
 const router = Router();
-
-// Map-matching is an opt-in service. When `OSRM_URL` is unset the
-// `/matched` endpoint returns 503 so the client can disable the toggle
-// instead of silently falling back to raw coordinates. Reading the env
-// at module load is safe because we never mutate it at runtime.
-const OSRM_URL = process.env.OSRM_URL || '';
 
 router.post('/', async (req, res, next) => {
   try {
@@ -55,62 +48,27 @@ router.get('/', async (req, res, next) => {
     const v = validateRange(req.query);
     if (!v.ok) return res.status(400).json({ error: v.error });
 
-    const { rows, truncated } = await queryPointsInRange(v);
+    const clauses = ['device_id = $1'];
+    const values = [v.device_id];
+    if (v.from) {
+      values.push(v.from);
+      clauses.push(`created_at >= $${values.length}`);
+    }
+    if (v.to) {
+      values.push(v.to);
+      clauses.push(`created_at <= $${values.length}`);
+    }
+    const LIMIT = 10_000;
+    const sql = `SELECT id, latitude, longitude, created_at FROM points WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC LIMIT ${LIMIT + 1}`;
+    const { rows } = await pool.query(sql, values);
+
+    const truncated = rows.length > LIMIT;
+    if (truncated) rows.length = LIMIT;
+
     res.json({ data: rows, truncated });
   } catch (err) {
     next(err);
   }
 });
-
-// GET /points/matched — same range-scan as GET /points, but each row is
-// snapped to the OSRM road/path graph before it's returned. When OSRM is
-// unreachable or disabled at deploy time we return 503 so the frontend
-// can disable its Raw/Matched toggle; unmatched individual rows inside a
-// successful response keep the raw coordinates so the rendered polyline
-// is continuous regardless.
-router.get('/matched', async (req, res, next) => {
-  try {
-    if (!OSRM_URL) {
-      return res.status(503).json({ error: 'map_matching_disabled' });
-    }
-    const v = validateRange(req.query);
-    if (!v.ok) return res.status(400).json({ error: v.error });
-
-    const { rows, truncated } = await queryPointsInRange(v);
-    const result = await matchTrace(OSRM_URL, rows, { log: req.log });
-    res.json({
-      data: result.points,
-      truncated,
-      matched_count: result.matchedCount,
-      total_count: result.totalCount,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Shared range-query helper. Mirrors the `/points` GET handler so the
-// matched endpoint reads the same slice of data the raw endpoint would
-// have returned — any future cap/index change only has to be made once.
-async function queryPointsInRange(v) {
-  const clauses = ['device_id = $1'];
-  const values = [v.device_id];
-  if (v.from) {
-    values.push(v.from);
-    clauses.push(`created_at >= $${values.length}`);
-  }
-  if (v.to) {
-    values.push(v.to);
-    clauses.push(`created_at <= $${values.length}`);
-  }
-  const LIMIT = 10_000;
-  const sql =
-    `SELECT id, latitude, longitude, created_at FROM points ` +
-    `WHERE ${clauses.join(' AND ')} ORDER BY created_at ASC LIMIT ${LIMIT + 1}`;
-  const { rows } = await pool.query(sql, values);
-  const truncated = rows.length > LIMIT;
-  if (truncated) rows.length = LIMIT;
-  return { rows, truncated };
-}
 
 export default router;

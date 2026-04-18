@@ -1,6 +1,6 @@
 {
   "name": "gpslogger-backend",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Minimal GPS points ingestion + query API",
   "type": "module",
   "main": "src/index.js",
