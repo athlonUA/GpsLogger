@@ -370,6 +370,52 @@ covers every device you've built for.
   a multi-hour app relaunch is a first fix, not a first fix after gap,
   so the gap-aware rule is bypassed by design — the other gates
   (stale-delivery, validity, source, 50 m accuracy) have already run.
+- **Silent-failure detectors (1.2.8)**: three classes of "everything
+  looks fine but nothing records" scenarios now surface as impairment
+  banners instead of failing quietly. All three are backed by
+  specific Apple Developer Forum reports or WWDC23/24 guidance, and
+  share the same observable symptom — an authorized app with an
+  empty `points` table after a day of movement.
+
+  1. **Reduced-accuracy detection (iOS 14+)** via
+     `CLLocationManager.accuracyAuthorization`. "Always + Precise
+     Location off" looks identical to "Always + Precise Location on"
+     at the authorization-status level, but produces
+     `horizontalAccuracy` values of 1–20 km that the 50 m filter
+     rejects unconditionally. A new `TrackingImpairment.reducedAccuracy`
+     banner now surfaces the condition and directs the user to
+     Settings. Re-evaluated on every
+     `locationManagerDidChangeAuthorization` callback, which iOS 14+
+     fires both for permission changes and for accuracy-only toggles.
+
+  2. **Background App Refresh impairment** via
+     `UIApplication.shared.backgroundRefreshStatus` +
+     `backgroundRefreshStatusDidChangeNotification`. Without
+     Background App Refresh the
+     `startMonitoringSignificantLocationChanges` relaunch path cannot
+     resurrect a terminated app — the #1 cause of "tracking
+     disappeared after I swiped the app away" reports. New
+     `TrackingImpairment.backgroundRefreshDenied` banner fires for
+     both `.denied` and `.restricted` (the latter is the Screen Time
+     / MDM case) because the symptom is identical.
+
+  3. **`didPauseLocationUpdates` / `didResume` delegate**
+     implementations. Apple documents these as unused under
+     `pausesLocationUpdatesAutomatically = false`, but production
+     reports on the Apple Developer Forums show the system still
+     pausing on rare OS/device combinations. The pause callback now
+     re-issues `startUpdatingLocation()` (idempotent) and emits an
+     unconditional `[tracker] WARN` line so the event is visible in
+     Console.app on a release build.
+
+  Mapping logic is pure and unit-tested:
+  `TrackingImpairment.impairment(for:)` accepts either a
+  `CLAccuracyAuthorization` or a `UIBackgroundRefreshStatus` and
+  returns the corresponding impairment or `nil`. 7 tests in
+  `TrackingImpairmentTests` cover the classification + a CaseIterable
+  sanity check that no new impairment case ever ships with an empty
+  `shortMessage`.
+
 - **High-density sampling + Kalman smoother (1.2.7)**: the 2026-04-17
   session exposed the limits of the deterministic filter: 21 minutes
   of walking under partial-sky / canopy produced 69 accepted fixes

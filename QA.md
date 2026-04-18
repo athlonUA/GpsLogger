@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (61 cases across 5 test files)
+### iOS unit tests (68 cases across 6 test files)
 
 ```
 cd ios
@@ -137,6 +137,26 @@ the 1.2.1 clock-skew guard, and the 1.2.7 gap-reset guard:
 - ENU round-trip consistency: forward + inverse mapping agree to
   sub-meter tolerance at city scale so filter-space math does not
   silently shift coordinates
+
+**`TrackingImpairmentTests` (7 cases)** — the 1.2.8 silent-failure
+mapping helpers. Pure static functions, testable without mocking
+`CLLocationManager` or `UIApplication`:
+
+- `CLAccuracyAuthorization.fullAccuracy` → no impairment
+- `CLAccuracyAuthorization.reducedAccuracy` → `.reducedAccuracy`
+  (iOS 14+ Precise Location toggle off; the silent-black-trace case
+  our 50 m filter ceiling would otherwise hide)
+- `UIBackgroundRefreshStatus.available` → no impairment
+- `.denied` → `.backgroundRefreshDenied`
+- `.restricted` (Screen Time / MDM policy) → `.backgroundRefreshDenied`
+  (same symptom as `.denied` — no SLC relaunch — same user-visible
+  message)
+- every `TrackingImpairment` case has a non-empty `shortMessage`
+  (CaseIterable guard against a silent empty banner if someone
+  forgets the switch arm)
+- new 1.2.8 impairment messages mention user-actionable guidance
+  (Settings / force-quit terminology) so the banner is never a
+  dead-end warning
 
 ### Backend unit tests (59 cases across validators + matcher)
 
@@ -969,6 +989,81 @@ and covered by scenarios #1–22. OSRM profile selection beyond `foot`
 (multi-modal car / bicycle snap), per-row dynamic radius from
 `fix_diagnostics`, and side-by-side raw+matched overlay are deferred
 follow-ups.
+
+## 1.2.8 silent-failure banner regression plan
+
+Targeted regression for the three `TrackingImpairment` detectors added
+in 1.2.8 (`reducedAccuracy`, `backgroundRefreshDenied`, and the
+`didPauseLocationUpdates` auto-resume). All are iOS-only and verified
+by flipping iOS Settings toggles — no Postgres queries required.
+
+Prereqs: iPhone on 1.2.8 (footer reads `v1.2.8 (13)`), app already
+launched once with **Always + Precise Location** granted and
+**Background App Refresh** enabled (baseline = no banners visible).
+
+### 28. Precise Location toggle detects reduced accuracy (1.2.8)
+
+- In the app, confirm the banner area is clear.
+- Go to Settings → Privacy & Security → Location Services → GpsLogger.
+- Toggle **Precise Location** off.
+- Return to the app.
+- Expected: orange impairment banner appears with the text
+  "Precise Location is off — fixes are too coarse to record. Enable
+  in Settings." within ~1 s (iOS fires
+  `locationManagerDidChangeAuthorization` on the accuracy toggle).
+- Toggle **Precise Location** back on. Banner disappears.
+- If the banner does not appear: confirm
+  `manager.accuracyAuthorization == .reducedAccuracy` via Console.app
+  filter `process = GpsLogger` and the tracker's
+  `locationManagerDidChangeAuthorization` log line.
+
+### 29. Background App Refresh toggle surfaces impairment (1.2.8)
+
+- In the app, confirm the banner area is clear.
+- Go to Settings → General → Background App Refresh → **GpsLogger**.
+- Toggle it off.
+- Return to the app.
+- Expected: orange banner appears with "Background App Refresh is
+  off — tracking can't resume after force-quit." The notification
+  `UIApplication.backgroundRefreshStatusDidChangeNotification` fires
+  synchronously on the toggle.
+- Toggle Background App Refresh back on. Banner disappears.
+- Second variant: same test using the global Settings → General →
+  Background App Refresh → **master switch off**. Banner behavior
+  identical (the status is `.denied` either way).
+- Screen Time variant (optional): set a Screen Time restriction on
+  Background App Refresh, observe `.restricted` — banner shows the
+  same message.
+
+### 30. iOS-driven pause auto-resumes (1.2.8, harder to reproduce)
+
+Verifies the `didPauseLocationUpdates` delegate re-issues
+`startUpdatingLocation()`. Can't be triggered deterministically — iOS
+almost never fires the pause with
+`pausesLocationUpdatesAutomatically = false` — but we can force an
+obvious positive signal:
+
+- Run the app in the debugger with a breakpoint on
+  `locationManagerDidPauseLocationUpdates`. Walk for 2–3 min to
+  collect a baseline of fixes.
+- In the debugger, manually invoke the delegate method:
+  ```
+  (lldb) expr -l swift -- tracker.locationManagerDidPauseLocationUpdates(tracker.manager)
+  ```
+  (adapt the accessor paths to the container).
+- Expected: Console shows `[tracker] WARN: CoreLocation paused
+  updates despite pausesAutomatically=false — re-starting`, and
+  subsequent `didUpdateLocations` callbacks continue unchanged.
+- In production this scenario manifests as "fixes stopped coming in
+  for N seconds, then resumed on their own" — the `WARN` line in
+  Console.app is the only visible trace. No action needed.
+
+**Out of scope for the 1.2.8 round.** Everything in `LocationFilter`,
+`KalmanSmoother`, `StationaryDetector`, and map-matching are
+unchanged and covered by scenarios #1–27. Mid-priority items (Low
+Power Mode observer, `CLLocation.sourceInformation` logging,
+`.otherNavigation` for rail, `CLBackgroundActivitySession` on iOS 17+)
+deliberately deferred until we have measurable 1.2.7/1.3.0 field data.
 
 ## Inspecting fix_diagnostics after an anomaly
 

@@ -1,6 +1,7 @@
 import Foundation
 import CoreLocation
 import Combine
+import UIKit
 
 /// Thin wrapper around CLLocationManager.
 ///
@@ -45,6 +46,22 @@ final class LocationTracker: NSObject, ObservableObject {
         /// applied (default `.fitness`), so vehicle fusion bias never
         /// engages. Not a data-loss condition, just a quality degradation.
         case motionPermissionDenied
+        /// iOS 14+ "Precise Location" toggle is off (`accuracyAuthorization
+        /// == .reducedAccuracy`). Apple reports horizontal accuracy on the
+        /// 1–20 km scale in this mode, which our 50 m filter ceiling rejects
+        /// unconditionally — the trace silently stays empty with no error.
+        /// Surface the condition so the user can flip the toggle in
+        /// Settings > Privacy > Location > GpsLogger > Precise Location.
+        case reducedAccuracy
+        /// "Background App Refresh" is disabled (either globally or for
+        /// this app). Without it, `startMonitoringSignificantLocationChanges`
+        /// cannot relaunch the app from a terminated state — the #1 cause
+        /// of "nothing recorded after the app was force-quit" scenarios.
+        /// Orthogonal to location permission: an Always-authorized app
+        /// with BG refresh off still records in foreground and in
+        /// suspended background, but loses the terminated-state recovery
+        /// path entirely.
+        case backgroundRefreshDenied
 
         /// Short user-facing blurb for the impairment banner.
         var shortMessage: String {
@@ -55,6 +72,34 @@ final class LocationTracker: NSObject, ObservableObject {
                 return "Background tracking needs Always permission."
             case .motionPermissionDenied:
                 return "Motion sensing off — vehicle mode will not engage."
+            case .reducedAccuracy:
+                return "Precise Location is off — fixes are too coarse to record. Enable in Settings."
+            case .backgroundRefreshDenied:
+                return "Background App Refresh is off — tracking can't resume after force-quit."
+            }
+        }
+
+        /// Pure mapping from `CLAccuracyAuthorization` to an impairment.
+        /// Extracted so the logic is unit-testable in isolation without
+        /// mocking `CLLocationManager` itself.
+        @available(iOS 14.0, *)
+        static func impairment(for accuracy: CLAccuracyAuthorization) -> TrackingImpairment? {
+            switch accuracy {
+            case .fullAccuracy: return nil
+            case .reducedAccuracy: return .reducedAccuracy
+            @unknown default: return nil
+            }
+        }
+
+        /// Pure mapping from `UIBackgroundRefreshStatus` to an impairment.
+        /// `.restricted` is treated the same as `.denied` because both
+        /// produce the same observable symptom — SLC-driven relaunch will
+        /// not fire — and the user's recovery path (Settings) is identical.
+        static func impairment(for refresh: UIBackgroundRefreshStatus) -> TrackingImpairment? {
+            switch refresh {
+            case .available: return nil
+            case .denied, .restricted: return .backgroundRefreshDenied
+            @unknown default: return .backgroundRefreshDenied
             }
         }
     }
@@ -150,6 +195,26 @@ final class LocationTracker: NSObject, ObservableObject {
             self?.addImpairment(.motionPermissionDenied)
         }
         classifier.start()
+
+        // Observe Background App Refresh toggle (global or per-app).
+        // `UIApplication.shared.backgroundRefreshStatus` reflects both
+        // Settings > General > Background App Refresh (system switch)
+        // and the per-app row; disabling either one breaks SLC's
+        // terminated-state relaunch path. The notification fires on
+        // every user change and on the first launch following one, so a
+        // single subscription handles both live toggling and a cold
+        // start after the user previously turned the setting off.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(backgroundRefreshStatusDidChange),
+            name: UIApplication.backgroundRefreshStatusDidChangeNotification,
+            object: nil
+        )
+        updateBackgroundRefreshImpairment()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     private func addImpairment(_ imp: TrackingImpairment) {
@@ -162,6 +227,43 @@ final class LocationTracker: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.impairments.remove(imp)
         }
+    }
+
+    /// Re-evaluate the Precise Location (iOS 14+) impairment against the
+    /// manager's current `accuracyAuthorization`. Called from every
+    /// authorization transition because the accuracy toggle can change
+    /// independently of the auth state — iOS 14+ lets a user leave
+    /// "Always" on while flipping "Precise Location" off, which would
+    /// otherwise look like a grant from the permission-status point of
+    /// view but silently reject 100% of fixes at the 50 m ceiling.
+    private func updateAccuracyImpairment() {
+        if #available(iOS 14.0, *) {
+            if TrackingImpairment.impairment(for: manager.accuracyAuthorization) == .reducedAccuracy {
+                addImpairment(.reducedAccuracy)
+            } else {
+                removeImpairment(.reducedAccuracy)
+            }
+        }
+    }
+
+    /// Re-evaluate the Background App Refresh impairment. Must touch
+    /// `UIApplication.shared` on the main thread — we dispatch here so
+    /// callers (notification callback, init) don't have to reason about
+    /// thread affinity.
+    private func updateBackgroundRefreshImpairment() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let status = UIApplication.shared.backgroundRefreshStatus
+            if TrackingImpairment.impairment(for: status) == .backgroundRefreshDenied {
+                self.impairments.insert(.backgroundRefreshDenied)
+            } else {
+                self.impairments.remove(.backgroundRefreshDenied)
+            }
+        }
+    }
+
+    @objc private func backgroundRefreshStatusDidChange() {
+        updateBackgroundRefreshImpairment()
     }
 
     /// Kick off tracking. Called once from `AppContainer` at launch.
@@ -382,6 +484,37 @@ extension LocationTracker: CLLocationManagerDelegate {
             self?.authStatus = status
         }
         handleAuthorizationState(status)
+        // iOS 14+ fires `didChangeAuthorization` for accuracy-only changes
+        // too (the user left Always on but toggled Precise Location off
+        // / on mid-session). Re-evaluate the accuracy impairment on every
+        // transition so the banner reflects the current state without
+        // waiting for a fix to come in and get rejected.
+        updateAccuracyImpairment()
+    }
+
+    /// iOS is documented to stop calling this when
+    /// `pausesLocationUpdatesAutomatically = false`, but production
+    /// reports on the Apple Developer Forums show it still firing on
+    /// rare device / OS combinations (post-update scenarios, specific
+    /// hardware). The callback is informational; our response is to
+    /// re-issue `startUpdatingLocation()` so the stream resumes without
+    /// waiting for the next system event. Idempotent — re-calling
+    /// `startUpdatingLocation` on an already-running manager is a no-op.
+    func locationManagerDidPauseLocationUpdates(_ manager: CLLocationManager) {
+        #if DEBUG
+        print("[tracker] locationManagerDidPauseLocationUpdates — re-issuing startUpdatingLocation()")
+        #endif
+        // Unconditional so release builds also surface the event in
+        // Console.app, since a silent pause is exactly the class of
+        // problem this handler exists to catch.
+        print("[tracker] WARN: CoreLocation paused updates despite pausesAutomatically=false — re-starting")
+        manager.startUpdatingLocation()
+    }
+
+    func locationManagerDidResumeLocationUpdates(_ manager: CLLocationManager) {
+        #if DEBUG
+        print("[tracker] locationManagerDidResumeLocationUpdates")
+        #endif
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {

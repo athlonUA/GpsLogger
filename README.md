@@ -465,6 +465,42 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **Silent-failure detectors** (1.2.8):
+  Three classes of "the app looks fine, nothing is being recorded"
+  scenarios now surface as impairment banners instead of failing
+  quietly — all motivated by Apple Developer Forum reports and the
+  WWDC23/24 Core Location sessions.
+
+  - **Reduced-accuracy detection** (iOS 14+). When the user grants
+    "Always" but toggles Precise Location off, `horizontalAccuracy`
+    reports on the 1–20 km scale and our 50 m filter ceiling rejects
+    every fix. `LocationTracker` now checks
+    `CLLocationManager.accuracyAuthorization` on every authorization
+    transition and adds `TrackingImpairment.reducedAccuracy` when it's
+    `.reducedAccuracy`, so the user sees a banner instead of a silent
+    empty trace.
+  - **Background App Refresh impairment.** Force-quit recovery via
+    `startMonitoringSignificantLocationChanges` requires Background
+    App Refresh to be on (globally in Settings > General and per-app).
+    `LocationTracker` subscribes to
+    `UIApplication.backgroundRefreshStatusDidChangeNotification` and
+    surfaces `TrackingImpairment.backgroundRefreshDenied` when it is
+    not `.available`, explaining why tracking disappeared after a
+    recent force-quit.
+  - **`didPauseLocationUpdates` / `didResume` delegate.** Apple docs
+    say these are not called when `pausesLocationUpdatesAutomatically
+    = false`, but production reports show the system still pauses on
+    rare OS/device combinations. The delegate methods now log the
+    event and re-issue `startUpdatingLocation()` on pause, so a
+    silent iOS-driven pause recovers on its own instead of running
+    out the foreground-Timer clock.
+  - Pure static mapping helpers
+    `TrackingImpairment.impairment(for: CLAccuracyAuthorization)` and
+    `impairment(for: UIBackgroundRefreshStatus)` keep the
+    classification logic unit-testable without mocking
+    `CLLocationManager` or `UIApplication`. 7 new tests in
+    `TrackingImpairmentTests`.
+
 - **High-density sampling + Kalman smoother** (1.2.7):
   - `CLLocationManager.desiredAccuracy` promoted from `kCLLocationAccuracyBest`
     to `kCLLocationAccuracyBestForNavigation`. Under partial-sky conditions
@@ -764,9 +800,9 @@ cd backend && node --test test/
 # behind the route view)
 cd frontend && npm test
 
-# iOS unit tests (61 cases across LocationFilter, KalmanSmoother,
-# Database drain, MotionClassifier classify, and StationaryDetector
-# state machine)
+# iOS unit tests (68 cases across LocationFilter, KalmanSmoother,
+# TrackingImpairment mappings, Database drain, MotionClassifier classify,
+# and StationaryDetector state machine)
 cd ios && xcodegen generate && xcodebuild test \
     -project GpsLogger.xcodeproj \
     -scheme GpsLoggerTests \
@@ -831,9 +867,10 @@ GpsLogger/
     │   ├── GpsLogger.entitlements
     │   └── Info.plist
     └── GpsLoggerTests/
-        ├── LocationFilterTests.swift      26 cases covering every filter gate + pending-timeout + deadlock-escape
-        ├── KalmanSmootherTests.swift       7 cases covering first-fix passthrough, noise attenuation, outlier damping, reset paths, ENU round-trip
-        ├── DatabaseTests.swift            7 cases locking in the drain/retention invariants
-        ├── MotionClassifierTests.swift    10 cases for the pure classification rules
-        └── StationaryDetectorTests.swift  11 cases for the Phase-A/B state machine + clock-skew guard + gap-reset
+        ├── LocationFilterTests.swift       26 cases covering every filter gate + pending-timeout + deadlock-escape
+        ├── KalmanSmootherTests.swift        7 cases covering first-fix passthrough, noise attenuation, outlier damping, reset paths, ENU round-trip
+        ├── DatabaseTests.swift              7 cases locking in the drain/retention invariants
+        ├── MotionClassifierTests.swift     10 cases for the pure classification rules
+        ├── StationaryDetectorTests.swift   11 cases for the Phase-A/B state machine + clock-skew guard + gap-reset
+        └── TrackingImpairmentTests.swift    7 cases covering the 1.2.8 silent-failure mappings (accuracyAuthorization, backgroundRefreshStatus, shortMessage sanity)
 ```

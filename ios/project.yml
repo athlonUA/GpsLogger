@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.2.7"
-    CURRENT_PROJECT_VERSION: "12"
+    MARKETING_VERSION: "1.2.8"
+    CURRENT_PROJECT_VERSION: "13"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
 targets:
@@ -30,8 +30,8 @@ targets:
       path: GpsLogger/Info-generated.plist
       properties:
         CFBundleDisplayName: GpsLogger
-        CFBundleShortVersionString: "1.2.7"
-        CFBundleVersion: "12"
+        CFBundleShortVersionString: "1.2.8"
+        CFBundleVersion: "13"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
