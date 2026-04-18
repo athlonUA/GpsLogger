@@ -177,6 +177,69 @@ body,
   cursor: not-allowed;
 }
 
+/* Direction-of-travel arrows placed every ~150 m along each rendered
+   polyline group (1.3.1). Small, semi-transparent, no background — the
+   chevron itself carries the information. Pointer-events are disabled
+   so a click near an arrow still hits the polyline underneath and
+   triggers the detail-card selection flow. */
+.direction-arrow {
+  background: transparent;
+  border: 0;
+  pointer-events: none;
+}
+.direction-arrow__inner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  line-height: 0;
+  transform-origin: center;
+}
+.direction-arrow svg {
+  display: block;
+}
+.direction-arrow polygon {
+  fill: #0f172a;
+  fill-opacity: 0.55;
+  stroke: #ffffff;
+  stroke-width: 0.8;
+  stroke-opacity: 0.85;
+}
+
+/* Start / End markers (1.3.1). Distinct green "S" / red "E" pins,
+   large enough to stand out on the light basemap but small enough that
+   they don't cover nearby route detail. Box-shadow gives the same
+   depth cue the gradient polyline halo provides, so the markers read
+   as "above" the route. */
+.endpoint-marker {
+  background: transparent;
+  border: 0;
+}
+.endpoint-pin {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 3px solid #ffffff;
+  box-shadow:
+    0 2px 6px rgba(15, 23, 42, 0.35),
+    0 0 0 1px rgba(15, 23, 42, 0.12);
+  cursor: pointer;
+}
+.endpoint-pin--start {
+  /* Green — matches the common "go" semantic and stays legible against
+     both the CARTO light basemap and any darker urban-canyon imagery. */
+  background: #10b981;
+}
+.endpoint-pin--end {
+  background: #ef4444;
+}
+
 .panel .stats {
   margin-left: auto;
   align-self: flex-end;

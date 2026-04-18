@@ -2,13 +2,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CircleMarker,
   MapContainer,
+  Marker,
   Polyline,
   TileLayer,
+  Tooltip,
   useMap,
 } from 'react-leaflet';
 import L from 'leaflet';
 import type { Point } from './api';
-import { buildSegments, downsampleGroups, splitByTimeGaps } from './route';
+import {
+  arrowsAlong,
+  buildSegments,
+  downsampleGroups,
+  splitByTimeGaps,
+} from './route';
 
 const MAX_ZOOM = 20;
 
@@ -239,6 +246,57 @@ export default function MapView({ points }: { points: Point[] }) {
     [groups],
   );
 
+  // Direction-of-travel arrows along each polyline group, computed in
+  // meters along the geodesic so spacing is zoom-invariant. Single-point
+  // groups contribute nothing (no direction to indicate). The arrows are
+  // rendered as stroke-outlined SVG chevrons tinted by `direction-arrow`
+  // CSS so they stay legible on both light and dark basemap regions.
+  const directionArrows = useMemo(() => {
+    const out: {
+      key: string;
+      latitude: number;
+      longitude: number;
+      bearing: number;
+    }[] = [];
+    groups.forEach((group, gi) => {
+      if (group.length < 2) return;
+      const positions = group.map((p) => ({
+        latitude: p.latitude,
+        longitude: p.longitude,
+      }));
+      arrowsAlong(positions).forEach((a, ai) => {
+        out.push({ key: `arrow-${gi}-${ai}`, ...a });
+      });
+    });
+    return out;
+  }, [groups]);
+
+  // DivIcon factories memoized at module scope would be ideal, but
+  // `L.divIcon` must be called after Leaflet has finished loading; doing
+  // it inside `useMemo` keeps the SSR-safe import pattern the rest of
+  // this component uses. The Start / End icons are static (no state), so
+  // the empty dependency arrays are intentional.
+  const startIcon = useMemo(
+    () =>
+      L.divIcon({
+        className: 'endpoint-marker',
+        html: '<div class="endpoint-pin endpoint-pin--start">S</div>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+      }),
+    [],
+  );
+  const endIcon = useMemo(
+    () =>
+      L.divIcon({
+        className: 'endpoint-marker',
+        html: '<div class="endpoint-pin endpoint-pin--end">E</div>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+      }),
+    [],
+  );
+
   const [selected, setSelected] = useState<
     { lat: number; lng: number; createdAt: string } | null
   >(null);
@@ -387,36 +445,56 @@ export default function MapView({ points }: { points: Point[] }) {
           />
         ))}
 
-        {first && (
-          <CircleMarker
-            center={[first.latitude, first.longitude]}
-            radius={7}
-            pathOptions={{
-              color: 'hsl(240, 78%, 58%)',
-              fillColor: '#ffffff',
-              fillOpacity: 1,
-              weight: 3,
-            }}
-            eventHandlers={{
-              click: () => selectPoint(first),
-            }}
+        {/* Direction-of-travel arrows along each polyline group. Rendered
+            via L.divIcon instead of L.marker's default PNG icon so there
+            are no asset-loading gymnastics and the arrows inherit page
+            CSS. `interactive={false}` keeps clicks flowing through to the
+            polyline underneath. */}
+        {directionArrows.map((a) => (
+          <Marker
+            key={a.key}
+            position={[a.latitude, a.longitude]}
+            icon={L.divIcon({
+              className: 'direction-arrow',
+              // SVG chevron pointing up; CSS rotates it to the bearing so
+              // we avoid baking a transform into every marker's HTML
+              // (cleaner devtools, one less value to escape).
+              html: `<span class="direction-arrow__inner" style="transform: rotate(${a.bearing}deg)">
+                <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+                  <polygon points="6,1 11,11 6,8.5 1,11" />
+                </svg>
+              </span>`,
+              iconSize: [12, 12],
+              iconAnchor: [6, 6],
+            })}
+            interactive={false}
           />
+        ))}
+
+        {first && (
+          <Marker
+            position={[first.latitude, first.longitude]}
+            icon={startIcon}
+            eventHandlers={{ click: () => selectPoint(first) }}
+            zIndexOffset={1000}
+          >
+            <Tooltip direction="top" offset={[0, -14]} opacity={0.95}>
+              Start
+            </Tooltip>
+          </Marker>
         )}
 
         {last && (
-          <CircleMarker
-            center={[last.latitude, last.longitude]}
-            radius={7}
-            pathOptions={{
-              color: 'hsl(360, 78%, 58%)',
-              fillColor: '#ffffff',
-              fillOpacity: 1,
-              weight: 3,
-            }}
-            eventHandlers={{
-              click: () => selectPoint(last),
-            }}
-          />
+          <Marker
+            position={[last.latitude, last.longitude]}
+            icon={endIcon}
+            eventHandlers={{ click: () => selectPoint(last) }}
+            zIndexOffset={1000}
+          >
+            <Tooltip direction="top" offset={[0, -14]} opacity={0.95}>
+              End
+            </Tooltip>
+          </Marker>
         )}
 
         {selected && (

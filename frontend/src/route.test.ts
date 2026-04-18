@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Point } from './api';
 import {
+  ARROW_INTERVAL_METERS,
+  arrowsAlong,
   buildSegments,
   downsampleGroups,
   GAP_MS,
@@ -222,5 +224,117 @@ describe('buildSegments', () => {
     // First chunk: t ≈ 0 → near 240°. Last chunk: t ≈ 1 → near 360°.
     expect(firstHue).toBeLessThan(245);
     expect(lastHue).toBeGreaterThan(355);
+  });
+});
+
+describe('arrowsAlong', () => {
+  /** Step a point north by `metersNorth` meters from a base at the equator.
+   *  At latitude 0, 1° north ≈ 111_195 m, so the math is clean and the
+   *  tests don't need cosine scaling. */
+  const metersPerDeg = 6_371_000 * Math.PI / 180;
+  const step = (fromLat: number, metersNorth: number) => ({
+    latitude: fromLat + metersNorth / metersPerDeg,
+    longitude: 0,
+  });
+
+  it('returns empty for fewer than two positions', () => {
+    expect(arrowsAlong([])).toEqual([]);
+    expect(arrowsAlong([{ latitude: 0, longitude: 0 }])).toEqual([]);
+  });
+
+  it('returns empty for a polyline shorter than one interval', () => {
+    // 50 m segment << 150 m default interval.
+    const positions = [step(0, 0), step(0, 50)];
+    expect(arrowsAlong(positions)).toEqual([]);
+  });
+
+  it('places arrows at the expected count along a long straight segment', () => {
+    // 1000 m straight north. With 150 m interval and half-interval padding
+    // at both ends, the usable span is [75, 925] → (925-75)/150 + 1 = ~6.7
+    // → expect 6 arrows.
+    const positions = [step(0, 0), step(0, 1000)];
+    const arrows = arrowsAlong(positions, 150);
+    expect(arrows.length).toBeGreaterThanOrEqual(5);
+    expect(arrows.length).toBeLessThanOrEqual(7);
+  });
+
+  it('first arrow sits at about half-interval from the start', () => {
+    const positions = [step(0, 0), step(0, 1000)];
+    const arrows = arrowsAlong(positions, 150);
+    // First arrow should be roughly 75 m north of origin → small positive
+    // latitude offset. Half-interval tolerance on either side.
+    const firstLat = arrows[0].latitude * metersPerDeg;
+    expect(firstLat).toBeGreaterThan(50);
+    expect(firstLat).toBeLessThan(100);
+  });
+
+  it('last arrow keeps clear of the end marker', () => {
+    // Last arrow must be at least a half-interval (75 m) before the end.
+    const positions = [step(0, 0), step(0, 1000)];
+    const arrows = arrowsAlong(positions, 150);
+    const lastMeters = arrows[arrows.length - 1].latitude * metersPerDeg;
+    expect(1000 - lastMeters).toBeGreaterThanOrEqual(75 - 1);
+  });
+
+  it('bearing of due-north polyline is ≈ 0°', () => {
+    const positions = [step(0, 0), step(0, 500)];
+    const arrows = arrowsAlong(positions, 150);
+    expect(arrows.length).toBeGreaterThan(0);
+    for (const a of arrows) {
+      // Allow a small numerical tolerance; near-zero bearings can also be
+      // reported as 359.x° because of the `% 360` normalization.
+      const delta = Math.min(a.bearing, 360 - a.bearing);
+      expect(delta).toBeLessThan(1);
+    }
+  });
+
+  it('bearing of due-east polyline is ≈ 90°', () => {
+    // 500 m east from origin → longitude offset by 500 / metersPerDeg
+    // (cos(0) = 1 at equator).
+    const positions = [
+      { latitude: 0, longitude: 0 },
+      { latitude: 0, longitude: 500 / metersPerDeg },
+    ];
+    const arrows = arrowsAlong(positions, 150);
+    expect(arrows.length).toBeGreaterThan(0);
+    for (const a of arrows) {
+      expect(Math.abs(a.bearing - 90)).toBeLessThan(1);
+    }
+  });
+
+  it('bearing follows a right-angle turn across the polyline', () => {
+    // 500 m north, then 500 m east. Arrows before the turn should read
+    // ≈ 0°; arrows after the turn should read ≈ 90°.
+    const positions = [
+      { latitude: 0, longitude: 0 },
+      step(0, 500),
+      { latitude: 500 / metersPerDeg, longitude: 500 / metersPerDeg },
+    ];
+    const arrows = arrowsAlong(positions, 150);
+    const northArrows = arrows.filter(
+      (a) => a.latitude * metersPerDeg < 450,
+    );
+    const eastArrows = arrows.filter(
+      (a) => a.longitude * metersPerDeg > 50,
+    );
+    expect(northArrows.length).toBeGreaterThan(0);
+    expect(eastArrows.length).toBeGreaterThan(0);
+    for (const a of northArrows) {
+      const d = Math.min(a.bearing, 360 - a.bearing);
+      expect(d).toBeLessThan(2);
+    }
+    for (const a of eastArrows) {
+      expect(Math.abs(a.bearing - 90)).toBeLessThan(2);
+    }
+  });
+
+  it('honors the ARROW_INTERVAL_METERS default', () => {
+    // 10 km polyline at default interval → ~66 arrows (10_000 - 150)/150.
+    const positions = [step(0, 0), step(0, 10_000)];
+    const arrows = arrowsAlong(positions);
+    // Sanity: the default is 150 m and density should reflect that.
+    const spacing = 10_000 / arrows.length;
+    expect(spacing).toBeGreaterThan(ARROW_INTERVAL_METERS - 30);
+    expect(spacing).toBeLessThan(ARROW_INTERVAL_METERS + 30);
   });
 });

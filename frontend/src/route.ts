@@ -29,9 +29,26 @@ export const GRADIENT_CHUNKS = 64;
 /// across unrelated locations (car trips, power-off periods, etc.).
 export const GAP_MS = 5 * 60 * 1000;
 
+/// Spacing between direction arrows along a rendered polyline, in meters.
+/// 150 m is large enough that the map stays uncluttered at city zoom
+/// levels and small enough that the *direction of travel* is immediately
+/// obvious on any non-trivial route — if you can see three consecutive
+/// arrows, the polyline is directed.
+export const ARROW_INTERVAL_METERS = 150;
+
 export type Segment = { positions: [number, number][]; color: string };
 export type Singleton = { point: Point; color: string };
 export type RenderData = { segments: Segment[]; singletons: Singleton[] };
+
+export type DirectionArrow = {
+  /// Lat/lon where the arrow sits on the polyline. Computed by linear
+  /// interpolation along the segment that contains the target distance.
+  latitude: number;
+  longitude: number;
+  /// Forward bearing in degrees (0° = north, 90° = east). Matches the
+  /// direction of travel along the segment the arrow was placed on.
+  bearing: number;
+};
 
 /// Split a time-sorted list of points into groups, starting a new group
 /// whenever the time delta to the previous point exceeds `GAP_MS`.
@@ -88,6 +105,94 @@ export function gradientColor(t: number): string {
       ? 240 + (285 - 240) * (t / 0.5)
       : 285 + (360 - 285) * ((t - 0.5) / 0.5);
   return `hsl(${h.toFixed(1)}, 78%, 58%)`;
+}
+
+/// Haversine distance in meters between two geographic points. Pure
+/// function, kept local to this module so `route.ts` has no runtime
+/// dependency on Leaflet (tests run in a DOM-free Node environment).
+function haversineMeters(
+  a: { latitude: number; longitude: number },
+  b: { latitude: number; longitude: number },
+): number {
+  const R = 6_371_000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const la1 = toRad(a.latitude);
+  const la2 = toRad(b.latitude);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+/// Forward bearing from `a` to `b`, in degrees where 0° is north and
+/// 90° is east. Matches the standard great-circle initial-bearing
+/// formula; for the short polyline segments typical in a phone trace
+/// (< 50 m), the bearing is effectively the same as a flat-Earth
+/// heading, so this formulation stays correct at any zoom level.
+function bearingDeg(
+  a: { latitude: number; longitude: number },
+  b: { latitude: number; longitude: number },
+): number {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const toDeg = (r: number) => (r * 180) / Math.PI;
+  const la1 = toRad(a.latitude);
+  const la2 = toRad(b.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const y = Math.sin(dLon) * Math.cos(la2);
+  const x =
+    Math.cos(la1) * Math.sin(la2) -
+    Math.sin(la1) * Math.cos(la2) * Math.cos(dLon);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+/// Place direction-of-travel arrows at fixed metric intervals along a
+/// polyline. The first arrow is offset by half the interval so it does
+/// not visually collide with the Start marker, and the last usable
+/// position stops a half-interval short of the end so the End marker
+/// stays clear too. Bearing is taken from the polyline segment the
+/// arrow was placed on, so turns are reflected automatically.
+///
+/// Returns an empty array for inputs shorter than a single interval —
+/// a ~50 m trace with one arrow halfway along does not add clarity,
+/// it just clutters the map.
+export function arrowsAlong(
+  positions: { latitude: number; longitude: number }[],
+  intervalMeters: number = ARROW_INTERVAL_METERS,
+): DirectionArrow[] {
+  if (positions.length < 2 || intervalMeters <= 0) return [];
+
+  let total = 0;
+  for (let i = 1; i < positions.length; i++) {
+    total += haversineMeters(positions[i - 1], positions[i]);
+  }
+  if (total < intervalMeters) return [];
+
+  const arrows: DirectionArrow[] = [];
+  const halfInterval = intervalMeters / 2;
+  const lastPos = total - halfInterval;
+  let covered = 0;
+  let next = halfInterval;
+
+  for (let i = 1; i < positions.length && next <= lastPos; i++) {
+    const a = positions[i - 1];
+    const b = positions[i];
+    const seg = haversineMeters(a, b);
+    if (seg === 0) continue;
+    // One segment can host multiple arrows on a long straightaway.
+    while (next <= covered + seg && next <= lastPos) {
+      const t = (next - covered) / seg;
+      arrows.push({
+        latitude: a.latitude + (b.latitude - a.latitude) * t,
+        longitude: a.longitude + (b.longitude - a.longitude) * t,
+        bearing: bearingDeg(a, b),
+      });
+      next += intervalMeters;
+    }
+    covered += seg;
+  }
+  return arrows;
 }
 
 /// Build render primitives for every time-gap group.

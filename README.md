@@ -725,6 +725,21 @@ flowchart LR
   across the full query window (blue early → red late). Each polyline
   is split into up to 64 colored chunks to fake a gradient under
   Leaflet's single-color-per-polyline limitation.
+- **Direction-of-travel arrows** (1.3.1): a small semi-transparent
+  chevron every ~150 m along each polyline group, oriented to the
+  segment's bearing, so direction reads instantly at any zoom
+  regardless of the gradient colors. Computed in meters along the
+  geodesic (`route.arrowsAlong`) so spacing is zoom-invariant; the
+  first and last arrows keep a half-interval clear of the endpoints
+  so they don't collide with the Start / End markers. Rendered via
+  `L.divIcon` SVG with `pointer-events: none` so clicks flow through
+  to the polyline.
+- **Start / End markers** (1.3.1): green "S" and red "E" pins on
+  distinct circular badges with drop-shadow, plus `Start` / `End`
+  tooltips, replacing the earlier same-shape white-filled circles.
+  Fixes the "I can't tell where the route starts" feedback that the
+  blue-fill vs. red-border treatment could not address on a light
+  basemap.
 - Clicks snap to the nearest rendered point in **screen-pixel space**
   via `map.latLngToContainerPoint` (30 px radius), so the snap behavior
   stays consistent at every zoom level — the previous degree-based
@@ -744,8 +759,9 @@ flowchart LR
 # validateRange + matcher pipeline end-to-end with injected fetchImpl)
 cd backend && node --test test/
 
-# frontend unit tests (20 cases covering splitByTimeGaps, downsampleGroups,
-# gradientColor, buildSegments — the pure functions behind the route view)
+# frontend unit tests (29 cases covering splitByTimeGaps, downsampleGroups,
+# gradientColor, buildSegments, and arrowsAlong — the pure functions
+# behind the route view)
 cd frontend && npm test
 
 # iOS unit tests (61 cases across LocationFilter, KalmanSmoother,
