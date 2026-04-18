@@ -159,6 +159,55 @@ final class StationaryDetectorTests: XCTestCase {
         XCTAssertEqual(d.candidateAnchor?.timestamp, pastInsideRadius.timestamp)
     }
 
+    // MARK: - Gap-reset guard (1.2.7 fix)
+
+    func testFixAfterLongGapDoesNotTriggerStationary() {
+        // Regression for the 2026-04-17 session: a 5-minute GPS
+        // blackout — during which LocationFilter rejected every raw
+        // sample as `nonGpsSource` — must not be reinterpreted as "the
+        // user stood still for 5 minutes". The previous code kept the
+        // candidate anchor from the pre-gap fix untouched; the first
+        // returning fix landed with `age >> windowSeconds` and was
+        // suppressed as stationary-jitter, losing 4 real movement
+        // points at 18:45:06–18:45:31 CEST.
+        //
+        // The gap-reset guard now detects that no fix was processed
+        // within `gapResetSeconds` and treats the returning fix as a
+        // fresh candidate anchor — accept, not suppress — so the
+        // cluster clock restarts from real movement evidence.
+        var d = StationaryDetector(gapResetSeconds: 60)
+        _ = d.consume(loc(50.45, 30.52, t: 0))
+        // 305 s gap with zero intermediate fixes. The returning fix is
+        // inside stationaryRadius of the pre-gap anchor, so the old
+        // code would classify it as a sustained cluster.
+        let afterGap = loc(50.4501, 30.52, t: 305)
+        XCTAssertEqual(d.consume(afterGap), .accept)
+        // Candidate is now the post-gap fix; the window restarts cleanly.
+        XCTAssertEqual(d.candidateAnchor?.timestamp, afterGap.timestamp)
+        XCTAssertNil(d.stationaryCenter)
+    }
+
+    func testGapResetAlsoClearsStationaryCenter() {
+        // The guard must also fire when the detector is already in
+        // Phase B. A long gap during which we received no fixes cannot
+        // be taken as evidence of continued stationarity — the user may
+        // have walked the entire gap — so the returning fix re-opens
+        // evaluation from scratch.
+        var d = StationaryDetector(gapResetSeconds: 60)
+        _ = d.consume(loc(50.45, 30.52, t: 0))
+        for t in stride(from: 30.0, through: 160.0, by: 30.0) {
+            _ = d.consume(loc(50.4500, 30.52, t: t))
+        }
+        XCTAssertNotNil(d.stationaryCenter)
+
+        // 305 s gap, returning fix inside resumeRadius. Previously
+        // suppressed; now accepted because the Phase B state is cleared.
+        let afterGap = loc(50.4501, 30.52, t: 465)
+        XCTAssertEqual(d.consume(afterGap), .accept)
+        XCTAssertNil(d.stationaryCenter)
+        XCTAssertEqual(d.candidateAnchor?.timestamp, afterGap.timestamp)
+    }
+
     // MARK: - reset()
 
     func testResetClearsBothStates() {

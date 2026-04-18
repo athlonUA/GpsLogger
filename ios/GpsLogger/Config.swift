@@ -98,8 +98,9 @@ enum Config {
     /// goes quiet for longer than this, the pending point is stale — the
     /// A → B → C temporal pattern is broken — and we drop it silently so
     /// a returning fix isn't compared against hours-old state. 30 s covers
-    /// normal delivery gaps (walking with `distanceFilter = 10`, low
-    /// signal, brief backgrounding) while catching any long pause.
+    /// normal delivery gaps (1 Hz cadence under `kCLDistanceFilterNone`,
+    /// 1.2.7, low signal, brief backgrounding) while catching any long
+    /// pause.
     static let pendingTimeoutSeconds: TimeInterval = 30
 
     /// Stationary detection — how long a candidate cluster must persist before
@@ -159,6 +160,41 @@ enum Config {
     /// yet small enough that a user who keeps walking through marginal
     /// signal will see fixes reappear within two minutes, not seventeen.
     static let resumeRelaxSeconds: TimeInterval = 120
+
+    /// Process-noise acceleration standard deviation (m/s²) for the
+    /// 2D constant-velocity Kalman filter applied to accepted fixes.
+    /// This is the σ_a parameter in the DWNA model: it models the
+    /// unmodelled acceleration a real walker / cyclist / motorist can
+    /// produce between samples.
+    ///
+    /// 2.0 m/s² is chosen as a multi-modal default:
+    ///   - walking:  peak ~0.5 m/s² during starts/stops
+    ///   - cycling:  peak ~1.5 m/s² on acceleration from stop
+    ///   - vehicles: typical-driving peak ~2–3 m/s² (not emergency braking)
+    /// Higher σ_a gives a more agile filter (trusts measurements more,
+    /// smooths less); lower σ_a gives heavier smoothing at the cost of
+    /// lag on real acceleration. The chosen value is biased slightly
+    /// toward agility so sharp turns and cyclist starts are not
+    /// visibly delayed on the rendered track.
+    static let kalmanProcessAccelStdDev: Double = 2.0
+
+    /// Reset the Kalman state whenever the inter-sample gap exceeds
+    /// this. After a gap of 10 s the cached velocity estimate is no
+    /// longer a useful prior — the user's real motion during the gap
+    /// is unknown — so it is safer to anchor fresh on the returning
+    /// fix than to predict across the blackout. 10 s comfortably
+    /// covers any legitimate delivery latency at our typical ~1 Hz
+    /// cadence while catching real signal-loss windows.
+    static let kalmanResetGapSeconds: TimeInterval = 10
+
+    /// Initial velocity-axis variance (m²/s²) assigned on the first
+    /// fix of a new Kalman window. 100 = σ_v of 10 m/s, which is wide
+    /// enough to cover the span from stationary through vehicle speeds
+    /// so the filter's velocity estimate adapts quickly from the
+    /// zero-initialized prior. Too small would hold the zero prior for
+    /// several samples; too large would amplify measurement noise into
+    /// a spurious initial velocity.
+    static let kalmanInitialVelocityVariance: Double = 100.0
 
     /// Identifier for the `BGAppRefreshTask` that wakes the app in
     /// background so `SyncService` can drain the local upload queue when

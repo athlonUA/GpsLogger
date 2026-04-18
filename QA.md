@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (52 cases across 4 test files)
+### iOS unit tests (61 cases across 5 test files)
 
 ```
 cd ios
@@ -89,8 +89,8 @@ invariants on an in-memory SQLite opened via `Database(path: ":memory:")`:
 - stationary/no-activity with high confidence → `.unknown` (caller
   keeps the prior hint)
 
-**`StationaryDetectorTests` (9 cases)** — Phase-A/B state machine
-plus the 1.2.1 clock-skew guard:
+**`StationaryDetectorTests` (11 cases)** — Phase-A/B state machine,
+the 1.2.1 clock-skew guard, and the 1.2.7 gap-reset guard:
 
 - first fix is accepted and becomes the candidate
 - fixes inside `stationaryRadius` before the window elapses are still
@@ -106,7 +106,37 @@ plus the 1.2.1 clock-skew guard:
 - **negative-age guard** (1.2.1): an anchor timestamp newer than the
   incoming fix (NTP correction / DST transition / cached replay)
   resets the candidate instead of stalling the window forever
+- **gap-reset in Phase A** (1.2.7): a 5-min gap with no intermediate
+  fixes followed by a returning fix inside the radius must not be
+  reinterpreted as "stationary for 5 min" — the guard resets the
+  candidate so the cluster clock restarts from real movement evidence
+- **gap-reset in Phase B** (1.2.7): a long gap also clears a previously
+  declared stationary center, so a returning fix inside `resumeRadius`
+  is accepted rather than suppressed
 - `reset()` clears both candidate and stationaryCenter
+
+**`KalmanSmootherTests` (7 cases)** — observable contract of the 1.2.7
+2D constant-velocity Kalman filter:
+
+- first-fix passthrough: output coordinate equals input (no state yet
+  to blend against), and non-horizontal fields (altitude, vertical
+  accuracy, speed, course) flow through unchanged
+- reported `horizontalAccuracy` on the output strictly improves after
+  a handful of co-located fixes (position-only measurements collapse
+  the state covariance)
+- zigzag smoothing: a straight east-walk with ±10 m cross-track noise
+  at HA=32 m has the smoothed cross-track average driven to ≤ 60 % of
+  the raw average over the last-10-sample window
+- outlier damping: a single 50 m cross-track spike in a clean walk
+  pulls the smoothed output less than 30 m — the motion prior bounds
+  the innovation, without the KF ever "rejecting" anything (that stays
+  upstream in `LocationFilter`)
+- long-gap reset: `dt > resetGapSeconds` discards the cached velocity
+  estimate so the post-gap output equals the post-gap input
+- out-of-order timestamp reset: `dt ≤ 0` triggers the same reset path
+- ENU round-trip consistency: forward + inverse mapping agree to
+  sub-meter tolerance at city scale so filter-space math does not
+  silently shift coordinates
 
 ### Backend validator unit tests
 
@@ -626,6 +656,175 @@ and don't need retesting here — scenarios #1–14 above already cover
 them: source gate (Wi-Fi/cell fallback), spike buffer, stationary
 detector, sync/backoff/idempotency, BGTaskScheduler, backend API,
 frontend visualization, Docker stack.
+
+## 1.2.7 sampling-density + Kalman regression plan
+
+Targeted field regression for the 1.2.7 overhaul of the sampling path
+(`BestForNavigation` + `distanceFilter = None`), the Kalman smoother
+(`KalmanSmoother.swift`), and the `StationaryDetector` gap-reset guard.
+Verifies:
+
+- **K1** — straight outdoor walks no longer show the HA=32 m zigzag
+  from 1.2.6 and earlier; the rendered polyline follows the true path
+  within a handful of meters even in partial-sky conditions.
+- **K2** — turns and true-motion changes are still visible (no
+  smeared corners from over-smoothing).
+- **K3** — GPS blackouts followed by signal recovery no longer lose
+  the first few post-recovery fixes to a false-stationary verdict
+  (regression for the 2026-04-17 18:45:06 bug).
+- **K4** — upstream outlier rejection (`LocationFilter` spike buffer,
+  source gate) still bites; the smoother must not be credited with
+  rejection it doesn't perform.
+
+Prereqs: iPhone on 1.2.7 (footer reads `v1.2.7 (12)`), `docker
+compose ps` healthy, Console.app attached with filter `process =
+GpsLogger`, Device ID copied as `<DEV>`. Total field time ~40 min.
+
+### 19. Straight outdoor walk — zigzag gone (1.2.7, K1)
+
+Primary acceptance test for the Kalman smoother. The 2026-04-17 session
+walked a straight sidewalk for 10 min and the rendered polyline zigzagged
+by ±20 m between consecutive points because every accept was at HA=32 m
+and the raw coordinates scattered accordingly.
+
+- Walk **≥ 500 m on a straight sidewalk** (not a park path — straight
+  roads give a visual reference). Moderate tree canopy or 4-story
+  buildings is ideal; pure clear-sky does not exercise the filter.
+- Open the frontend, narrow the time range to this walk, zoom to
+  street level.
+- Expected: the polyline follows the sidewalk within ~10 m; no
+  sawtooth pattern. Individual dots may still show HA circles up to
+  32 m (that's the chip's report) but the **line between them** is
+  smooth.
+- Query to compare raw `fix_diagnostics` vs. stored `points` for the
+  same window:
+
+  ```sql
+  -- Raw per-accept HA (chip report)
+  SELECT to_char(fix_timestamp, 'HH24:MI:SS') AS t,
+         ROUND(horizontal_accuracy::numeric, 1) AS ha
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<start>' AND '<end>'
+     AND decision = 'accept'
+   ORDER BY fix_timestamp;
+  ```
+
+  If the map still shows a zigzag: confirm the running binary is
+  1.2.7, then compute cross-track deviation from the walked line —
+  any persisted `points` row farther than ~15 m from the true
+  sidewalk centerline on a clear-sky section is a regression. The
+  baseline on 1.2.6 is ~±30 m.
+
+### 20. Post-blackout movement is preserved (1.2.7, K3)
+
+Regression for the 2026-04-17 18:45:06 false-stationary bug. A
+5-minute GPS blackout that looks identical to "user stood still for
+5 min" must not suppress the first minute of real post-recovery
+movement.
+
+- Walk outside for ~2 min to warm up the filter (several accepts
+  land in `fix_diagnostics`).
+- Enter a building and stay ≥ 5 min so GPS dies completely
+  (watching Console for `[tracker] discard nonGps ...` confirms the
+  blackout is real, not just weak).
+- Exit and walk normally for ≥ 2 min.
+- Expected: on the frontend, the **first 4–10 points** after
+  building-exit are all rendered (not just one every 30–60 s). No
+  visible dead-segment of `suppress stationary` at the exit.
+- Query for post-exit accepts and cross-check against the persisted
+  `points` table (remember that `points` now stores Kalman-smoothed
+  coords, so direct `fix_timestamp ↔ created_at` equality still
+  holds but the lat/lon differ slightly from the raw row):
+
+  ```sql
+  SELECT d.fix_timestamp,
+         d.horizontal_accuracy,
+         d.decision,
+         (SELECT p.id FROM points p
+           WHERE p.device_id = d.device_id
+             AND p.created_at = d.fix_timestamp) AS points_id
+    FROM fix_diagnostics d
+   WHERE d.device_id = '<DEV>'
+     AND d.fix_timestamp BETWEEN '<exit-utc>'
+                             AND '<exit-utc>'::timestamptz + INTERVAL '2 minutes'
+     AND d.decision = 'accept'
+   ORDER BY d.fix_timestamp;
+  ```
+
+  Every `accept` in the first minute after exit must have a
+  non-null `points_id`. If any are NULL (i.e. the StationaryDetector
+  suppressed them), compare against the pre-gap last accept: if
+  that accept's lat/lon is within 20 m of the post-gap accept and
+  more than 60 s older, the gap-reset guard is not firing — check
+  `Config.resumeGapSeconds` and the `lastSeen`-based branch at the
+  top of `StationaryDetector.consume`.
+
+### 21. Sharp turn fidelity (1.2.7, K2)
+
+Verifies the Kalman smoother's constant-velocity motion prior does
+not smear a real 90° turn into a rounded curve. σ_a = 2 m/s² was
+chosen with this test in mind; if it fails, either σ_a is too low
+(over-smoothing) or the process-noise matrix is miscomputed.
+
+- Walk a right-angle city-block corner at a steady pace. Note the
+  wall-clock seconds at the corner (screenshot Console.app).
+- After the walk, open the frontend and zoom to the corner.
+- Expected: the polyline *turns* at the corner. A smooth S-curve
+  over 3+ samples is a regression — the turn should be visible
+  within 1–2 sample intervals of the corner crossing.
+- If wrong, pull the accepted fixes around the corner and compute
+  the implied velocity vector:
+
+  ```sql
+  SELECT fix_timestamp,
+         horizontal_accuracy,
+         latitude, longitude
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<corner-utc>'::timestamptz - INTERVAL '30 seconds'
+                           AND '<corner-utc>'::timestamptz + INTERVAL '30 seconds'
+     AND decision = 'accept'
+   ORDER BY fix_timestamp;
+  ```
+
+  The raw trajectory should turn; if the *raw* turns but the
+  rendered `points` rows don't, the smoother is smearing. Bumping
+  `Config.kalmanProcessAccelStdDev` from 2.0 to 2.5 or 3.0 gives
+  the filter more velocity-update agility at the cost of slightly
+  less smoothing on straight segments.
+
+### 22. Source-gate still bites on network fallback (1.2.7, K4)
+
+Sanity check that the smoother has not weakened any upstream gate.
+The Kalman filter sits *after* `LocationFilter.accept`, so a
+Wi-Fi-origin "teleport" fix must still be rejected before reaching
+the smoother.
+
+- Reproduce the park-canopy or subway-exit Wi-Fi fallback scenario
+  that historically produced `discard:nonGpsSource` rows.
+- Expected: `fix_diagnostics` still shows the discards; the `points`
+  table has no rows at the offending fix timestamps.
+- Query:
+
+  ```sql
+  SELECT COUNT(*) FILTER (WHERE decision = 'discard:nonGpsSource')  AS wifi_rejects,
+         COUNT(*) FILTER (WHERE decision = 'accept')                AS accepts
+    FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<window-start>' AND '<window-end>';
+  ```
+
+  If `wifi_rejects` ever drops to zero during a session that
+  historically showed them, it means the source gate has been
+  accidentally relaxed — the 1.2.7 change should not have touched
+  `LocationFilter.consume` at all.
+
+**Out of scope for the 1.2.7 round.** Unchanged and not retested
+here: source gate (#22 is a sanity touch, not a re-validation),
+`LocationFilter`'s gap-aware three-tier gate (1.2.6), spike buffer,
+sync/backoff, BGTaskScheduler, backend API, frontend visualization
+logic, Docker stack. Scenarios #1–18 cover those.
 
 ## Inspecting fix_diagnostics after an anomaly
 

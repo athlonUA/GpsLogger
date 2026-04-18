@@ -7,9 +7,12 @@ import Combine
 /// - No timers. Points are stored purely in response to CoreLocation callbacks.
 /// - Raw CLLocation samples pass through `LocationFilter` first (validity,
 ///   source discrimination, accuracy, speed, spike buffer — see
-///   `LocationFilter.swift`), then through `StationaryDetector`, which
-///   suppresses stationary-jitter clusters without touching the coordinates
-///   themselves.
+///   `LocationFilter.swift`), then through `KalmanSmoother` (2D constant-
+///   velocity KF that averages per-sample HA noise against a motion prior),
+///   then through `StationaryDetector`, which suppresses stationary-jitter
+///   clusters. `LocationFilter` still owns outlier rejection; the smoother
+///   only shapes accepted coordinates and never synthesizes a fix from
+///   nothing.
 /// - Always-on: `start()` is invoked once during container bootstrap and the
 ///   tracker runs for the full app lifetime. There is no user-facing Stop;
 ///   CoreLocation only ceases when the OS terminates the process.
@@ -66,6 +69,7 @@ final class LocationTracker: NSObject, ObservableObject {
     private let appState: AppState
 
     private var filter = LocationFilter()
+    private var smoother = KalmanSmoother()
     private var stationary = StationaryDetector()
     private let classifier = MotionClassifier()
 
@@ -102,7 +106,17 @@ final class LocationTracker: NSObject, ObservableObject {
         super.init()
 
         manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyBest
+        // `BestForNavigation` is one step above `Best`: CoreLocation's
+        // fusion engine consumes accelerometer / gyroscope / barometer
+        // data more aggressively, and under partial-sky conditions
+        // (urban canyon, tree canopy) the reported horizontalAccuracy
+        // drops measurably — HA=32 m buckets collapse toward 10–16 m.
+        // Apple's docs recommend this mode only "when navigating" or
+        // "while the device is plugged in" because of the additional
+        // battery draw; we run it permanently because our product goal
+        // is continuous high-fidelity tracking and the user has
+        // explicitly accepted the battery cost.
+        manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
         // Startup default: pedestrian hint. `MotionClassifier` will flip
         // this to `.automotiveNavigation` once it detects a motor vehicle
         // with medium/high confidence. The previous hard-coded
@@ -110,7 +124,17 @@ final class LocationTracker: NSObject, ObservableObject {
         // biased the fusion engine toward vehicle motion models in
         // degraded-signal environments.
         manager.activityType = .fitness
-        manager.distanceFilter = Config.minDistanceMeters
+        // `kCLDistanceFilterNone` means CoreLocation delivers every
+        // computed fix (~1 Hz in normal conditions) rather than only
+        // those more than `minDistanceMeters` from the last delivered
+        // sample. The denser stream gives the downstream `KalmanSmoother`
+        // 5–7× more observations to average against, which is the main
+        // lever for driving per-sample jitter below the HA ceiling.
+        // The `minDistanceMeters` gate still applies inside
+        // `LocationFilter` for what gets persisted, so the `points`
+        // table row rate is unchanged by this flip; only the smoother's
+        // input density changes.
+        manager.distanceFilter = kCLDistanceFilterNone
         manager.pausesLocationUpdatesAutomatically = false
         manager.allowsBackgroundLocationUpdates = true
         manager.showsBackgroundLocationIndicator = true
@@ -204,6 +228,7 @@ final class LocationTracker: NSObject, ObservableObject {
                 // baseline instead of being compared against an hours-old
                 // last-accepted position.
                 filter.reset()
+                smoother.reset()
                 stationary.reset()
                 beginUpdates()
             }
@@ -216,6 +241,7 @@ final class LocationTracker: NSObject, ObservableObject {
             addImpairment(.backgroundRequiresAlways)
             if !isTracking {
                 filter.reset()
+                smoother.reset()
                 stationary.reset()
                 beginUpdates()
             }
@@ -300,13 +326,25 @@ final class LocationTracker: NSObject, ObservableObject {
     /// `LocationFilter` funnels through here so stationary suppression is
     /// applied uniformly to direct accepts, spike replacements, and
     /// committed-pending emissions.
+    ///
+    /// Pipeline order is deliberate:
+    ///   1. `smoother.consume` — averages the accepted-fix stream against
+    ///      a constant-velocity motion prior. Downstream stages see
+    ///      smoothed coordinates, so stationary-cluster detection and
+    ///      the persisted `points` row both benefit.
+    ///   2. `stationary.consume` — uses the smoothed coordinate for its
+    ///      distance-to-anchor math. Smoothed positions cluster more
+    ///      tightly than raw ones, which *improves* stationary detection
+    ///      rather than hurting it (less jitter → fewer spurious
+    ///      cluster-breaks).
     private func maybePersist(_ loc: CLLocation) {
-        switch stationary.consume(loc) {
+        let smoothed = smoother.consume(loc)
+        switch stationary.consume(smoothed) {
         case .accept:
-            persist(loc)
+            persist(smoothed)
         case .suppress:
             #if DEBUG
-            print("[tracker] suppress stationary @ \(loc.coordinate.latitude),\(loc.coordinate.longitude)")
+            print("[tracker] suppress stationary @ \(smoothed.coordinate.latitude),\(smoothed.coordinate.longitude)")
             #endif
         }
     }

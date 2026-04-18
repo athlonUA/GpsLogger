@@ -391,6 +391,49 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **High-density sampling + Kalman smoother** (1.2.7):
+  - `CLLocationManager.desiredAccuracy` promoted from `kCLLocationAccuracyBest`
+    to `kCLLocationAccuracyBestForNavigation`. Under partial-sky conditions
+    (urban canyon, tree canopy) the fusion engine pulls in more inertial
+    data and the reported `horizontalAccuracy` collapses from 32 m
+    buckets toward 10–16 m. Battery impact is real (Apple flags this mode
+    as "while plugged in / navigating"); accepted trade for continuous
+    high-fidelity tracking.
+  - `CLLocationManager.distanceFilter` set to `kCLDistanceFilterNone`
+    so every computed fix is delivered (~1 Hz) rather than only those
+    farther than 10 m from the last one. Row rate in the `points` table
+    is unchanged — `LocationFilter.minDistance` still gates persistence
+    at 10 m — but the downstream smoother now sees 5–7× more
+    observations per persisted point.
+  - New `KalmanSmoother` module: 2D constant-velocity Kalman filter
+    layered between `LocationFilter.accept` and
+    `StationaryDetector.consume`. State: `[x, y, vx, vy]` in local ENU
+    meters anchored at the first accepted fix. Process noise σ_a = 2 m/s²
+    (multi-modal: covers walking, cycling, typical-driving accelerations).
+    Measurement noise R = CLLocation's own `horizontalAccuracy`² — the
+    filter trusts Apple's per-sample quality estimate as-is. Resets on
+    `dt > 10 s` (stale velocity estimate) or non-positive `dt`
+    (out-of-order / duplicate delivery). Output `CLLocation` preserves
+    altitude / vertical accuracy / speed / course from the input and
+    reports the post-update position-variance RMS as the new
+    `horizontalAccuracy`, which is strictly ≤ the input after a few
+    updates. 7 unit tests cover first-fix passthrough, accuracy
+    improvement, zigzag smoothing, spike damping, long-gap reset,
+    out-of-order reset, and ENU round-trip.
+  - `StationaryDetector` false-positive after GPS blackout fixed. Prior
+    behavior (observed in the 2026-04-17 18:34–18:55 CEST session):
+    a 5-minute GNSS blackout during which `LocationFilter` rejected
+    every raw sample left the candidate anchor from the pre-gap fix
+    untouched; the first returning fix landed with `age >> windowSeconds`
+    and was suppressed as stationary-jitter, losing 4 real movement
+    points at 18:45:06–18:45:31. New gap-reset guard tracks the
+    timestamp of the most recent processed fix and, when the
+    inter-sample gap exceeds `Config.resumeGapSeconds` (60 s), treats
+    the returning fix as a fresh candidate anchor and clears any
+    cached stationary center. Symmetric to the reset logic already
+    present in `LocationFilter.pending`. Regression test covers both
+    the Phase-A (candidate-only) and Phase-B (stationary-declared)
+    variants of the bug.
 - **Filter deadlock escape valve** (1.2.6):
   - Gap-aware accuracy gate changed from two-tier (normal ≤ 60 s / tight
     forever) to three-tier (normal ≤ 60 s / tight 60–120 s / relaxed
@@ -463,9 +506,11 @@ flowchart LR
   - `Database` sets `PRAGMA synchronous=NORMAL` explicitly alongside
     WAL mode so the crash-safety posture is reviewable in code rather
     than implicit in the iOS SQLite default.
-- **Distance filter (first gate).** Two layers ensure no points land closer
-  than 10 m: `CLLocationManager.distanceFilter = 10` and a defensive
-  per-insert check.
+- **Distance filter (first gate).** `CLLocationManager.distanceFilter` is
+  set to `kCLDistanceFilterNone` (1.2.7) so `KalmanSmoother` sees every
+  raw fix, but `LocationFilter.minDistance = 10 m` still enforces the
+  10 m gate on what gets persisted — the `points` table still holds
+  rows spaced ≥ 10 m apart.
 - **`LocationFilter` (second gate, GPS noise).** Rules applied in order:
   0. **Delivery age** (1.2.2, symmetric in 1.2.5) — `|now − timestamp| ≤ 10 s`.
      CoreLocation may replay cached locations after a signal gap; Apple's
@@ -503,13 +548,25 @@ flowchart LR
      the buffered point is confirmed as a spike and dropped
      (A → B(far) → C(near A)).
   7. Minimum distance — ≥ 10 m from the last accepted fix.
-- **`StationaryDetector` (third gate, jitter clusters).** After accepted
+- **`KalmanSmoother` (third stage, jitter smoothing).** Layered between
+  `LocationFilter.accept` and `StationaryDetector.consume`. 2D
+  constant-velocity Kalman filter in local ENU meters; uses CLLocation's
+  own `horizontalAccuracy` as measurement σ and a 2 m/s² process-noise
+  acceleration σ tuned for multi-modal use (walking, cycling, driving).
+  Resets on `dt > 10 s` so velocity state never carries across a GPS
+  blackout. Output coordinates flow on to `StationaryDetector` and the
+  `points` table; `fix_diagnostics` still records the raw CLLocation so
+  filter debugging is unaffected.
+- **`StationaryDetector` (fourth gate, jitter clusters).** After accepted
   fixes stay within 20 m of a candidate anchor for 150 s, the user is
   declared stationary and subsequent fixes are dropped until one lands more
-  than 30 m from the cluster center (10 m of hysteresis). Coordinates are
-  never smoothed or averaged — only accept/suppress decisions are made, and
-  `LocationFilter.lastAccepted` keeps advancing so the spike/speed gates
-  stay sane across long stationary windows.
+  than 30 m from the cluster center (10 m of hysteresis). A 1.2.7
+  gap-reset guard invalidates the candidate / stationary state when the
+  inter-sample gap exceeds 60 s, so a GNSS blackout cannot be
+  reinterpreted as sustained stationarity. Coordinates are never smoothed
+  or averaged *inside this stage* — smoothing happens upstream in
+  `KalmanSmoother` — and `LocationFilter.lastAccepted` keeps advancing so
+  the spike/speed gates stay sane across long stationary windows.
 - **Diagnostic channel.** Every raw `CLLocation` that enters
   `didUpdateLocations` — *before* the filter, not just accepted ones — is
   written to a local `fix_diagnostics` table with the filter verdict, then
@@ -604,8 +661,9 @@ cd backend && node --test test/
 # gradientColor, buildSegments — the pure functions behind the route view)
 cd frontend && npm test
 
-# iOS unit tests (52 cases across LocationFilter, Database drain,
-# MotionClassifier classify, and StationaryDetector state machine)
+# iOS unit tests (61 cases across LocationFilter, KalmanSmoother,
+# Database drain, MotionClassifier classify, and StationaryDetector
+# state machine)
 cd ios && xcodegen generate && xcodebuild test \
     -project GpsLogger.xcodeproj \
     -scheme GpsLoggerTests \
@@ -657,7 +715,8 @@ GpsLogger/
     │   ├── ContentView.swift
     │   ├── LocationTracker.swift     delegate, pipeline, diagnostic logging, runtime activityType swap
     │   ├── LocationFilter.swift      validity → source → accuracy → speed → spike
-    │   ├── StationaryDetector.swift  jitter-cluster suppression
+    │   ├── KalmanSmoother.swift      2D constant-velocity KF over accepted fixes
+    │   ├── StationaryDetector.swift  jitter-cluster suppression + gap-reset guard
     │   ├── MotionClassifier.swift    CMMotionActivityManager wrapper, emits transport mode
     │   ├── DeviceIdentity.swift      Keychain-backed UUID
     │   ├── SyncService.swift         points + diagnostics drains
@@ -667,7 +726,8 @@ GpsLogger/
     │   └── Info.plist
     └── GpsLoggerTests/
         ├── LocationFilterTests.swift      26 cases covering every filter gate + pending-timeout + deadlock-escape
+        ├── KalmanSmootherTests.swift       7 cases covering first-fix passthrough, noise attenuation, outlier damping, reset paths, ENU round-trip
         ├── DatabaseTests.swift            7 cases locking in the drain/retention invariants
         ├── MotionClassifierTests.swift    10 cases for the pure classification rules
-        └── StationaryDetectorTests.swift   9 cases for the Phase-A/B state machine + clock-skew guard
+        └── StationaryDetectorTests.swift  11 cases for the Phase-A/B state machine + clock-skew guard + gap-reset
 ```

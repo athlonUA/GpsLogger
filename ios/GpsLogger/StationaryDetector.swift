@@ -44,6 +44,7 @@ struct StationaryDetector {
     private let windowSeconds: TimeInterval
     private let stationaryRadius: CLLocationDistance
     private let resumeRadius: CLLocationDistance
+    private let gapResetSeconds: TimeInterval
 
     /// First fix of the current candidate cluster while not yet stationary.
     /// Reset whenever a fix lands outside `stationaryRadius`.
@@ -53,22 +54,58 @@ struct StationaryDetector {
     /// are still in "moving / evaluating" mode.
     private(set) var stationaryCenter: CLLocation?
 
+    /// Timestamp of the most recent fix we processed, whether accepted or
+    /// suppressed. Used to invalidate the candidate / stationary state
+    /// after a long signal-loss gap — see the gap-reset branch in
+    /// `consume(_:)`.
+    private(set) var lastSeen: Date?
+
     init(
         windowSeconds: TimeInterval = Config.stationaryWindowSeconds,
         stationaryRadius: CLLocationDistance = Config.stationaryRadiusMeters,
-        resumeRadius: CLLocationDistance = Config.stationaryResumeMeters
+        resumeRadius: CLLocationDistance = Config.stationaryResumeMeters,
+        gapResetSeconds: TimeInterval = Config.resumeGapSeconds
     ) {
         self.windowSeconds = windowSeconds
         self.stationaryRadius = stationaryRadius
         self.resumeRadius = resumeRadius
+        self.gapResetSeconds = gapResetSeconds
     }
 
     mutating func reset() {
         candidateAnchor = nil
         stationaryCenter = nil
+        lastSeen = nil
     }
 
     mutating func consume(_ loc: CLLocation) -> Decision {
+        // Gap-reset guard. `windowSeconds` is supposed to be evidence that
+        // the user was physically inside `stationaryRadius` for that long,
+        // which requires a continuous stream of fixes inside the cluster.
+        // If `LocationFilter` rejected every sample during a GPS blackout
+        // (tunnel, indoor, canopy), the candidate anchor quietly sits
+        // untouched — and then the first returning fix gets classified
+        // "stationary for 5 minutes" purely because of the clock delta,
+        // even though the user may have been walking the entire time. We
+        // observed exactly this in production (2026-04-17 session): after
+        // a 5-minute blackout, the four real movement fixes at
+        // 16:45:06–16:45:31 were suppressed as stationary-jitter because
+        // the anchor from 16:40:01 had "aged" past `windowSeconds`.
+        //
+        // Fix: if no fix was processed within `gapResetSeconds`, treat the
+        // returning fix as a fresh candidate anchor and drop any cached
+        // stationary center. This aligns with `LocationFilter`'s own
+        // `resumeGapSeconds` concept — both modules agree on what counts
+        // as "we lost the user" and reset state symmetrically.
+        if let last = lastSeen,
+           loc.timestamp.timeIntervalSince(last) > gapResetSeconds {
+            candidateAnchor = loc
+            stationaryCenter = nil
+            lastSeen = loc.timestamp
+            return .accept
+        }
+        lastSeen = loc.timestamp
+
         // Phase B — already stationary. Hold the suppression until we see a
         // fix clearly outside the cluster.
         if let center = stationaryCenter {

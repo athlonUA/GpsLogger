@@ -235,13 +235,20 @@ covers every device you've built for.
 
 ## How it works
 
-- **Collection**: `CLLocationManager` with `kCLLocationAccuracyBest`,
-  `distanceFilter = 10`, `pausesLocationUpdatesAutomatically = false`,
+- **Collection** (tightened 1.2.7): `CLLocationManager` with
+  `kCLLocationAccuracyBestForNavigation`,
+  `distanceFilter = kCLDistanceFilterNone`,
+  `pausesLocationUpdatesAutomatically = false`,
   `allowsBackgroundLocationUpdates = true`,
-  `showsBackgroundLocationIndicator = true`. Points are saved **only**
-  from `didUpdateLocations` callbacks — no timers are used for
-  collection. The tracker is started in `AppContainer.init` and runs
-  for the lifetime of the app; there is no Start/Stop button.
+  `showsBackgroundLocationIndicator = true`. `BestForNavigation` pulls
+  in additional accelerometer / gyroscope / barometer data and reduces
+  reported HA in partial-sky conditions; `kCLDistanceFilterNone`
+  delivers every computed fix (~1 Hz) so the downstream Kalman smoother
+  has 5–7× more observations to average against. Battery impact is
+  real and accepted as a product trade. Points are saved **only** from
+  `didUpdateLocations` callbacks — no timers are used for collection.
+  The tracker is started in `AppContainer.init` and runs for the
+  lifetime of the app; there is no Start/Stop button.
   The `didUpdateLocations` array is sorted ascending by timestamp
   before iteration (1.2.5 defensive sort) so a future iOS change in
   array ordering cannot corrupt the spike-buffer logic.
@@ -267,11 +274,9 @@ covers every device you've built for.
   motion coprocessor, the classifier emits `onUnavailable`, the
   tracker surfaces a `motionPermissionDenied` impairment in the UI,
   and `activityType` stays on `.fitness` for the rest of the session.
-- **Filter pipeline** (every fix passes distanceFilter → LocationFilter
+- **Filter pipeline** (every fix passes LocationFilter → KalmanSmoother
   → StationaryDetector before it lands in `points`):
-  1. **`CLLocationManager.distanceFilter = 10 m`** and a defensive
-     per-insert distance check (LocationFilter's minDistance rule).
-  2. **`LocationFilter`** — nine rules in order:
+  1. **`LocationFilter`** — nine rules in order:
      (a) **delivery age** (1.2.2, symmetric in 1.2.5) —
      `|now − timestamp| ≤ 10 s`. Rejects cached locations that
      CoreLocation replays after a signal gap; the 1.2.5 symmetric
@@ -304,13 +309,27 @@ covers every device you've built for.
      `Config.pendingTimeoutSeconds` (30 s) is discarded silently so
      an app-backgrounding event cannot corrupt the next session.
      (i) minimum distance — ≥ 10 m from the last accepted fix.
+  2. **`KalmanSmoother` (1.2.7)** — 2D constant-velocity Kalman filter
+     in local ENU meters. State `[x, y, vx, vy]`, process-noise
+     acceleration σ = 2 m/s² (multi-modal), measurement noise R from
+     CLLocation's own `horizontalAccuracy`². Resets on `dt > 10 s` so
+     velocity never carries across a GNSS blackout. Output
+     `CLLocation` preserves altitude / vertical accuracy / speed /
+     course from the raw input and reports the post-update
+     position-variance RMS as the new `horizontalAccuracy`. Raw
+     coordinates are still logged to `fix_diagnostics`, so filter
+     debugging is unaffected.
   3. **`StationaryDetector`** — after accepted fixes stay within 20 m
      of a candidate anchor for 150 s, suppresses subsequent fixes
      until one lands more than 30 m from the cluster center. The
      `age >= window` comparison is guarded against negative deltas
      (NTP correction, DST transition, cached replay) so a clock jump
-     cannot stall the detector in Phase A. Coordinates are never
-     smoothed or averaged — only accept/suppress decisions.
+     cannot stall the detector in Phase A. A 1.2.7 gap-reset guard
+     also invalidates the candidate / stationary state when the
+     inter-sample gap exceeds 60 s, so a GNSS blackout cannot be
+     reinterpreted as sustained stationarity. Coordinates are never
+     smoothed or averaged *inside this stage* — smoothing happens
+     upstream in `KalmanSmoother`.
 - **Tracking impairment UI**: `LocationTracker` publishes a
   `Set<TrackingImpairment>`, rendered as an orange banner at the top
   of `ContentView` whenever non-empty. Three cases:
@@ -351,6 +370,38 @@ covers every device you've built for.
   a multi-hour app relaunch is a first fix, not a first fix after gap,
   so the gap-aware rule is bypassed by design — the other gates
   (stale-delivery, validity, source, 50 m accuracy) have already run.
+- **High-density sampling + Kalman smoother (1.2.7)**: the 2026-04-17
+  session exposed the limits of the deterministic filter: 21 minutes
+  of walking under partial-sky / canopy produced 69 accepted fixes
+  all at HA=16 m or HA=32 m — Apple's own quality buckets — so the
+  visible track zigzagged by ±30 m around the true path despite
+  nothing being technically wrong with any individual sample. Three
+  changes address it:
+
+    1. `desiredAccuracy` promoted to `kCLLocationAccuracyBestForNavigation`
+       and `distanceFilter` dropped to `kCLDistanceFilterNone` — the
+       chip is given the inertial side-channels it needs and delivers
+       every computed fix (~1 Hz) instead of throttling at 10 m.
+    2. New `KalmanSmoother` module layered between `LocationFilter`
+       and `StationaryDetector`; it averages the denser stream against
+       a constant-velocity motion prior, collapsing per-sample HA
+       noise well below the chip's quantization bucket without
+       smearing sharp turns the way a coordinate-space moving average
+       would.
+    3. `StationaryDetector` gap-reset guard: the 2026-04-17 session
+       also lost 4 real movement points at 18:45:06–18:45:31 because
+       the detector interpreted a 5-minute GPS blackout as "user stood
+       still for 5 minutes". New rule: if no fix is processed within
+       `Config.resumeGapSeconds` (60 s), the returning fix becomes a
+       fresh candidate anchor rather than the confirmation of a
+       stationary window.
+
+  Battery impact of (1) is real — Apple flags `BestForNavigation` as
+  a "while plugged in / actively navigating" mode — and is accepted
+  as the product trade for continuous high-fidelity tracking. Process
+  noise σ_a defaults to 2 m/s² (multi-modal: walking, cycling,
+  typical driving); future transport modes can tune it without
+  touching the filter interface.
 - **Filter deadlock escape valve (1.2.6)**: the gap-aware accuracy
   gate is now three-tier (see filter rule (f) above). Fixes a
   self-reinforcing deadlock observed in the 2026-04-16 production
