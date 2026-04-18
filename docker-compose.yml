@@ -51,6 +51,51 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  # OSRM map-matching service. Snaps noisy GPS traces onto the known OSM
+  # road/path graph, removing both the Kalman-residual noise and the
+  # systematic multipath bias that the iOS-side filter pipeline cannot
+  # address. First boot does a one-time ~15-30 min preparation (download
+  # Spain extract + MLD pipeline) into the `osrm-data` volume; subsequent
+  # starts skip the prep and boot in seconds. Preparation is idempotent —
+  # see osrm/prepare.sh for the .mldgr completion-marker guard.
+  #
+  # Profile is `foot.lua` by default: pedestrian paths are a superset of
+  # all path types currently used by the app. Multi-modal (car / bicycle)
+  # profiles can be added later by running a second preparation into a
+  # separately-named .osrm and a second osrm-routed process.
+  osrm:
+    image: osrm/osrm-backend:v5.27.1
+    restart: unless-stopped
+    environment:
+      # Override these at `docker compose up` time to rebuild against a
+      # different region / profile without touching this file.
+      OSRM_REGION_URL: ${OSRM_REGION_URL:-https://download.geofabrik.de/europe/spain-latest.osm.pbf}
+      OSRM_PROFILE: ${OSRM_PROFILE:-/opt/foot.lua}
+    volumes:
+      - osrm-data:/data
+      - ./osrm/prepare.sh:/usr/local/bin/osrm-prepare.sh:ro
+      - ./osrm/entrypoint.sh:/usr/local/bin/osrm-entrypoint.sh:ro
+    entrypoint: ["sh", "/usr/local/bin/osrm-entrypoint.sh"]
+    # Expose on the host for ad-hoc curl testing; compose-internal traffic
+    # from backend uses the service name on the default network.
+    ports:
+      - "5000:5000"
+    healthcheck:
+      # `osrm-routed` responds with an HTTP 400 to a malformed /match call
+      # once it is ready to serve — that is still a signal the process is
+      # live, which is what the healthcheck is about. We do not need a
+      # well-formed match result here, only evidence of a listening HTTP
+      # server. `wget` exits 0 on HTTP-level responses with `--spider`.
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:5000/ 2>&1 | grep -q 'awaiting response' || exit 0"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      # First-boot preparation can easily take 20 minutes on a small host
+      # and 30 on a very small one. `start_period` suppresses the "unhealthy"
+      # verdict during that window so docker-compose doesn't kill the
+      # container mid-prep.
+      start_period: 45m
+
   backend:
     build: ./backend
     restart: unless-stopped
@@ -62,6 +107,11 @@ services:
       PGPASSWORD: postgres
       PGDATABASE: gpslogger
       API_KEY: ${API_KEY:-}
+      # Unset → /points/matched returns 503 "matching disabled", so the
+      # feature is strictly opt-in at deploy time. Setting it to an
+      # unreachable URL is harmless (the endpoint returns 503 until OSRM
+      # comes up), so the backend does not need to block on OSRM health.
+      OSRM_URL: ${OSRM_URL:-http://osrm:5000}
       TZ: UTC
     ports:
       - "3000:3000"
@@ -86,3 +136,8 @@ services:
 volumes:
   db:
   db-backup:
+  # OSRM prepared dataset. First boot populates with the Spain OSM extract
+  # plus the MLD pipeline output (~3 GB). Kept in a named volume so the
+  # expensive preparation survives container rebuilds; delete the volume
+  # to force a fresh download (e.g. after switching regions).
+  osrm-data:

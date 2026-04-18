@@ -138,7 +138,7 @@ the 1.2.1 clock-skew guard, and the 1.2.7 gap-reset guard:
   sub-meter tolerance at city scale so filter-space math does not
   silently shift coordinates
 
-### Backend validator unit tests
+### Backend unit tests (59 cases across validators + matcher)
 
 ```
 cd backend
@@ -146,7 +146,8 @@ node --test test/
 ```
 
 Covers `validate.js` — the pure input-validation layer that sits in front of every
-DB write and read.
+DB write and read — plus `matcher.js`, the map-matching pipeline that sits
+in front of `GET /points/matched`.
 
 **`validateBatch` (POST /points):**
 
@@ -181,6 +182,28 @@ DB write and read.
 **`validateRange` (GET /points):**
 
 - requires `device_id`, parses optional `from`/`to`, rejects invalid dates, rejects `from > to`
+
+**`matcher` (GET /points/matched, 1.3.0 — 24 cases):**
+
+- `splitByTimeGap`: empty input, single-point, continuous trace,
+  5-min gap splits into two segments, gap at threshold is NOT split
+  (strict `>` boundary)
+- `chunkBySize`: short segment returns single chunk, 150-point
+  segment splits into 100 + 51 with a 1-point seam, 100-point segment
+  at boundary yields one chunk (no 1-point tail left over)
+- `buildMatchUrl`: lon,lat coordinate ordering (reverse of lat,lon —
+  a common OSRM footgun), literal `;` separator (not URL-encoded —
+  OSRM rejects `%3B`), radiuses / timestamps / options serialization,
+  trailing slash on base URL is trimmed
+- `parseMatchResponse`: happy path snaps every tracepoint, `null`
+  tracepoint falls back to raw for that slot, `code != 'Ok'` returns
+  all-raw, malformed JSON returns all-raw
+- `matchTrace` end-to-end with injected `fetchImpl`: empty input,
+  no `OSRM_URL` returns raw-echo with zero matches, HTTP error falls
+  back to raw, thrown error falls back to raw and emits a `log.warn`,
+  250-point trace splits into 3 OSRM requests and stitches in order,
+  two time-gap-separated trips produce two independent OSRM calls,
+  single-point segment bypasses OSRM entirely
 
 The DB layer itself is intentionally thin (parameterized inserts and a single
 filter+sort select) and is exercised end-to-end via the smoke tests below.
@@ -825,6 +848,127 @@ here: source gate (#22 is a sanity touch, not a re-validation),
 `LocationFilter`'s gap-aware three-tier gate (1.2.6), spike buffer,
 sync/backoff, BGTaskScheduler, backend API, frontend visualization
 logic, Docker stack. Scenarios #1–18 cover those.
+
+## 1.3.0 map-matching regression plan
+
+Targeted regression for the OSRM-based `/points/matched` endpoint and
+the frontend Raw/Matched toggle. Verifies:
+
+- **M1** — OSRM comes up cleanly from a cold `docker compose up` and
+  the one-time preparation completes without manual intervention.
+- **M2** — a straight outdoor walk on a mapped sidewalk renders
+  visually on the road/path polyline, removing the residual
+  Kalman zigzag.
+- **M3** — multipath bias cases (track appearing parallel to a road
+  instead of on it) are cured by snapping.
+- **M4** — off-graph edge cases (open fields, unmapped paths) fall
+  back to raw gracefully without breaking the polyline.
+- **M5** — the toggle self-disables when `OSRM_URL` is unset, so a
+  deployment without OSRM still renders raw tracks.
+
+Prereqs: frontend footer shows 1.3.0 build, `docker compose ps` lists
+five services (db, db-backup, osrm, backend, frontend) and `osrm` is
+healthy (the `start_period: 45m` grace window means first boot is
+slow — watch logs with `docker compose logs -f osrm`), Device ID
+copied as `<DEV>`.
+
+### 23. Cold-boot OSRM preparation (1.3.0, M1)
+
+Baseline that the preparation pipeline runs end-to-end without manual
+intervention on a clean volume.
+
+- `docker compose down -v && docker compose up --build` (the `-v`
+  wipes the `osrm-data` volume so we re-exercise preparation).
+- Watch `docker compose logs -f osrm`. Expected line sequence over
+  ~15–30 min on a modest host:
+  1. `[osrm-prepare] Downloading https://download.geofabrik.de/europe/spain-latest.osm.pbf...`
+  2. `[osrm-prepare] osrm-extract...`
+  3. `[osrm-prepare] osrm-partition...`
+  4. `[osrm-prepare] osrm-customize...`
+  5. `[osrm-prepare] Complete. Ready to serve from /data/spain-latest.osrm`
+  6. `[osrm] starting osrm-routed on /data/spain-latest.osrm (algorithm=mld)`
+- Sanity: once the service is healthy,
+  ```
+  curl -s 'http://localhost:5000/match/v1/foot/-0.3830,39.4847;-0.3829,39.4848?overview=false&timestamps=1776443700;1776443705&radiuses=25;25' | jq '.code'
+  ```
+  should return `"Ok"` (or `"NoMatch"` for those specific coords —
+  either is fine; `"InvalidUrl"` or a connection refusal is not).
+- Restart containers: `docker compose restart osrm`. Logs should
+  print `[osrm-prepare] Already prepared at ... — skipping.` and the
+  service should be healthy again within ~10 s.
+
+### 24. Straight walk renders on the road (1.3.0, M2)
+
+Primary acceptance test — the reason this whole feature exists.
+
+- Open the frontend, enter Device ID, pick a time window covering a
+  known straight-sidewalk walk from a recent 1.2.7 session.
+- Toggle **Snap to roads** on, click **Visualize**.
+- Expected: the rendered polyline sits on top of the sidewalk in the
+  basemap, without the ±20 m residual zigzag from 1.2.7. Status bar
+  shows **"N / N snapped to roads"** (100 % ratio, or very close).
+- Toggle **Snap to roads** off → polyline snaps back to the raw
+  zigzag. Flip the toggle back and forth a few times and confirm
+  both renders are stable (no stale data bleeding).
+
+### 25. Parallel-road bias gets corrected (1.3.0, M3)
+
+The case map-matching is uniquely good at: trace is offset from the
+true road by ~15–30 m due to multipath from tall buildings, so the
+Kalman output is a clean line in the *wrong place*.
+
+- Find a historical session through urban canyon (downtown, between
+  tall buildings) where raw 1.2.7 output visibly ran alongside a
+  road rather than on it.
+- Raw view: line is offset from the road (in the adjacent
+  sidewalk/building).
+- Snap-to-roads view: line should sit on the road itself.
+- Confidence metadata: the status bar should still read a high
+  `matched / total` ratio (≥ 80 %). If many rows fail to match on a
+  known-mapped road, check OSRM logs for `NoMatch` — our default
+  25 m radius may be tight for severe bias; bumping
+  `DEFAULT_RADIUS_METERS` or piping per-row HA from `fix_diagnostics`
+  is the next lever.
+
+### 26. Off-graph edge case falls back gracefully (1.3.0, M4)
+
+Verifies that map-matching does not silently destroy data for a walk
+that took a footpath not in OSM (park shortcut, unmarked alley,
+private campus path).
+
+- Pick a session that includes a segment crossing an open park (grass)
+  or an unmarked shortcut.
+- Snap-to-roads view: the on-road portions snap cleanly; the off-graph
+  segment renders as a raw polyline (points carry `matched: false` in
+  the API). No segment disappears entirely; the line stays continuous.
+- Status bar shows partial match, e.g. **"120 / 180 snapped to roads"**.
+- Open browser devtools → Network → inspect the `/api/points/matched`
+  response body. `data[i].matched` should be `false` for the off-graph
+  segment and `true` elsewhere.
+
+### 27. Frontend self-disables when OSRM is absent (1.3.0, M5)
+
+Deployment without OSRM still works — the toggle just becomes a no-op.
+
+- Edit `docker-compose.yml` temporarily (or `docker compose stop osrm`),
+  restart the backend. Confirm with:
+  ```
+  curl -i http://localhost:3000/points/matched?device_id=X&from=...&to=...
+  ```
+  returns HTTP 503 with `{"error":"map_matching_disabled"}`.
+- In the frontend with **Snap to roads** toggled on, click **Visualize**.
+- Expected: points load (falling back to raw) and the toggle becomes
+  **disabled + unchecked** with tooltip *"Map-matching service not
+  configured on the backend"*. No scary error in the status bar.
+- Bring OSRM back (`docker compose start osrm`) and reload the page.
+  The toggle re-enables and the feature works again.
+
+**Out of scope for the 1.3.0 round.** iOS tracker, filter pipeline,
+sync, BGTaskScheduler, and the raw `/points` endpoint are unchanged
+and covered by scenarios #1–22. OSRM profile selection beyond `foot`
+(multi-modal car / bicycle snap), per-row dynamic radius from
+`fix_diagnostics`, and side-by-side raw+matched overlay are deferred
+follow-ups.
 
 ## Inspecting fix_diagnostics after an anomaly
 

@@ -11,10 +11,11 @@ Minimal end-to-end GPS tracking system.
 | Component | Tech | Purpose |
 |---|---|---|
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in batches; second channel uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
-| **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
+| **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range, serve raw and map-matched traces |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, for debugging) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a gradient polyline |
-| **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
+| **OSRM** (`osrm/`) | osrm/osrm-backend v5.27 | map-matching service: snaps noisy GPS traces to the OpenStreetMap road/path graph on demand (1.3.0, opt-in via `OSRM_URL`) |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a gradient polyline; Raw / Snap-to-roads toggle (1.3.0) |
+| **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB + OSRM bring-up |
 
 ## Data contract
 
@@ -121,6 +122,76 @@ optional. Returns an array **sorted ASC by `created_at`**:
 ]
 ```
 
+### `GET /points/matched?device_id=<id>&from=<ISO>&to=<ISO>` (1.3.0)
+
+Same query shape and response envelope as `GET /points`, but every row's
+coordinates are snapped to the OpenStreetMap path graph via the OSRM
+`/match` endpoint before being returned. The goal is cosmetic-but-
+measurable: removing both the Kalman-residual zigzag and the systematic
+multipath bias that on-device filtering cannot address, so a rendered
+polyline follows the actual sidewalk / road instead of a shape offset
+by 10–30 m.
+
+Requires `OSRM_URL` to be set in the backend environment (pointing at a
+reachable OSRM service, e.g. `http://osrm:5000` on the compose network).
+If unset, the endpoint returns **HTTP 503 `map_matching_disabled`** so
+the frontend can disable its toggle instead of silently degrading.
+
+```json
+{
+  "data": [
+    {
+      "id": 42,
+      "latitude": 39.4847,
+      "longitude": -0.3830,
+      "created_at": "2026-04-17T16:37:47.975Z",
+      "matched": true
+    },
+    {
+      "id": 43,
+      "latitude": 39.4848,
+      "longitude": -0.3829,
+      "created_at": "2026-04-17T16:37:50.123Z",
+      "matched": false
+    }
+  ],
+  "truncated": false,
+  "matched_count": 1,
+  "total_count": 2
+}
+```
+
+Semantics:
+
+- `data[*].matched = true` → the row carries the snapped lat/lon from
+  OSRM. The original coordinates are not echoed; use the raw `/points`
+  endpoint if you need them for side-by-side comparison.
+- `data[*].matched = false` → OSRM rejected this specific tracepoint
+  (low confidence, off-graph, or part of a single-point segment with
+  nothing to match against), and the raw coordinates are echoed so the
+  rendered polyline stays continuous.
+- `matched_count` / `total_count` — aggregate snap ratio so the UI can
+  display "*N / M snapped to roads*" without scanning the array.
+
+Implementation:
+
+- Points are split into trip segments on any inter-sample gap > 5 min
+  (matching the frontend's existing polyline-split rule), because
+  OSRM's HMM assumes a continuous trace.
+- Within each trip, further split into OSRM requests of ≤ 100 points
+  with a 1-point overlap so each batch after the first has a warm HMM
+  seed. Typical walking sessions fit into one OSRM call.
+- Per-point `radius = 25 m` (uniform). The `points` table doesn't
+  carry `horizontal_accuracy` — a future optimization is a JOIN on
+  `fix_diagnostics(device_id, fix_timestamp)` for per-row radius.
+- Profile is `foot` (see `osrm/prepare.sh`). Multi-modal profile
+  selection is a future feature; `foot` is a safe default because
+  walker-accessible paths are a superset of what a city phone trace
+  actually touches.
+- Degradation on error: an unreachable OSRM, a non-2xx response, or a
+  network timeout (`OSRM_TIMEOUT_MS = 15 s` per chunk) collapses into
+  raw-echo for that chunk. The endpoint never throws at the caller.
+
 ### Schema
 
 ```sql
@@ -219,12 +290,13 @@ Postgres is authoritative for everything.
 docker compose up --build
 ```
 
-Brings up four services:
+Brings up five services:
 
 | Service | Host port | Purpose |
 |---|---|---|
 | **db** | `5434` (→ container `5432`) | Postgres 16, data in the `db` named volume |
 | **db-backup** | — | Sidecar that runs `pg_dump -Fc` into the `db-backup` named volume once every 24 h with 7-day retention (`find -mtime +7 -delete`). `tmpfs` mounted over `/var/lib/postgresql/data` to avoid Docker creating an anonymous volume for the postgres image's declared VOLUME |
+| **osrm** | `5000` | OSRM map-matching engine. First boot downloads the Spain OSM extract (~800 MB) and runs the MLD preparation pipeline (`osrm-extract` + `osrm-partition` + `osrm-customize`, ~15–30 min CPU) into the `osrm-data` named volume; subsequent starts skip the prep via a `.mldgr` completion marker. Serves the `/match/v1/foot` endpoint consumed by the backend's `GET /points/matched`. Override `OSRM_REGION_URL` to switch regions without rebuilding |
 | **backend** | `3000` | Express API |
 | **frontend** | `3001` | nginx serving the built SPA + `/api/*` reverse proxy to `backend:3000` |
 
@@ -308,9 +380,10 @@ flowchart LR
     subgraph compose["docker-compose stack"]
         direction LR
         nginx["nginx<br/>frontend container"]
-        backend["Express API<br/>POST /points<br/>GET /points<br/>POST /diagnostics"]
+        backend["Express API<br/>POST /points<br/>GET /points<br/>GET /points/matched<br/>POST /diagnostics"]
         db[("Postgres 16<br/>points<br/>fix_diagnostics")]
         dbbackup["db-backup<br/>pg_dump -Fc daily<br/>7-day retention"]
+        osrm["OSRM<br/>osrm-routed --algorithm mld<br/>/match/v1/foot"]
     end
 
     iOS -->|"HTTP batches every 30s<br/>points + diagnostics"| backend
@@ -320,6 +393,7 @@ flowchart LR
     nginx -->|"reverse proxy /api/*"| backend
     backend --> db
     db --> backend
+    backend -.->|"GET /match/v1/foot<br/>(on /points/matched)"| osrm
     dbbackup -->|nightly dump| db
 ```
 
@@ -586,12 +660,13 @@ flowchart LR
 
 ### Backend — minimalism
 
-- Three routes + health endpoint: `POST /points`, `GET /points`,
-  `POST /diagnostics`. No envelopes, no extra layers. Optional
-  `API_KEY` bearer-token auth gates the two POST routes — compared
-  with `crypto.timingSafeEqual` so the key prefix doesn't leak
-  through a response-time side channel. `GET /health` and `GET /points`
-  are unprotected so the frontend and Docker healthcheck keep working
+- Four routes + health endpoint: `POST /points`, `GET /points`,
+  `GET /points/matched` (1.3.0), `POST /diagnostics`. No envelopes, no
+  extra layers. Optional `API_KEY` bearer-token auth gates the two
+  POST routes — compared with `crypto.timingSafeEqual` so the key
+  prefix doesn't leak through a response-time side channel.
+  `GET /health`, `GET /points`, and `GET /points/matched` are
+  unprotected so the frontend and Docker healthcheck keep working
   without a token.
 - `GET /health` runs `SELECT 1` against the pool and returns 503 on
   failure, so the Docker healthcheck reflects actual DB reachability,
@@ -617,6 +692,17 @@ flowchart LR
 - Pure-function input validators with a dedicated unit-test suite
   (35 tests covering `validateBatch`, `validateDiagnosticsBatch`, and
   `validateRange`).
+- **Map-matching (1.3.0).** `GET /points/matched` runs the same
+  range-scan as `GET /points` and then pipes the result through
+  `src/matcher.js`, which batches the trace by ≤ 5 min trip gaps and
+  ≤ 100-point OSRM chunks (1-point overlap for HMM warm-seeding),
+  calls OSRM's `/match/v1/foot` with per-point radiuses + timestamps,
+  and stitches the snapped coordinates back in input order. Any
+  tracepoint OSRM rejects falls back to the raw coord so the rendered
+  polyline is continuous. The endpoint returns **503
+  `map_matching_disabled`** when `OSRM_URL` is unset, so the frontend
+  can self-disable its toggle. 24 unit tests cover the pipeline end
+  to end with an injected `fetchImpl` so no live OSRM is required.
 
 ### Frontend — visualization
 
@@ -654,7 +740,8 @@ flowchart LR
 ## Tests
 
 ```bash
-# backend unit tests (35 cases: validateBatch + validateDiagnosticsBatch + validateRange)
+# backend unit tests (59 cases: validateBatch + validateDiagnosticsBatch +
+# validateRange + matcher pipeline end-to-end with injected fetchImpl)
 cd backend && node --test test/
 
 # frontend unit tests (20 cases covering splitByTimeGaps, downsampleGroups,
@@ -679,7 +766,10 @@ query workflow after an anomaly): see [`QA.md`](QA.md).
 GpsLogger/
 ├── README.md                this file
 ├── QA.md                    test plan + fix_diagnostics query workflow
-├── docker-compose.yml       db + db-backup + backend + frontend
+├── docker-compose.yml       db + db-backup + osrm + backend + frontend
+├── osrm/                    1.3.0 map-matching service
+│   ├── prepare.sh           idempotent OSM extract download + MLD pipeline
+│   └── entrypoint.sh        prepare-then-serve wrapper for osrm-routed
 ├── backend/
 │   ├── Dockerfile
 │   ├── package.json
@@ -689,9 +779,9 @@ GpsLogger/
 │   │   ├── 003_fix_diagnostics.sql
 │   │   ├── 004_idempotency.sql
 │   │   └── 005_cleanup.sql
-│   ├── src/{index,db,log,validate}.js
+│   ├── src/{index,db,log,validate,matcher}.js
 │   ├── src/routes/{points,diagnostics}.js
-│   └── test/validate.test.js
+│   └── test/{validate,matcher}.test.js
 ├── frontend/
 │   ├── Dockerfile           multi-stage: Node build → nginx serve
 │   ├── nginx.conf           static files + /api/* proxy to backend
