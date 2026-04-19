@@ -249,4 +249,55 @@ enum Config {
         }
         return ""
     }
+
+    // MARK: - Wi-Fi-only sync policy
+
+    /// Per-request URLSession timeout. Short enough that a broken backend
+    /// doesn't park the radio on for minutes, long enough that a healthy
+    /// LAN round-trip completes comfortably.
+    static let syncRequestTimeoutSeconds: TimeInterval = 15
+
+    /// Build the `URLSessionConfiguration` used by `SyncService`. This is
+    /// the **OS-level** half of the Wi-Fi-only policy — even if a higher
+    /// layer misses a check, the system itself will refuse to carry the
+    /// traffic. The flags disable:
+    ///   - `allowsCellularAccess` — LTE/5G.
+    ///   - `allowsExpensiveNetworkAccess` — iOS classes personal hotspot
+    ///     and tethered-phone-as-modem as "expensive"; we don't want to
+    ///     drain a peer's cellular either.
+    ///   - `allowsConstrainedNetworkAccess` — Low Data Mode networks.
+    /// Complemented by `NWPathMonitor` pre-checks in `SyncService` so we
+    /// don't even create a task when the current path is disallowed.
+    static func makeSyncSessionConfiguration() -> URLSessionConfiguration {
+        let cfg = URLSessionConfiguration.default
+        cfg.allowsCellularAccess = false
+        cfg.allowsExpensiveNetworkAccess = false
+        cfg.allowsConstrainedNetworkAccess = false
+        cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForRequest = syncRequestTimeoutSeconds
+        cfg.timeoutIntervalForResource = syncRequestTimeoutSeconds
+        return cfg
+    }
+
+    /// UserDefaults key that gates the `fix_diagnostics` observability
+    /// channel (see below).
+    static let syncDiagnosticsEnabledKey = "syncDiagnosticsEnabled"
+
+    /// Whether to write raw-fix diagnostic rows to the local SQLite store
+    /// **and** upload them to the backend. `false` by default: the channel
+    /// existed to tune the 1.2.x filter thresholds, and with tracking
+    /// quality now stable it is pure overhead — ~95% of both local writes
+    /// and uplink bytes on a typical walk come from this one table.
+    ///
+    /// Flip at runtime without a rebuild when a new tuning campaign
+    /// starts (e.g. cycling / automotive filter work):
+    ///     `defaults write com.gpslogger.personal syncDiagnosticsEnabled -bool YES`
+    /// …then kill + relaunch so `LocationTracker` and `SyncService` both
+    /// pick up the change. Leaves the table definition intact so any rows
+    /// written before the flag is flipped off continue to drain normally,
+    /// and any rows written while it's on are not lost if the user flips
+    /// it off mid-session.
+    static var syncDiagnosticsEnabled: Bool {
+        UserDefaults.standard.bool(forKey: syncDiagnosticsEnabledKey)
+    }
 }

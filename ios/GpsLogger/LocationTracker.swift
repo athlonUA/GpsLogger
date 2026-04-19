@@ -614,25 +614,31 @@ extension LocationTracker: CLLocationManagerDelegate {
 
             // Debug observability: snapshot every raw fix with its full
             // set of CLLocation fields plus the composed filter +
-            // stationary verdict. Offloaded to `persistQueue` so the
-            // synchronous SQLite insert does not block the CoreLocation
-            // main-thread callback. Order is preserved because
-            // `persistQueue` is serial.
-            let snapshot = FixDiagnostic(
-                fixTimestamp: loc.timestamp,
-                latitude: loc.coordinate.latitude,
-                longitude: loc.coordinate.longitude,
-                horizontalAccuracy: loc.horizontalAccuracy,
-                verticalAccuracy: loc.verticalAccuracy,
-                altitude: loc.altitude,
-                speed: loc.speed,
-                speedAccuracy: loc.speedAccuracy,
-                course: loc.course,
-                courseAccuracy: loc.courseAccuracy,
-                decision: diagnosticTag(decision, stationarySuppressed: stationarySuppressed)
-            )
-            persistQueue.async { [database] in
-                database.logDiagnostic(snapshot)
+            // stationary verdict. Gated on `Config.syncDiagnosticsEnabled`
+            // (default false) — the channel was scaffolding for the 1.2.x
+            // filter tuning and is pure overhead in steady-state use
+            // (~95% of disk writes and uplink bytes without it). When off,
+            // we skip the entire snapshot + queue hop, not just the SQLite
+            // write, so CoreLocation callbacks are as light as possible.
+            // Flip the flag at runtime when a new tuning campaign starts;
+            // see `Config.syncDiagnosticsEnabled`.
+            if Config.syncDiagnosticsEnabled {
+                let snapshot = FixDiagnostic(
+                    fixTimestamp: loc.timestamp,
+                    latitude: loc.coordinate.latitude,
+                    longitude: loc.coordinate.longitude,
+                    horizontalAccuracy: loc.horizontalAccuracy,
+                    verticalAccuracy: loc.verticalAccuracy,
+                    altitude: loc.altitude,
+                    speed: loc.speed,
+                    speedAccuracy: loc.speedAccuracy,
+                    course: loc.course,
+                    courseAccuracy: loc.courseAccuracy,
+                    decision: diagnosticTag(decision, stationarySuppressed: stationarySuppressed)
+                )
+                persistQueue.async { [database] in
+                    database.logDiagnostic(snapshot)
+                }
             }
         }
     }
