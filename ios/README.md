@@ -27,16 +27,20 @@ ios/
 │   ├── StationaryDetector.swift        ← jitter-cluster suppression + clock-skew guard
 │   ├── MotionClassifier.swift          ← CMMotionActivityManager wrapper, emits transport mode
 │   ├── DeviceIdentity.swift            ← Keychain-backed UUID (UserDefaults fallback)
-│   ├── SyncService.swift               ← sync timer + private syncQueue + HTTP upload
+│   ├── SyncService.swift               ← Wi-Fi-only sync timer + private syncQueue + HTTP upload
 │   ├── Database.swift                  ← raw sqlite3 wrapper (points + fix_diagnostics)
-│   ├── Config.swift                    ← tunables + apiBaseURL resolver
+│   ├── KalmanSmoother.swift            ← 2D constant-velocity KF over accepted fixes (1.2.7)
+│   ├── Config.swift                    ← tunables + apiBaseURL resolver + Wi-Fi URLSession factory + diagnostics flag
 │   ├── GpsLogger.entitlements
 │   └── Info.plist                      ← reference plist with required keys
 └── GpsLoggerTests/
-    ├── LocationFilterTests.swift       ← 26 cases covering every filter gate + pending-timeout + deadlock-escape
-    ├── DatabaseTests.swift              ← 7 cases for insert/fetch/delete/retention invariants
+    ├── LocationFilterTests.swift       ← 20 cases covering every filter gate + pending-timeout + automotive spike-jump widening
+    ├── KalmanSmootherTests.swift        ←  9 cases covering first-fix passthrough, attenuation, outlier damping, reset paths, ENU round-trip
+    ├── DatabaseTests.swift              ←  7 cases for insert/fetch/delete/retention invariants
     ├── MotionClassifierTests.swift     ← 10 cases for the pure classification rules
-    └── StationaryDetectorTests.swift    ← 9 cases for Phase-A/B state machine + clock-skew guard
+    ├── StationaryDetectorTests.swift   ← 11 cases for Phase-A/B state machine + clock-skew guard + gap-reset
+    ├── TrackingImpairmentTests.swift    ←  7 cases for the 1.2.8 silent-failure mappings
+    └── SyncPolicyTests.swift           ← 10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config + diagnostics flag
 ```
 
 ## One-time setup (xcodegen-based)
@@ -378,6 +382,36 @@ covers every device you've built for.
   a multi-hour app relaunch is a first fix, not a first fix after gap,
   so the gap-aware rule is bypassed by design — the other gates
   (stale-delivery, validity, source, 50 m accuracy) have already run.
+- **Wi-Fi-only uploads + opt-in diagnostics (1.2.10)**: battery-first,
+  LAN-first product policy — uploads must never run on cellular,
+  personal hotspot, or Low Data Mode. Enforcement is defense-in-depth:
+  a `ReachabilitySnapshot` derived from `NWPathMonitor` gates every
+  drain (`isSatisfied && usesWifi && !isExpensive && !isConstrained`),
+  and the `URLSession` is built with `allowsCellularAccess = false`,
+  `allowsExpensiveNetworkAccess = false`, and
+  `allowsConstrainedNetworkAccess = false` so the OS itself refuses to
+  carry the traffic if the predicate ever misfires. A Wi-Fi-regained
+  transition resets the backoff to the base 30 s so accumulated queue
+  drains on the next tick. `fix_diagnostics` is gated behind
+  `Config.syncDiagnosticsEnabled` (UserDefaults, default `false`) —
+  the channel was scaffolding for the 1.2.x filter audits and produced
+  ~95% of on-device writes and uplink bytes on a typical walk. When
+  off, `LocationTracker` skips snapshot construction + queue hop, and
+  `SyncService.drainDiagnostics` early-returns. Table, backend endpoint,
+  and 3-day retention are unchanged, so legacy rows continue to drain
+  on the next Wi-Fi window. Flip at runtime for the next tuning
+  campaign:
+
+  ```
+  defaults write com.gpslogger.personal syncDiagnosticsEnabled -bool YES
+  ```
+
+  then kill + relaunch so both callers re-read the flag. 10 new tests
+  in `SyncPolicyTests` cover the predicate across every combination
+  (cellular / hotspot / Low Data Mode / offline / wired / Wi-Fi-happy
+  / pessimistic default), the URLSession configuration flags, and the
+  diagnostics flag default + override.
+
 - **Audit-driven simplification (1.2.9)**: an independent review of
   `LocationFilter` / `KalmanSmoother` / `StationaryDetector` against
   9,300 `fix_diagnostics` rows from two devices over four days drove
@@ -544,29 +578,47 @@ covers every device you've built for.
     after upgrade.
   - `fix_diagnostics(id, logged_at, fix_timestamp, latitude, longitude,
     horizontal_accuracy, vertical_accuracy, altitude, speed, speed_accuracy,
-    course, course_accuracy, decision)` — debug/observability table capturing
-    every raw `CLLocation` that enters `LocationTracker.didUpdateLocations`
-    together with the filter's decision. **Uploaded** on the same 30 s sync
+    course, course_accuracy, decision)` — opt-in since 1.2.10. When
+    `Config.syncDiagnosticsEnabled` is `true`, every raw `CLLocation` that
+    enters `LocationTracker.didUpdateLocations` is captured here together
+    with the filter's decision. **Uploaded** on the same 30 s Wi-Fi sync
     cadence as `points` (see below); the authoritative store is the backend
     Postgres table. Local rows are deleted on successful 2xx; a 3-day
     retention window in `cleanupDiagnostics` covers prolonged backend
-    outages. See `QA.md` for how to query the backend after an anomaly.
+    outages and also drains legacy rows left over from before the flag was
+    flipped off. Default is `false` — the channel was scaffolding for the
+    1.2.x filter tuning and produced ~95% of disk writes and uplink bytes
+    on a typical walk. Enable at runtime for the next tuning campaign:
+    `defaults write com.gpslogger.personal syncDiagnosticsEnabled -bool YES`
+    (restart required). See `QA.md` for how to query the backend after an
+    anomaly.
 - **Sync**: a `Timer` (the only in-app timer) fires every 30 s and runs
   two independent drains on a private serial `syncQueue`:
   - `points` → `POST /points` — drives the visible trace. Pulls up to 100
     rows, stamps the device ID on each payload element (from the injected
     `SyncService.deviceId`, not per-row), and deletes on 2xx.
   - `fix_diagnostics` → `POST /diagnostics` — mirror shape of the points
-    drain. Each channel has its own in-flight guard so one slow response
-    cannot stall the other.
+    drain. Gated (1.2.10) on `Config.syncDiagnosticsEnabled`; when the
+    flag is false the channel short-circuits with no fetch and no HTTP.
+    Each channel has its own in-flight guard so one slow response cannot
+    stall the other.
+
+  **Wi-Fi-only uploads (1.2.10).** Both channels gate on a
+  `ReachabilitySnapshot` derived from `NWPathMonitor` — any
+  non-Wi-Fi path (cellular, personal hotspot, Low Data Mode) skips the
+  drain entirely. The `URLSession` is constructed via
+  `Config.makeSyncSessionConfiguration()` with
+  `allowsCellularAccess`, `allowsExpensiveNetworkAccess`, and
+  `allowsConstrainedNetworkAccess` all `false`, so even a logic bug
+  above cannot leak bytes onto cellular. A Wi-Fi-regained transition
+  resets the backoff interval to the base 30 s so a queue accumulated
+  during the offline window drains promptly.
 
   HTTP outcomes are classified (1.2.4): 2xx resets the backoff interval;
   network errors / 408 / 429 / 5xx double it up to a 5-min cap; every
   other 4xx holds the interval steady and logs loudly so a schema drift
-  or rotated API key is visible within seconds. `NWPathMonitor`
-  short-circuits the drain when there is no usable network, preventing
-  15 s URLSession-timeout spins. The same code path is exposed as
-  `drainOnce(completion:)` and invoked by a registered
+  or rotated API key is visible within seconds. The same code path is
+  exposed as `drainOnce(completion:)` and invoked by a registered
   `BGAppRefreshTask` so the local queue drains in background even when
   the `Timer` is suspended. Failures stay in the local DB for the next
   tick — no partial delete, no retry storms; replay safety is

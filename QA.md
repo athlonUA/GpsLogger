@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (64 cases across 6 test files)
+### iOS unit tests (74 cases across 7 test files)
 
 ```
 cd ios
@@ -155,6 +155,26 @@ mapping helpers. Pure static functions, testable without mocking
 - new 1.2.8 impairment messages mention user-actionable guidance
   (Settings / force-quit terminology) so the banner is never a
   dead-end warning
+
+**`SyncPolicyTests` (10 cases)** — the 1.2.10 Wi-Fi-only enforcement:
+
+- `ReachabilitySnapshot.isWifiOnlyReachable` predicate across every
+  combination: Wi-Fi-happy (accept), pessimistic default before
+  NWPathMonitor publishes (reject), cellular (reject via `!usesWifi`
+  + `isExpensive`), personal hotspot (reject: Wi-Fi link but
+  `isExpensive = true`), Low Data Mode (reject via `isConstrained`),
+  airplane mode / offline (reject via `!isSatisfied`), wired /
+  loopback-only default route (reject because `usesWifi = false`)
+- `Config.makeSyncSessionConfiguration()` regression guard —
+  `allowsCellularAccess`, `allowsExpensiveNetworkAccess`, and
+  `allowsConstrainedNetworkAccess` all `false`;
+  `waitsForConnectivity = false`;
+  `timeoutIntervalForRequest == Config.syncRequestTimeoutSeconds`
+- `Config.syncDiagnosticsEnabled` default is `false` (purge any
+  stray UserDefaults override before asserting)
+- `Config.syncDiagnosticsEnabled` honors a UserDefaults override
+  (`defaults write … syncDiagnosticsEnabled -bool YES`) so the
+  runtime enable path works without a rebuild
 
 ### Backend validator unit tests
 
@@ -370,9 +390,23 @@ All scenarios assume:
 - `docker-compose up --build` has run on the Mac (migrations 001–005 applied)
 - iPhone has the app installed with `API_BASE_URL` in
   `ios/GpsLogger.xcconfig` pointing to the Mac's current LAN IP
-- iPhone and Mac share the same Wi-Fi network
+- iPhone and Mac share the same Wi-Fi network (**required** since
+  1.2.10 — sync skips on cellular, personal hotspot, and Low Data Mode;
+  the URLSession itself is built with `allowsCellularAccess = false`)
 - Location permission is **Always**; Motion & Fitness permission is
   allowed (both prompts appear on first launch)
+- For any scenario that reads `fix_diagnostics` below, **diagnostics
+  must be enabled on the device** (off by default since 1.2.10). On the
+  iPhone via Xcode or a preconfigured profile, or via a dev Mac while
+  the phone is mirroring its defaults:
+
+  ```
+  defaults write com.gpslogger.personal syncDiagnosticsEnabled -bool YES
+  ```
+
+  Kill + relaunch the app so `LocationTracker` and `SyncService`
+  re-read the flag. Sessions recorded while the flag is off will have
+  no corresponding `fix_diagnostics` rows at all.
 
 > The iOS app is **always-on**: there is no Start/Stop button. Tracking begins
 > in `AppContainer.init` and the pulsing green dot in the top-right corner
@@ -864,15 +898,96 @@ repair biased measurements), stationary detector, sync/backoff,
 BGTaskScheduler, backend API, frontend visualization, Docker stack.
 Scenarios #1–22 cover those.
 
+## 1.2.10 Wi-Fi-only uploads regression plan
+
+Field regression for the 1.2.10 sync-policy changes. All scenarios
+assume the iPhone footer reads `v1.2.10 (15)`. Timing uses the foreground
+30 s `Timer` — don't background the app while observing.
+
+### 29. Cellular drains nothing (1.2.10)
+
+Primary validation that no HTTP task is issued on cellular, and that the
+unsynced counter survives without drift.
+
+- On the iPhone: Settings → Wi-Fi → off. Cellular on.
+- Launch the app. Walk ≥ 100 m so the counter ticks up past 10.
+- Hold for ≥ 2 min.
+- Expected: counter keeps going up, **never decrements**. Console.app
+  (attached via Xcode, DEBUG build) shows `[sync] points: not on Wi-Fi,
+  skipping` every 30 s; no `URLSession` task, no 15 s timeout, no
+  retryable-error log. Battery Instruments shows a flat "Networking"
+  row — not the pre-1.2.10 sawtooth pattern of 15 s timeouts.
+- Turn Wi-Fi back on (same network as the Mac backend).
+- Expected: within ≤ 30 s the counter drains. Console.app shows
+  `[sync] Wi-Fi regained → backoff reset to base` (DEBUG only) and no
+  futile waiting beyond one tick.
+
+### 30. Personal hotspot blocked (1.2.10)
+
+Verifies `isExpensive` gate. A paired peer's cellular must not be drained.
+
+- Enable the iPhone's personal hotspot. Connect a Mac to the hotspot and
+  confirm the Mac is online via LTE/5G routing.
+- Walk ≥ 100 m with the iPhone.
+- Expected: counter rises, never drains (hotspot connection has
+  `usesInterfaceType(.wifi) = true` but `isExpensive = true`, so the
+  predicate rejects).
+
+### 31. Low Data Mode blocked (1.2.10)
+
+Verifies `isConstrained` gate.
+
+- Settings → Wi-Fi → (active network) → Low Data Mode = on.
+- Walk ≥ 100 m.
+- Expected: counter rises, never drains. Turn Low Data Mode off:
+  counter drains within one tick.
+
+### 32. Diagnostics flag default (1.2.10)
+
+Verifies new installs don't write or upload `fix_diagnostics` rows.
+
+- Fresh install or delete app + reinstall. Do **not** flip the flag.
+- Walk ~5 min on Wi-Fi.
+- Expected: `points` rows accumulate and upload normally. In Postgres:
+
+  ```sql
+  SELECT COUNT(*) FROM fix_diagnostics
+   WHERE device_id = '<DEV>'
+     AND fix_timestamp BETWEEN '<start>' AND '<end>';
+  -- → 0
+  ```
+
+### 33. Diagnostics flag runtime override (1.2.10)
+
+Verifies the UserDefaults override works without a rebuild.
+
+- On the iPhone, via Xcode or SSH to a jailbroken device (not typical),
+  or on a development Mac mirroring the device defaults:
+
+  ```
+  defaults write com.gpslogger.personal syncDiagnosticsEnabled -bool YES
+  ```
+
+- Kill + relaunch the app.
+- Walk ~5 min on Wi-Fi.
+- Expected: backend `fix_diagnostics` now grows (≈ 1 Hz = ~300 rows per
+  5 min). Decisions include the full 1.2.9 tag vocabulary (`accept`,
+  `accept:stationarySuppress`, `buffered`, `spikeReplaced`,
+  `committedPending`, `discard:poorAccuracy`, etc.).
+- Turn flag back off, relaunch. Expected: row count stops growing on
+  the next tick.
+
 ## Inspecting fix_diagnostics after an anomaly
 
 `fix_diagnostics` records every raw `CLLocation` that entered
 `LocationTracker.didUpdateLocations` (fields: `horizontal_accuracy`,
 `vertical_accuracy`, `altitude`, `speed`, `speed_accuracy`, `course`,
 `course_accuracy`) together with the `LocationFilter` decision for that
-fix. Rows are written to the device's local SQLite, uploaded by
-`SyncService` on the same 30 s cadence as `/points`, and deleted locally
-after a successful 2xx. **The authoritative store is the backend Postgres
+fix — **when `Config.syncDiagnosticsEnabled` is `true`** (off by default
+since 1.2.10, see the scenarios above for how to flip it on). Rows are
+written to the device's local SQLite, uploaded by `SyncService` on the
+same 30 s Wi-Fi sync cadence as `/points`, and deleted locally after a
+successful 2xx. **The authoritative store is the backend Postgres
 `fix_diagnostics` table** — the local SQLite copy is only a staging buffer
 with a 3-day safety-net retention.
 
