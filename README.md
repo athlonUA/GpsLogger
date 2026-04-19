@@ -13,7 +13,7 @@ Minimal end-to-end GPS tracking system.
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a gradient polyline |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1) |
 | **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
 
 ## Data contract
@@ -787,23 +787,36 @@ flowchart LR
   periods) never get bridged by a straight "teleport" line.
 - Downsamples each group with a shared global budget of ≤ 4000 points
   total, always preserving the first and last fix of each group.
-- Groups of ≥ 2 points render as a halo + gradient polyline; groups of
-  a single point render as standalone `CircleMarker`s (1.2.4) so an
+- Groups of ≥ 2 points render as a halo + route polyline; groups of a
+  single point render as standalone `CircleMarker`s (1.2.4) so an
   isolated fix in a sparse tracking window doesn't silently disappear
   between the status-bar count and the map.
-- Gradient `t` stays global across groups so colors track progression
-  across the full query window (blue early → red late). Each polyline
-  is split into up to 64 colored chunks to fake a gradient under
-  Leaflet's single-color-per-polyline limitation.
+- **Single uniform route color** (1.4.1). The route is drawn in
+  `ROUTE_COLOR` (`hsl(260, 78%, 58%)` indigo-violet) — no time gradient,
+  no speed-based classification, no mode overlay. A short-lived 1.4.x
+  experiment inferred walking / cycling / vehicle from GPS-derived speed
+  and painted the polyline accordingly; it was reverted because
+  heuristic speed→mode classification is unreliable enough on
+  multi-modal real-world traces (tram stops, red lights, stop-and-go
+  traffic) that fragmented coloring was worse UX than a uniform line.
+  Direction-of-travel arrows (below) carry the motion-direction signal
+  that the gradient used to imply.
+- **Distance from start** (1.4.1). The detail card shown on point click
+  reports cumulative distance from the first point of the query window,
+  formatted as `"350 m from start"` below 1 km or `"2.5 km from start"`
+  at or above. Computed by walking the raw (pre-downsample) points with
+  haversine so winding-road chord-shortening doesn't undercount;
+  continuous across time-gap groups (gap-jump distance is NOT added,
+  but the running total carries over, so the last point reports true
+  total traced distance).
 - **Direction-of-travel arrows** (1.3.1): a small semi-transparent
   chevron every ~150 m along each polyline group, oriented to the
-  segment's bearing, so direction reads instantly at any zoom
-  regardless of the gradient colors. Computed in meters along the
-  geodesic (`route.arrowsAlong`) so spacing is zoom-invariant; the
-  first and last arrows keep a half-interval clear of the endpoints
-  so they don't collide with the Start / End markers. Rendered via
-  `L.divIcon` SVG with `pointer-events: none` so clicks flow through
-  to the polyline.
+  segment's bearing, so direction reads instantly at any zoom.
+  Computed in meters along the geodesic (`route.arrowsAlong`) so
+  spacing is zoom-invariant; the first and last arrows keep a
+  half-interval clear of the endpoints so they don't collide with the
+  Start / End markers. Rendered via `L.divIcon` SVG with
+  `pointer-events: none` so clicks flow through to the polyline.
 - **Start / End markers** (1.3.1): green "S" and red "E" pins on
   distinct circular badges with drop-shadow, plus `Start` / `End`
   tooltips, replacing the earlier same-shape white-filled circles.

@@ -10,45 +10,41 @@ import {
 } from 'react-leaflet';
 import L from 'leaflet';
 import type { Point } from './api';
-import {
-  arrowsAlong,
-  buildSegments,
-  downsampleGroups,
-  splitByTimeGaps,
-} from './route';
+import { arrowsAlong, buildRenderData, ROUTE_COLOR } from './route';
 
 const MAX_ZOOM = 20;
 
 // Snap distance in screen pixels. Converting through `latLngToContainerPoint`
 // makes the threshold zoom-invariant: 30 px is 30 px on the user's screen
-// whether they're looking at a continent (zoom 3) or a street (zoom 18). The
-// previous degree² radius was ~1 km regardless of zoom, which was useless at
-// both extremes (too wide when zoomed out, too narrow when zoomed in).
+// whether they're looking at a continent (zoom 3) or a street (zoom 18).
 const MAX_CLICK_DIST_PX = 30;
 const MAX_CLICK_DIST_PX_SQ = MAX_CLICK_DIST_PX * MAX_CLICK_DIST_PX;
+
+type Nearest = { point: Point; index: number } | null;
 
 function findNearestPoint(
   points: Point[],
   map: L.Map,
   clickLat: number,
   clickLng: number,
-): Point | null {
+): Nearest {
   if (points.length === 0) return null;
   const clickPt = map.latLngToContainerPoint([clickLat, clickLng]);
-  let best = points[0];
+  let bestIdx = 0;
   let bestDistSq = Infinity;
-  for (const p of points) {
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
     const pt = map.latLngToContainerPoint([p.latitude, p.longitude]);
     const dx = pt.x - clickPt.x;
     const dy = pt.y - clickPt.y;
     const d = dx * dx + dy * dy;
     if (d < bestDistSq) {
       bestDistSq = d;
-      best = p;
+      bestIdx = i;
     }
   }
   if (bestDistSq > MAX_CLICK_DIST_PX_SQ) return null;
-  return best;
+  return { point: points[bestIdx], index: bestIdx };
 }
 
 function FitBounds({ points }: { points: Point[] }) {
@@ -63,9 +59,9 @@ function FitBounds({ points }: { points: Point[] }) {
   return null;
 }
 
-// Capture the Leaflet `Map` instance into a ref owned by the parent so the
-// click handler (which lives outside the MapContainer subtree) can call
-// `latLngToContainerPoint` for pixel-space snap math. Runs once per mount.
+// Capture the Leaflet `Map` instance into a ref owned by the parent so
+// the click handler (which lives outside the MapContainer subtree) can
+// call `latLngToContainerPoint` for pixel-space snap math.
 function MapRefCapture({ mapRef }: { mapRef: React.MutableRefObject<L.Map | null> }) {
   const map = useMap();
   useEffect(() => {
@@ -81,9 +77,9 @@ function MapRefCapture({ mapRef }: { mapRef: React.MutableRefObject<L.Map | null
 // Local time formatting (browser timezone, no UTC display)
 // --------------------------------------------------------------------------
 
-// en-GB keeps the output unambiguous ("01 Jun 2025, 03:14:22") regardless of
-// the user's chosen UI locale. Conversion to local wall-clock time is still
-// automatic because Intl.DateTimeFormat defaults to the runtime's timezone.
+// en-GB keeps the output unambiguous ("01 Jun 2025, 03:14:22") regardless
+// of the user's chosen UI locale. Conversion to local wall-clock time is
+// automatic because Intl.DateTimeFormat defaults to the runtime's tz.
 const LOCAL_FORMATTER = new Intl.DateTimeFormat('en-GB', {
   day: '2-digit',
   month: 'short',
@@ -105,6 +101,16 @@ function formatLocal(iso: string): { localTime: string; timezone: string } {
     localTime: LOCAL_FORMATTER.format(d),
     timezone: LOCAL_TIMEZONE,
   };
+}
+
+/// Format cumulative distance for the detail card. Below 1 km render as
+/// whole meters; at or above, render kilometers with one decimal. Matches
+/// the level of precision a user actually cares about — sub-meter output
+/// would be fake precision given GPS noise.
+function formatDistance(meters: number): string {
+  if (!Number.isFinite(meters) || meters < 0) return '—';
+  if (meters < 1000) return `${Math.round(meters)} m from start`;
+  return `${(meters / 1000).toFixed(1)} km from start`;
 }
 
 // --------------------------------------------------------------------------
@@ -146,17 +152,20 @@ function DetailCard({
   lat,
   lng,
   createdAt,
+  distanceMeters,
   address,
   onClose,
 }: {
   lat: number;
   lng: number;
   createdAt: string;
+  distanceMeters: number;
   address: AddressState;
   onClose: () => void;
 }) {
   const coordsText = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
   const { localTime, timezone } = useMemo(() => formatLocal(createdAt), [createdAt]);
+  const distanceText = useMemo(() => formatDistance(distanceMeters), [distanceMeters]);
   const [copied, setCopied] = useState<CopyTarget | null>(null);
 
   const copy = useCallback(async (text: string, which: CopyTarget) => {
@@ -186,6 +195,9 @@ function DetailCard({
           {copied === 'coords' ? 'Copied' : 'Copy'}
         </button>
       </div>
+
+      <div className="point-card__label">Distance</div>
+      <div className="point-card__distance">{distanceText}</div>
 
       <div className="point-card__label">Address</div>
       <div className="point-card__address">
@@ -227,15 +239,12 @@ function DetailCard({
 // --------------------------------------------------------------------------
 
 export default function MapView({ points }: { points: Point[] }) {
-  const groups = useMemo(
-    () => downsampleGroups(splitByTimeGaps(points)),
-    [points],
-  );
-  const sampled = useMemo(() => groups.flat(), [groups]);
-  const { segments, singletons } = useMemo(() => buildSegments(groups), [groups]);
+  const render = useMemo(() => buildRenderData(points), [points]);
+  const { groups, sampled, distancesMeters, segments, singletons } = render;
 
-  // One halo polyline per group — keeps the subtle shadow under the route but
-  // honors the same time-gap breaks so it doesn't bridge disconnected sessions.
+  // One halo polyline per group — keeps the subtle shadow under the route
+  // but honors the same time-gap breaks so it does not bridge
+  // disconnected sessions.
   const haloGroups = useMemo(
     () =>
       groups
@@ -247,10 +256,7 @@ export default function MapView({ points }: { points: Point[] }) {
   );
 
   // Direction-of-travel arrows along each polyline group, computed in
-  // meters along the geodesic so spacing is zoom-invariant. Single-point
-  // groups contribute nothing (no direction to indicate). The arrows are
-  // rendered as stroke-outlined SVG chevrons tinted by `direction-arrow`
-  // CSS so they stay legible on both light and dark basemap regions.
+  // meters along the geodesic so spacing is zoom-invariant.
   const directionArrows = useMemo(() => {
     const out: {
       key: string;
@@ -271,11 +277,9 @@ export default function MapView({ points }: { points: Point[] }) {
     return out;
   }, [groups]);
 
-  // DivIcon factories memoized at module scope would be ideal, but
-  // `L.divIcon` must be called after Leaflet has finished loading; doing
-  // it inside `useMemo` keeps the SSR-safe import pattern the rest of
-  // this component uses. The Start / End icons are static (no state), so
-  // the empty dependency arrays are intentional.
+  // DivIcon factories. `L.divIcon` must be called after Leaflet has
+  // finished loading, so they live inside `useMemo` rather than module
+  // scope. The Start / End icons are static (no state).
   const startIcon = useMemo(
     () =>
       L.divIcon({
@@ -298,17 +302,15 @@ export default function MapView({ points }: { points: Point[] }) {
   );
 
   const [selected, setSelected] = useState<
-    { lat: number; lng: number; createdAt: string } | null
+    { lat: number; lng: number; createdAt: string; distanceMeters: number } | null
   >(null);
   const [address, setAddress] = useState<AddressState>({ status: 'idle' });
 
-  // Client-side cache of address lookups for the current session. Keeps repeat
-  // clicks free and avoids hammering Nominatim (which has a 1 req/sec policy).
+  // Client-side cache of address lookups for the current session. Keeps
+  // repeat clicks free and avoids hammering Nominatim (1 req/sec policy).
   const cacheRef = useRef(new Map<string, string>());
   const requestIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
-  // Map ref populated by `MapRefCapture`. Used by the click handler to
-  // project lat/lng into screen pixels for zoom-invariant snap distance.
   const mapRef = useRef<L.Map | null>(null);
 
   // Reset selection when the underlying points change (new query).
@@ -318,63 +320,94 @@ export default function MapView({ points }: { points: Point[] }) {
     abortRef.current?.abort();
   }, [points]);
 
-  const selectPoint = useCallback((point: Point) => {
-    const id = ++requestIdRef.current;
-    const lat = point.latitude;
-    const lng = point.longitude;
-    setSelected({ lat, lng, createdAt: point.created_at });
+  const selectPoint = useCallback(
+    (point: Point, distanceMeters: number) => {
+      const id = ++requestIdRef.current;
+      const lat = point.latitude;
+      const lng = point.longitude;
+      setSelected({ lat, lng, createdAt: point.created_at, distanceMeters });
 
-    const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
-    const cached = cacheRef.current.get(key);
-    if (cached) {
-      setAddress({ status: 'ok', value: cached });
-      return;
-    }
+      const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+      const cached = cacheRef.current.get(key);
+      if (cached) {
+        setAddress({ status: 'ok', value: cached });
+        return;
+      }
 
-    abortRef.current?.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
+      abortRef.current?.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
 
-    setAddress({ status: 'loading' });
-    reverseGeocode(lat, lng, ctrl.signal)
-      .then((value) => {
-        if (requestIdRef.current !== id) return;
-        cacheRef.current.set(key, value);
-        setAddress({ status: 'ok', value });
-      })
-      .catch((err: unknown) => {
-        if (requestIdRef.current !== id) return;
-        if (err instanceof DOMException && err.name === 'AbortError') return;
-        const message = err instanceof Error ? err.message : 'lookup failed';
-        setAddress({ status: 'error', error: message });
-      });
-  }, []);
+      setAddress({ status: 'loading' });
+      reverseGeocode(lat, lng, ctrl.signal)
+        .then((value) => {
+          if (requestIdRef.current !== id) return;
+          cacheRef.current.set(key, value);
+          setAddress({ status: 'ok', value });
+        })
+        .catch((err: unknown) => {
+          if (requestIdRef.current !== id) return;
+          if (err instanceof DOMException && err.name === 'AbortError') return;
+          const message = err instanceof Error ? err.message : 'lookup failed';
+          setAddress({ status: 'error', error: message });
+        });
+    },
+    [],
+  );
+
+  // Helper: snap a sampled index to its cumulative distance, falling
+  // back to 0 if the parallel arrays ever drift out of alignment (they
+  // shouldn't — `buildRenderData` guarantees it — but cheap insurance).
+  const distanceAt = useCallback(
+    (index: number) => distancesMeters[index] ?? 0,
+    [distancesMeters],
+  );
 
   const handleRouteClick = useCallback(
     (e: L.LeafletMouseEvent) => {
       const map = mapRef.current;
       if (!map) return;
       const nearest = findNearestPoint(sampled, map, e.latlng.lat, e.latlng.lng);
-      if (nearest) selectPoint(nearest);
+      if (nearest) selectPoint(nearest.point, distanceAt(nearest.index));
     },
-    [sampled, selectPoint],
+    [sampled, selectPoint, distanceAt],
   );
 
-  // Start/end markers are anchors for the polyline endpoints, not for any
-  // isolated singleton fix. Deriving them from the first/last polyline
-  // group prevents the white-filled start/end ring from drawing over (and
-  // visually swallowing) a singleton CircleMarker that happens to sit at
-  // position 0 or length-1 of `sampled`.
-  const first = useMemo(() => {
-    for (const g of groups) if (g.length >= 2) return g[0];
-    return null;
-  }, [groups]);
-  const last = useMemo(() => {
-    for (let i = groups.length - 1; i >= 0; i--) {
-      const g = groups[i];
-      if (g.length >= 2) return g[g.length - 1];
+  // Start/end markers anchor the polyline endpoints, not any isolated
+  // singleton fix. Deriving them from the first/last polyline group
+  // prevents the white-filled endpoint ring from drawing over a
+  // singleton CircleMarker that happens to sit at position 0 or
+  // length-1 of `sampled`.
+  const firstInfo = useMemo(() => {
+    let flatIndex = 0;
+    for (const g of groups) {
+      if (g.length >= 2) return { point: g[0], index: flatIndex };
+      flatIndex += g.length;
     }
     return null;
+  }, [groups]);
+  const lastInfo = useMemo(() => {
+    let flatIndex = 0;
+    let result: { point: Point; index: number } | null = null;
+    for (const g of groups) {
+      if (g.length >= 2) {
+        result = { point: g[g.length - 1], index: flatIndex + g.length - 1 };
+      }
+      flatIndex += g.length;
+    }
+    return result;
+  }, [groups]);
+
+  // Pre-compute the flat index of each singleton so clicks can look up
+  // its cumulative distance without another pass.
+  const singletonIndices = useMemo(() => {
+    const out: number[] = [];
+    let flatIndex = 0;
+    for (const g of groups) {
+      if (g.length === 1) out.push(flatIndex);
+      flatIndex += g.length;
+    }
+    return out;
   }, [groups]);
 
   return (
@@ -415,7 +448,7 @@ export default function MapView({ points }: { points: Point[] }) {
             key={i}
             positions={s.positions}
             pathOptions={{
-              color: s.color,
+              color: ROUTE_COLOR,
               weight: 5,
               opacity: 0.95,
               lineCap: 'round',
@@ -425,40 +458,36 @@ export default function MapView({ points }: { points: Point[] }) {
           />
         ))}
 
-        {/* Isolated fixes — groups of a single point after time-gap split.
+        {/* Isolated fixes — groups of a single point after gap-split.
             Rendered on their own so the on-map count matches the status
-            bar. Color is the gradient value at their chronological index,
-            so a lone point in the middle of a query window picks up the
-            mid-gradient hue rather than looking like an unrelated marker. */}
-        {singletons.map((s, i) => (
-          <CircleMarker
-            key={`singleton-${i}`}
-            center={[s.point.latitude, s.point.longitude]}
-            radius={5}
-            pathOptions={{
-              color: s.color,
-              fillColor: s.color,
-              fillOpacity: 0.9,
-              weight: 2,
-            }}
-            eventHandlers={{ click: () => selectPoint(s.point) }}
-          />
-        ))}
+            bar. */}
+        {singletons.map((s, i) => {
+          const flatIndex = singletonIndices[i] ?? 0;
+          return (
+            <CircleMarker
+              key={`singleton-${i}`}
+              center={[s.point.latitude, s.point.longitude]}
+              radius={5}
+              pathOptions={{
+                color: ROUTE_COLOR,
+                fillColor: ROUTE_COLOR,
+                fillOpacity: 0.9,
+                weight: 2,
+              }}
+              eventHandlers={{
+                click: () => selectPoint(s.point, distanceAt(flatIndex)),
+              }}
+            />
+          );
+        })}
 
-        {/* Direction-of-travel arrows along each polyline group. Rendered
-            via L.divIcon instead of L.marker's default PNG icon so there
-            are no asset-loading gymnastics and the arrows inherit page
-            CSS. `interactive={false}` keeps clicks flowing through to the
-            polyline underneath. */}
+        {/* Direction-of-travel arrows along each polyline group. */}
         {directionArrows.map((a) => (
           <Marker
             key={a.key}
             position={[a.latitude, a.longitude]}
             icon={L.divIcon({
               className: 'direction-arrow',
-              // SVG chevron pointing up; CSS rotates it to the bearing so
-              // we avoid baking a transform into every marker's HTML
-              // (cleaner devtools, one less value to escape).
               html: `<span class="direction-arrow__inner" style="transform: rotate(${a.bearing}deg)">
                 <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
                   <polygon points="6,1 11,11 6,8.5 1,11" />
@@ -471,11 +500,13 @@ export default function MapView({ points }: { points: Point[] }) {
           />
         ))}
 
-        {first && (
+        {firstInfo && (
           <Marker
-            position={[first.latitude, first.longitude]}
+            position={[firstInfo.point.latitude, firstInfo.point.longitude]}
             icon={startIcon}
-            eventHandlers={{ click: () => selectPoint(first) }}
+            eventHandlers={{
+              click: () => selectPoint(firstInfo.point, distanceAt(firstInfo.index)),
+            }}
             zIndexOffset={1000}
           >
             <Tooltip direction="top" offset={[0, -14]} opacity={0.95}>
@@ -484,11 +515,13 @@ export default function MapView({ points }: { points: Point[] }) {
           </Marker>
         )}
 
-        {last && (
+        {lastInfo && (
           <Marker
-            position={[last.latitude, last.longitude]}
+            position={[lastInfo.point.latitude, lastInfo.point.longitude]}
             icon={endIcon}
-            eventHandlers={{ click: () => selectPoint(last) }}
+            eventHandlers={{
+              click: () => selectPoint(lastInfo.point, distanceAt(lastInfo.index)),
+            }}
             zIndexOffset={1000}
           >
             <Tooltip direction="top" offset={[0, -14]} opacity={0.95}>
@@ -520,6 +553,7 @@ export default function MapView({ points }: { points: Point[] }) {
           lat={selected.lat}
           lng={selected.lng}
           createdAt={selected.createdAt}
+          distanceMeters={selected.distanceMeters}
           address={address}
           onClose={() => {
             abortRef.current?.abort();

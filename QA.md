@@ -223,65 +223,80 @@ DB write and read.
 The DB layer itself is intentionally thin (parameterized inserts and a single
 filter+sort select) and is exercised end-to-end via the smoke tests below.
 
-### Frontend unit tests (29 cases)
+### Frontend unit tests (30 cases)
 
 ```
 cd frontend
 npm test
 ```
 
-Covers the pure route-processing functions extracted into `src/route.ts`
-so they can be tested in `vitest`'s default Node environment without
-loading `react-leaflet` (which requires the DOM).
+Covers the pure route-processing functions in `src/route.ts` so they
+can be tested in `vitest`'s default Node environment without loading
+`react-leaflet` (which requires the DOM).
 
-**`splitByTimeGaps` (6 cases)** — turns the time-sorted `Point[]` into
+**`splitByTimeGaps` (5 cases)** — turns the time-sorted `Point[]` into
 time-gap groups:
 
 - empty input returns `[]` (no placeholder group)
-- single point produces one one-point group — the input survives the
-  segmentation stage even when there is nothing to gap against
+- single point produces one one-point group
 - consecutive close points stay in the same group
 - gap boundary is **strictly greater than** `GAP_MS` (exactly 5 min is
   not a split; 5 min + 1 s is)
-- many gaps produce the expected number of groups
 - a lone fix between two clusters becomes its own 1-point group,
-  unblocking the singleton-render path in `buildSegments`
+  unblocking the singleton-render path
 
-**`downsampleGroups` (5 cases)** — global budget with per-group
-proportional allocation:
+**`downsampleGroups` (3 cases)** and **`downsampleIndices` (2 cases)** —
+global budget with per-group proportional allocation:
 
 - under-budget input returns the same array reference (identity, no
   reallocation) so React's `useMemo` doesn't invalidate needlessly
 - over-budget input compresses below `MAX_POINTS` while preserving the
-  first and last fix of each group (polyline endpoints stay anchored
-  to the real trace)
-- 2-point group passes through unchanged (short-circuit for already-minimal groups)
+  first and last fix of each group
 - singleton group passes through unchanged
-- budget splits proportionally: a 2N-point group ends up with more
-  sampled points than a 0.5N-point group
+- indices match the input length under budget; first + last indices
+  are retained when over-budget
 
-**`gradientColor` (3 cases)** — Blue → Purple → Red hue mapping:
+**`haversineMeters` (2 cases)** — distance primitive:
 
-- output is always a valid `hsl(...)` string
-- anchor values: t=0 → 240°, t=0.5 → 285°, t=1 → 360°
-- monotonic across [0, 1]
+- identical points return ≈ 0
+- 1° of latitude returns ≈ 111 km
 
-**`buildSegments` (6 cases)** — render-primitives builder:
+**`segmentLengths` (2 cases)** and **`cumulativeDistances` (2 cases)** —
+distance machinery backing the "X km from start" detail-card row
+(1.4.1):
+
+- lengths are empty for groups shorter than 2
+- per-segment lengths sum very close to the end-to-end haversine
+- cumulative distance starts at 0 and is monotonic within a group
+- running total **carries across time gaps without adding gap distance**
+  — the gap contributes zero meters, but the running total is
+  preserved so the last sampled point reports true total traced
+  distance (1.4.1)
+
+**`buildRenderData` (6 cases, 1.4.1)** — the end-to-end pipeline
+consumed by `MapView`:
 
 - empty input → empty render
-- **singleton regression (1.2.4)**: a 1-point group emits a singleton
-  with the right color, no polyline segments — the audit-day bug where
-  lone fixes were silently dropped is locked in
-- multi-point group emits polyline segments with ≥ 2 positions each,
-  no singletons
-- mixed groups emit both polyline segments and singletons
-- global-`t` preservation: a singleton at the chronological centre
-  picks up `hue = 285°` (purple), proving the gradient spans the whole
-  query window rather than restarting per group
-- bookends: first segment is near blue (240°) and last segment is near
-  red (360°) across a two-group window
+- **singleton regression (1.2.4)**: a 1-point group emits a singleton,
+  no polyline segments; distancesMeters is `[0]`
+- multi-group input emits one polyline per group (single uniform
+  color — the per-mode split from the reverted 1.4.x experiment is
+  gone)
+- `distancesMeters.length === sampled.length` and is monotonic
+- distance continuity across a time-gap boundary — the ~111 km
+  spatial jump between two groups does NOT leak into the total
+- **alignment after downsampling** (audit regression): over-budget
+  input still produces `distancesMeters.length === sampled.length`,
+  and the endpoint distance matches the raw total (ensures the
+  click-to-distance lookup in `MapView` stays correct when the trace
+  exceeds `MAX_POINTS`)
+- **singleton flat-index alignment** (audit regression): in a
+  mixed walk → lone-fix → walk trace, the flat index of the singleton
+  in `sampled` matches the index used in `Map.tsx` to look up its
+  distance; the singleton's distance equals the end-of-preceding-walk
+  distance (time gap adds nothing)
 
-**`arrowsAlong` (9 cases, 1.3.1)** — direction-of-travel chevron
+**`arrowsAlong` (8 cases, 1.3.1)** — direction-of-travel chevron
 placement along a polyline group:
 
 - empty input returns `[]` (fewer than 2 positions cannot carry a
@@ -484,7 +499,8 @@ All scenarios assume:
 - Visualize the range.
 - Expected: the polyline renders smoothly in <1 s. The status bar shows the
   full count ("10,247 points"). Internally, the map only renders ≤ 4000
-  after downsampling, across up to 64 colored segments per group.
+  points after downsampling. The line is a single uniform indigo-violet
+  (1.4.1) — one polyline per time-gap group.
 
 ### 9. Time-gap polyline split
 
@@ -492,9 +508,11 @@ All scenarios assume:
   gap between them at distant coordinates.
 - Visualize a range that covers both clusters.
 - Expected: two separate polylines render — **no straight line bridges the
-  two clusters**. The gradient color (blue → red) is global across both
-  groups, so the second cluster picks up the gradient where the first
-  finished.
+  two clusters**. Both polylines are the same uniform `ROUTE_COLOR` (no
+  time gradient since 1.4.1). Click a point near the end of the *second*
+  cluster: the detail card reports cumulative distance equal to
+  (sum of intra-cluster 1 distance) + (distance from cluster-2 start
+  to the clicked point) — the spatial jump during the gap is NOT added.
 
 ### 10. Logout / device switch (frontend)
 
@@ -976,6 +994,43 @@ Verifies the UserDefaults override works without a rebuild.
   `committedPending`, `discard:poorAccuracy`, etc.).
 - Turn flag back off, relaunch. Expected: row count stops growing on
   the next tick.
+
+### 34. Frontend distance-from-start + uniform color (1.4.1)
+
+Verifies the 1.4.1 visualization simplification: one uniform color
+(no gradient, no speed-based classifier) and per-point cumulative
+distance in the detail card.
+
+- Visualize a day with a continuous multi-kilometer trace (walk, bike
+  ride, commute — anything with ≥ 2 km covered).
+- **Uniform color.** The whole polyline is a single indigo-violet
+  (`hsl(260, 78%, 58%)`). No blue→red gradient, no green/red segment
+  variants, no mode legend overlay. Start pin is green "S", End pin
+  is red "E" — unchanged from 1.3.1.
+- **Distance row.** Click a point near the Start marker. The detail
+  card's "Distance" row reads `"0 m from start"` (or a few meters
+  from the snap offset). Click a point near the End marker: the row
+  reads the total kilometers. Click a point ~halfway along: the
+  reading should be approximately half the total, give or take
+  downsampling snap.
+- **Formatting.** Distances below 1 km render as whole meters
+  (`"350 m from start"`). At 1 km and above, kilometers with one
+  decimal (`"2.5 km from start"`). `—` appears only if the value is
+  `NaN` (shouldn't happen on healthy data).
+- **Gap continuity.** Visualize a range that crosses a >5-minute
+  time-gap (e.g. a morning walk at point A, then an afternoon walk at
+  point B, same `device_id`). Click a point in the second group: the
+  distance shown is `(group-1 end distance) +
+  (distance from group-2 start to clicked point)`. The ~10 km spatial
+  jump during the gap is **not** added (the gap has no polyline; the
+  running total carries over but picks up zero meters of bridge
+  distance).
+- **Downsampled trace.** Insert 10k+ synthetic points with increasing
+  coordinates (known total distance). Visualize. Click the last
+  rendered point. Expected: the displayed kilometers are within a
+  few percent of the true total — downsampling computes distances on
+  the *raw* points before sampling, so chord-shortening on winding
+  segments doesn't undercount.
 
 ## Inspecting fix_diagnostics after an anomaly
 
