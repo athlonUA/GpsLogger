@@ -126,6 +126,19 @@ export default function App() {
     }
   }, [deviceId, from, to]);
 
+  // Auto-fetch on first mount when a device_id was already in storage,
+  // so a page reload behaves like the user re-clicked Visualize. Gated
+  // on the *initial* deviceId only — typing the ID after landing on a
+  // logged-out page still waits for an explicit Visualize click.
+  useEffect(() => {
+    if (!deviceId) return;
+    void onVisualize();
+    // Mount-only: re-running on deviceId / onVisualize changes would
+    // reintroduce the auto-fetch-on-typing behavior we explicitly
+    // exclude above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onLogout = useCallback(() => {
     setDeviceId('');
     setPoints([]);

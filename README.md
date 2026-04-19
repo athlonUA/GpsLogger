@@ -13,7 +13,7 @@ Minimal end-to-end GPS tracking system.
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2) |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3) |
 | **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
 
 ## Data contract
@@ -777,6 +777,14 @@ flowchart LR
 ### Frontend — visualization
 
 - User-driven fetch only. **No auto-refresh, no clustering, no heatmap.**
+  One exception (1.4.3): a page reload with a previously-stored
+  `device_id` auto-fires the same fetch a Visualize click would, using
+  whatever `from`/`to` the URL / defaults resolve to on that load. Gated
+  on the *initial* `device_id` read from `localStorage` — typing the ID
+  after landing on a logged-out page still waits for an explicit click,
+  so each keystroke doesn't kick off a request. No polling: after the
+  mount fetch, subsequent refreshes require a fresh reload or a manual
+  Visualize.
 - **Query range in URL.** The `from`/`to` datetime selectors round-trip
   through `URLSearchParams` (ISO UTC, `history.replaceState` so history
   stays clean), so reloading the page or sharing the link hydrates the
