@@ -418,6 +418,9 @@ export default function MapView({ points }: { points: Point[] }) {
         zoom={2}
         maxZoom={MAX_ZOOM}
         zoomControl={true}
+        zoomSnap={0.25}
+        zoomDelta={0.25}
+        wheelPxPerZoomLevel={120}
         scrollWheelZoom
         attributionControl
       >

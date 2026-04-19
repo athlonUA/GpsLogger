@@ -13,7 +13,7 @@ Minimal end-to-end GPS tracking system.
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1) |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2) |
 | **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
 
 ## Data contract
@@ -782,6 +782,20 @@ flowchart LR
   stays clean), so reloading the page or sharing the link hydrates the
   same range. Device ID stays in `localStorage` because it's identity,
   not query state; Logout clears both.
+- **Default range = today since local 00:00** (1.4.2). On a fresh load
+  with no `from`/`to` params, the picker seeds `from` to local midnight
+  of the current day and `to` to "now" instead of the previous rolling
+  24 h window. Stable across page reopens during the day (the displayed
+  range no longer drifts past midnight) and matches the most common
+  ad-hoc query: "where did I go today?". Logout reseeds the same way.
+  URL params still take precedence, so shared links are unaffected.
+- **Fractional zoom step** (1.4.2). `MapContainer` is configured with
+  `zoomSnap` / `zoomDelta` = 0.25 and `wheelPxPerZoomLevel` = 120, so
+  the `+`/`−` buttons, keyboard, and mouse wheel all advance the zoom
+  in quarter-level increments. Tile rendering interpolates between
+  integer zoom levels at the cost of slight tile blur off-integer —
+  acceptable trade for finer framing on dense urban traces where the
+  default integer steps oscillated between "too tight" and "too wide".
 - Splits the time-sorted points into groups whenever consecutive fixes
   are more than **5 minutes** apart, so unrelated trips (or power-off
   periods) never get bridged by a straight "teleport" line.

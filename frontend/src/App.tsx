@@ -9,6 +9,15 @@ function toLocalInputValue(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+// Local-midnight of "now" — used as the default `from` so reopening the
+// page lands on "everything since the day started" rather than a rolling
+// 24 h window that drifts across midnight.
+function startOfTodayLocal(): Date {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
 function readStoredDeviceId(): string {
   try {
     return localStorage.getItem(DEVICE_ID_STORAGE_KEY) ?? '';
@@ -32,18 +41,18 @@ function readUrlDate(key: string): Date | undefined {
 }
 
 export default function App() {
-  // Defaults fall back to a 24 h window ending now. URL params (if valid)
-  // override on first render so reloads / shared links hydrate the same
-  // range the previous session was looking at.
+  // Defaults fall back to "today since local midnight". URL params
+  // (if valid) override on first render so reloads / shared links
+  // hydrate the same range the previous session was looking at.
   const initialFrom = useMemo(
-    () => readUrlDate('from') ?? new Date(Date.now() - 24 * 60 * 60 * 1000),
+    () => readUrlDate('from') ?? startOfTodayLocal(),
     [],
   );
   const initialTo = useMemo(() => readUrlDate('to') ?? new Date(), []);
   // `defaultFrom`/`defaultTo` are the always-fresh values used by Logout to
-  // reset the range to "last 24 h" rather than to whatever URL the session
-  // was loaded with.
-  const defaultFrom = useMemo(() => new Date(Date.now() - 24 * 60 * 60 * 1000), []);
+  // reset the range to "today since 00:00" rather than to whatever URL the
+  // session was loaded with.
+  const defaultFrom = useMemo(() => startOfTodayLocal(), []);
   const defaultTo = useMemo(() => new Date(), []);
 
   const [deviceId, setDeviceId] = useState<string>(() => readStoredDeviceId());
