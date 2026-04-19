@@ -6,6 +6,12 @@ Minimal end-to-end GPS tracking system.
 > No trip detection, no movement classification, no behavior analysis —
 > just `collect → store → visualize`.
 
+> **New here?** Skip straight to [`QUICKSTART_CLAUDE_CODE.md`](QUICKSTART_CLAUDE_CODE.md)
+> for a step-by-step walkthrough that uses Claude Code to bring up the
+> backend, install the iOS app on your phone, and visualize your first
+> route. The rest of this README documents the architecture and data
+> contract.
+
 ## Parts
 
 | Component | Tech | Purpose |
