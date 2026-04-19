@@ -59,18 +59,469 @@ function FitBounds({ points }: { points: Point[] }) {
   return null;
 }
 
-// Capture the Leaflet `Map` instance into a ref owned by the parent so
-// the click handler (which lives outside the MapContainer subtree) can
-// call `latLngToContainerPoint` for pixel-space snap math.
-function MapRefCapture({ mapRef }: { mapRef: React.MutableRefObject<L.Map | null> }) {
+// Make trackpad / wheel zoom snap to integer steps, matching the feel of
+// a double-tap (+1/-1). `zoomSnap` stays fractional for slider smoothness
+// so we can't fix this globally; instead we patch Leaflet's internal
+// `_performZoom` for the scroll-wheel handler to ignore softplus math and
+// snap straight to ±1 per debounced burst. Stable in Leaflet 1.9.x.
+function SnappyWheelZoom() {
+  const map = useMap();
+  useEffect(() => {
+    const wheel = (
+      map as unknown as {
+        scrollWheelZoom?: {
+          _performZoom?: () => void;
+          _delta?: number;
+          _lastMousePos?: L.Point;
+          _startTime?: number | null;
+        };
+      }
+    ).scrollWheelZoom;
+    const orig = wheel?._performZoom;
+    if (!wheel || !orig) return;
+    wheel._performZoom = function (this: {
+      _delta?: number;
+      _lastMousePos?: L.Point;
+      _startTime?: number | null;
+    }) {
+      const delta = this._delta ?? 0;
+      this._delta = 0;
+      this._startTime = null;
+      if (!delta) return;
+      const dir: 1 | -1 = delta > 0 ? 1 : -1;
+      const target = map.getZoom() + dir;
+      if (this._lastMousePos) {
+        map.setZoomAround(this._lastMousePos, target);
+      } else {
+        map.setZoom(target);
+      }
+    };
+    return () => {
+      wheel._performZoom = orig;
+    };
+  }, [map]);
+  return null;
+}
+
+// Clamp zoom-out so the world fully covers the container on both axes —
+// no empty margin, no horizontal tile wrapping. At zoom `z` the Web
+// Mercator world is `256 * 2^z` px on each side, so the minimum zoom
+// that fills the container is `log2(max(W, H) / 256)`.
+//
+// We deliberately do NOT use `setMaxBounds` here. Bound clamping forces
+// Leaflet to pan the center after zoom-out so the view fits inside the
+// bounds, which in turn drifts the center (e.g. Valencia sliding off
+// screen after zoom-out → zoom-in). `noWrap` on the tile layer already
+// prevents horizontal repetition, so we can just rely on the min-zoom
+// floor to stop the user from zooming out past a useful point.
+function WorldMinZoom() {
+  const map = useMap();
+  useEffect(() => {
+    const apply = () => {
+      const size = map.getSize();
+      if (size.x <= 0 || size.y <= 0) return;
+      const minZoom = Math.max(
+        0,
+        Math.log2(Math.max(size.x, size.y) / 256),
+      );
+      map.setMinZoom(minZoom);
+      if (map.getZoom() < minZoom) {
+        map.setZoom(minZoom, { animate: false });
+      }
+    };
+    apply();
+    map.on('resize', apply);
+    return () => {
+      map.off('resize', apply);
+    };
+  }, [map]);
+  return null;
+}
+
+// Capture the Leaflet `Map` instance into a ref owned by the parent and
+// publish it via state so siblings (e.g. `RouteMinimap`) can render against
+// the same instance. The ref covers synchronous callbacks; the state covers
+// React subtrees that need to re-render once the map is ready.
+function MapRefCapture({
+  mapRef,
+  onReady,
+}: {
+  mapRef: React.MutableRefObject<L.Map | null>;
+  onReady?: (map: L.Map) => void;
+}) {
   const map = useMap();
   useEffect(() => {
     mapRef.current = map;
+    onReady?.(map);
     return () => {
       mapRef.current = null;
     };
-  }, [map, mapRef]);
+  }, [map, mapRef, onReady]);
   return null;
+}
+
+// --------------------------------------------------------------------------
+// Route minimap — Google-Photos-style overview with a draggable viewport
+// handle and a horizontal zoom slider. By default the minimap is fitted
+// to the full route bounds, so the clear rectangle shows what fraction
+// of the route is in the main viewport (everything outside is a soft
+// sea-tinted matte). If the main map is zoomed out past the route, the
+// minimap expands to contain `route ∪ main-bounds`, so the rectangle
+// stays symmetric and the matte reads correctly on both sides.
+//
+// Interactions: drag the rectangle to pan the main map; click elsewhere
+// on the thumb to recenter the main map there; drag/click the zoom
+// slider or ± buttons to change the main map's zoom.
+// --------------------------------------------------------------------------
+
+const MINIMAP_MAX_ZOOM = 16;
+
+function MinimapBootstrap({ onReady }: { onReady: () => void }) {
+  const map = useMap();
+  useEffect(() => {
+    // Leaflet measures the container on construction; the minimap DOM is
+    // sized by CSS, so a manual invalidate guarantees correct projection
+    // math the first time we compute the rect.
+    requestAnimationFrame(() => {
+      map.invalidateSize();
+      onReady();
+    });
+  }, [map, onReady]);
+  return null;
+}
+
+function MinimapRefCapture({ onReady }: { onReady: (map: L.Map) => void }) {
+  const map = useMap();
+  useEffect(() => {
+    onReady(map);
+  }, [map, onReady]);
+  return null;
+}
+
+type Rect = { left: number; top: number; width: number; height: number };
+
+function RouteMinimap({
+  points,
+  mainMap,
+}: {
+  points: Point[];
+  mainMap: L.Map | null;
+}) {
+  const [mini, setMini] = useState<L.Map | null>(null);
+  const [miniReady, setMiniReady] = useState(false);
+  const [rect, setRect] = useState<Rect | null>(null);
+  const [zoomFrac, setZoomFrac] = useState(0);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  // When the user is dragging the viewport handle or scrubbing the zoom
+  // slider, pan/zoom events fire rapidly on the main map. Each one would
+  // normally trigger a `mini.fitBounds(...)` refit, which shifts the
+  // minimap's projection under the cursor mid-drag — pixel→latlng math
+  // computed off the new projection produces the "drunken" wander the
+  // user reported. We pause refits during interactions and fire one
+  // final refit on pointer-up.
+  const isDraggingRef = useRef(false);
+
+  // Track the main map's zoom fraction in [0..1] so the slider handle
+  // position mirrors the current zoom. Updates on `zoom` (live during
+  // animation) and `zoomend` (final snap).
+  useEffect(() => {
+    if (!mainMap) return;
+    const update = () => {
+      const z = mainMap.getZoom();
+      const minZ = mainMap.getMinZoom();
+      const maxZ = mainMap.getMaxZoom();
+      const span = maxZ - minZ;
+      setZoomFrac(span > 0 ? Math.max(0, Math.min(1, (z - minZ) / span)) : 0);
+    };
+    update();
+    mainMap.on('zoom zoomend', update);
+    return () => {
+      mainMap.off('zoom zoomend', update);
+    };
+  }, [mainMap]);
+
+  const positions = useMemo(
+    () =>
+      points.map((p) => [p.latitude, p.longitude] as [number, number]),
+    [points],
+  );
+
+  const routeBounds = useMemo<L.LatLngBounds | null>(
+    () => (positions.length > 0 ? L.latLngBounds(positions) : null),
+    [positions],
+  );
+
+  const refit = useCallback(() => {
+    if (!mini || !mainMap || !miniReady || !routeBounds) return;
+    if (isDraggingRef.current) return;
+    const mainBounds = mainMap.getBounds();
+    let target = routeBounds;
+    if (!routeBounds.contains(mainBounds)) {
+      const expanded = L.latLngBounds(
+        routeBounds.getSouthWest(),
+        routeBounds.getNorthEast(),
+      );
+      expanded.extend(mainBounds);
+      target = expanded;
+    }
+    mini.fitBounds(target, { padding: [6, 6], animate: false });
+  }, [mini, mainMap, miniReady, routeBounds]);
+
+  // Keep the minimap's view wide enough to always contain the main map's
+  // current viewport. Default is the route bounds; if the main map is
+  // zoomed out past the route, the minimap expands to the union so the
+  // viewport rectangle (and its matte) stays symmetric and never gets
+  // clipped against a minimap edge.
+  useEffect(() => {
+    if (!mainMap) return;
+    refit();
+    mainMap.on('moveend zoomend', refit);
+    return () => {
+      mainMap.off('moveend zoomend', refit);
+    };
+  }, [mainMap, refit]);
+
+  // Keep the viewport rect in sync with the main map. `move` (fires during
+  // pan) + `zoom` (fires during zoom) + `resize` (window resize) cover the
+  // live cases; `moveend`/`zoomend` are belt-and-suspenders for when a
+  // programmatic setView bypasses the continuous events.
+  //
+  // The rect is clamped to the minimap's container bounds so it never
+  // escapes the thumb area when the main map is zoomed out past the route.
+  useEffect(() => {
+    if (!mini || !mainMap || !miniReady) return;
+    const update = () => {
+      const b = mainMap.getBounds();
+      const nw = mini.latLngToContainerPoint(b.getNorthWest());
+      const se = mini.latLngToContainerPoint(b.getSouthEast());
+      const size = mini.getSize();
+      const left = Math.max(0, Math.min(size.x, nw.x));
+      const top = Math.max(0, Math.min(size.y, nw.y));
+      const right = Math.max(left, Math.min(size.x, se.x));
+      const bottom = Math.max(top, Math.min(size.y, se.y));
+      setRect({
+        left,
+        top,
+        width: Math.max(6, right - left),
+        height: Math.max(6, bottom - top),
+      });
+    };
+    update();
+    mainMap.on('move zoom moveend zoomend resize', update);
+    mini.on('move zoom moveend zoomend resize', update);
+    return () => {
+      mainMap.off('move zoom moveend zoomend resize', update);
+      mini.off('move zoom moveend zoomend resize', update);
+    };
+  }, [mini, mainMap, miniReady, positions]);
+
+  const onViewportPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!mini || !mainMap) return;
+      e.preventDefault();
+      e.stopPropagation();
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startCenterPx = mini.latLngToContainerPoint(mainMap.getCenter());
+      isDraggingRef.current = true;
+
+      const onMove = (me: PointerEvent) => {
+        const dx = me.clientX - startX;
+        const dy = me.clientY - startY;
+        const newPt = L.point(startCenterPx.x + dx, startCenterPx.y + dy);
+        mainMap.panTo(mini.containerPointToLatLng(newPt), {
+          animate: false,
+        });
+      };
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+        isDraggingRef.current = false;
+        refit();
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    },
+    [mini, mainMap, refit],
+  );
+
+  const onBackgroundClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!mini || !mainMap) return;
+      const box = containerRef.current?.getBoundingClientRect();
+      if (!box) return;
+      const pt = L.point(e.clientX - box.left, e.clientY - box.top);
+      mainMap.panTo(mini.containerPointToLatLng(pt));
+    },
+    [mini, mainMap],
+  );
+
+  // Zoom slider: pointerdown anywhere on the track sets the zoom to the
+  // fraction at that x, and subsequent moves continue to track the cursor.
+  // The track captures pointer events on the handle too (handle is
+  // pointer-events: none) so we never race between "click track" and
+  // "drag handle" logic.
+  const onZoomTrackPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!mainMap) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const track = e.currentTarget;
+      const trackRect = track.getBoundingClientRect();
+      if (trackRect.width <= 0) return;
+      const minZ = mainMap.getMinZoom();
+      const maxZ = mainMap.getMaxZoom();
+      const span = maxZ - minZ;
+      isDraggingRef.current = true;
+
+      const applyFromClientX = (clientX: number) => {
+        const x = Math.max(0, Math.min(trackRect.width, clientX - trackRect.left));
+        const frac = x / trackRect.width;
+        mainMap.setZoom(minZ + frac * span, { animate: false });
+      };
+      applyFromClientX(e.clientX);
+
+      const onMove = (me: PointerEvent) => applyFromClientX(me.clientX);
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+        isDraggingRef.current = false;
+        refit();
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    },
+    [mainMap, refit],
+  );
+
+  if (positions.length === 0) return null;
+
+  return (
+    <div className="route-minimap">
+      <div
+        className="route-minimap__thumb"
+        ref={containerRef}
+        onClick={onBackgroundClick}
+      >
+        <MapContainer
+          className="route-minimap__map"
+          center={[0, 0]}
+          zoom={2}
+          maxZoom={MINIMAP_MAX_ZOOM}
+          zoomControl={false}
+          attributionControl={false}
+          dragging={false}
+          scrollWheelZoom={false}
+          doubleClickZoom={false}
+          boxZoom={false}
+          keyboard={false}
+          touchZoom={false}
+        >
+          <TileLayer
+            url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+            subdomains="abcd"
+            maxZoom={MINIMAP_MAX_ZOOM}
+          />
+          <Polyline
+            positions={positions}
+            pathOptions={{
+              color: ROUTE_COLOR,
+              weight: 2,
+              opacity: 0.95,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }}
+            interactive={false}
+          />
+          <MinimapBootstrap onReady={() => setMiniReady(true)} />
+          <MinimapRefCapture onReady={setMini} />
+        </MapContainer>
+        {rect && (
+          <>
+            {/* Four-sided matte darkens everything outside the viewport
+                rectangle, so the minimap visually emphasizes the portion
+                of the route that's currently rendered on the main map. */}
+            <div
+              className="route-minimap__matte"
+              style={{ left: 0, top: 0, right: 0, height: rect.top }}
+            />
+            <div
+              className="route-minimap__matte"
+              style={{
+                left: 0,
+                top: rect.top + rect.height,
+                right: 0,
+                bottom: 0,
+              }}
+            />
+            <div
+              className="route-minimap__matte"
+              style={{
+                left: 0,
+                top: rect.top,
+                width: rect.left,
+                height: rect.height,
+              }}
+            />
+            <div
+              className="route-minimap__matte"
+              style={{
+                left: rect.left + rect.width,
+                top: rect.top,
+                right: 0,
+                height: rect.height,
+              }}
+            />
+            <div
+              className="route-minimap__viewport"
+              style={{
+                left: rect.left,
+                top: rect.top,
+                width: rect.width,
+                height: rect.height,
+              }}
+              onClick={(e) => e.stopPropagation()}
+              onPointerDown={onViewportPointerDown}
+            />
+          </>
+        )}
+      </div>
+      <div className="route-minimap__zoom-bar">
+        <button
+          type="button"
+          className="route-minimap__zoom-btn"
+          onClick={() => mainMap?.zoomOut(1, { animate: true })}
+          aria-label="Zoom out"
+        >
+          −
+        </button>
+        <div
+          className="route-minimap__zoom-track"
+          onPointerDown={onZoomTrackPointerDown}
+        >
+          <div
+            className="route-minimap__zoom-handle"
+            style={{
+              left: `calc(18px + ${zoomFrac} * (100% - 36px))`,
+            }}
+          />
+        </div>
+        <button
+          type="button"
+          className="route-minimap__zoom-btn"
+          onClick={() => mainMap?.zoomIn(1, { animate: true })}
+          aria-label="Zoom in"
+        >
+          +
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // --------------------------------------------------------------------------
@@ -312,6 +763,7 @@ export default function MapView({ points }: { points: Point[] }) {
   const requestIdRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const mapRef = useRef<L.Map | null>(null);
+  const [mainMap, setMainMap] = useState<L.Map | null>(null);
 
   // Reset selection when the underlying points change (new query).
   useEffect(() => {
@@ -417,10 +869,8 @@ export default function MapView({ points }: { points: Point[] }) {
         center={[20, 0]}
         zoom={2}
         maxZoom={MAX_ZOOM}
-        zoomControl={true}
+        zoomControl={false}
         zoomSnap={0.25}
-        zoomDelta={0.25}
-        wheelPxPerZoomLevel={120}
         scrollWheelZoom
         attributionControl
       >
@@ -429,6 +879,7 @@ export default function MapView({ points }: { points: Point[] }) {
           url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
           subdomains="abcd"
           maxZoom={MAX_ZOOM}
+          noWrap
         />
 
         {haloGroups.map((positions, i) => (
@@ -547,9 +998,13 @@ export default function MapView({ points }: { points: Point[] }) {
           />
         )}
 
+        <WorldMinZoom />
+        <SnappyWheelZoom />
         <FitBounds points={sampled} />
-        <MapRefCapture mapRef={mapRef} />
+        <MapRefCapture mapRef={mapRef} onReady={setMainMap} />
       </MapContainer>
+
+      <RouteMinimap points={sampled} mainMap={mainMap} />
 
       {selected && (
         <DetailCard

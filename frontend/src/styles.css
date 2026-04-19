@@ -447,3 +447,138 @@ body,
   display: flex;
   justify-content: flex-end;
 }
+
+/* ---------- Route minimap (overview + draggable viewport) ----------
+
+   Google-Photos-style thumbnail in the page's light palette: white
+   panel chrome, rounded corners, a slim zoom bar below the thumb
+   `[−] [track with dark pill handle] [+]` that rides on the current
+   zoom fraction of the main map. */
+
+.route-minimap {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: 240px;
+  padding: 10px;
+  border-radius: var(--radius);
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 12px 28px rgba(15, 23, 42, 0.10),
+    0 4px 10px rgba(15, 23, 42, 0.06);
+  z-index: 1050;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Zoom bar: Google-Photos layout — [−] [track with pill handle] [+]. */
+.route-minimap__zoom-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.route-minimap__zoom-btn {
+  width: 28px;
+  height: 24px;
+  flex-shrink: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 18px;
+  line-height: 1;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: 12px;
+  transition: background 0.15s ease, color 0.15s ease;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.route-minimap__zoom-btn:hover {
+  background: #f1f5f9;
+  color: var(--text);
+}
+
+.route-minimap__zoom-btn:active {
+  background: #e2e8f0;
+}
+
+.route-minimap__zoom-track {
+  flex: 1 1 auto;
+  position: relative;
+  height: 24px;
+  border-radius: 12px;
+  background: #f1f5f9;
+  cursor: ew-resize;
+  touch-action: none;
+  transition: background-color 0.15s ease;
+}
+
+.route-minimap__zoom-track:hover {
+  background: #e2e8f0;
+}
+
+.route-minimap__zoom-handle {
+  position: absolute;
+  top: 5px;
+  width: 36px;
+  height: 14px;
+  background: var(--accent);
+  border-radius: 999px;
+  box-shadow:
+    0 1px 3px rgba(15, 23, 42, 0.35),
+    0 0 0 0.5px rgba(15, 23, 42, 0.2);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+/* Thumb: rounded map area with the viewport rectangle overlay. */
+.route-minimap__thumb {
+  position: relative;
+  width: 100%;
+  height: 180px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #f5f5f5;
+  cursor: crosshair;
+}
+
+.route-minimap__map {
+  width: 100%;
+  height: 100%;
+  background: #f5f5f5;
+  cursor: inherit;
+}
+
+/* Matte tiles surrounding the viewport rectangle. Tinted in the
+   basemap's water color, just a shade darker — blends with CARTO's
+   pale sea over water and gives a dusty-teal wash over land. Keeps
+   the minimap in the same visual language as the main map. */
+.route-minimap__matte {
+  position: absolute;
+  background: rgba(96, 125, 147, 0.2);
+  pointer-events: none;
+  z-index: 500;
+}
+
+.route-minimap__viewport {
+  position: absolute;
+  border: none;
+  background: transparent;
+  box-sizing: border-box;
+  cursor: grab;
+  touch-action: none;
+  z-index: 501;
+}
+
+.route-minimap__viewport:active {
+  cursor: grabbing;
+}

@@ -19,7 +19,7 @@ Minimal end-to-end GPS tracking system.
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3) |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
 | **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
 
 ## Data contract
@@ -803,13 +803,39 @@ flowchart LR
   range no longer drifts past midnight) and matches the most common
   ad-hoc query: "where did I go today?". Logout reseeds the same way.
   URL params still take precedence, so shared links are unaffected.
-- **Fractional zoom step** (1.4.2). `MapContainer` is configured with
-  `zoomSnap` / `zoomDelta` = 0.25 and `wheelPxPerZoomLevel` = 120, so
-  the `+`/`−` buttons, keyboard, and mouse wheel all advance the zoom
-  in quarter-level increments. Tile rendering interpolates between
-  integer zoom levels at the cost of slight tile blur off-integer —
-  acceptable trade for finer framing on dense urban traces where the
-  default integer steps oscillated between "too tight" and "too wide".
+- **Fractional zoom snap** (1.4.2, refined in 1.5.0). `MapContainer`
+  uses `zoomSnap = 0.25` so the zoom slider in the minimap rides
+  smoothly across the full `[minZoom..maxZoom]` range. `zoomDelta`
+  stays at Leaflet's default `1`, so the `+`/`−` buttons and a
+  double-tap on the map each advance the zoom by one full level —
+  snappy, predictable. A tiny patch on Leaflet's internal
+  `scrollWheelZoom._performZoom` makes a trackpad pinch / wheel burst
+  also jump ±1 per debounced step instead of the built-in softplus
+  fractional zoom, so swipe feel matches the tap feel without
+  sacrificing slider smoothness.
+- **Route minimap with draggable viewport + zoom slider** (1.5.0).
+  A compact overview panel in the bottom-right renders the whole
+  route in the page palette, with a clear "viewport rectangle"
+  showing which fraction of the route is currently on the main map.
+  Areas outside the rectangle are covered by a soft sea-tinted matte
+  (`rgba(96, 125, 147, 0.2)`) so the in-view portion reads as
+  primary. Drag the rectangle to pan the main map; click elsewhere
+  on the thumb to recenter; use the `[−] [slider] [+]` bar below the
+  thumb to zoom. The minimap normally stays fitted to the route
+  bounds, but expands to `route ∪ main-bounds` when the user zooms
+  the main map out past the route so the rectangle and matte stay
+  symmetric. Refits are paused during a pointer drag to keep the
+  projection stable under the cursor (prior implementation drifted
+  as `moveend` re-projected the minimap mid-drag).
+- **Poles-fit zoom-out floor + `noWrap`** (1.5.0). `WorldMinZoom`
+  dynamically sets `map.setMinZoom(log2(max(W, H) / 256))`, so at
+  the lowest allowed zoom the Web Mercator world exactly fills the
+  larger container axis — no "other state" with empty chrome or
+  horizontal tile wrapping. The basemap TileLayer carries
+  `noWrap = true` to keep the world single-copy. `setMaxBounds` is
+  deliberately NOT used: bound clamping auto-pans the center to fit
+  the view, which caused the route focus (e.g. Valencia) to slide
+  off-screen across a zoom-out → zoom-in sequence.
 - Splits the time-sorted points into groups whenever consecutive fixes
   are more than **5 minutes** apart, so unrelated trips (or power-off
   periods) never get bridged by a straight "teleport" line.
