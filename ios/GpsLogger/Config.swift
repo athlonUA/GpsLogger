@@ -279,6 +279,37 @@ enum Config {
         return cfg
     }
 
+    // MARK: - Auto Wake (significant-location-change kill switch)
+
+    /// UserDefaults key holding the user's Auto Wake preference.
+    /// Boolean. Absent / `false` ⇒ the OS-level
+    /// `startMonitoringSignificantLocationChanges()` subscription is
+    /// **never** registered; iOS cannot relaunch the app from a
+    /// terminated state via SLC. `true` ⇒ the subscription is armed
+    /// during normal launch flow so iOS can wake the app after a
+    /// significant displacement. Default `false` is deliberate: SLC
+    /// is an explicit opt-in, not a feature that should run silently.
+    static let autoWakeEnabledKey = "autoWakeEnabled"
+
+    /// Effective Auto Wake setting. Read every time we need to decide
+    /// whether to arm or disarm the wake subscription, so a runtime
+    /// flip via the hidden settings sheet is reflected immediately
+    /// without depending on cached property state.
+    ///
+    /// **Mutation must go through `LocationTracker.setAutoWakeEnabled`.**
+    /// That method writes UserDefaults *and* runs the matching
+    /// start/stop call on the wake-monitor `CLLocationManager`. Writing
+    /// the key directly (e.g. via `defaults write`) only persists the
+    /// preference; the OS-level SLC subscription would not change until
+    /// the next launch when `LocationTracker.init` reads the value
+    /// during `applyAutoWakeSetting()`. The hidden UI never bypasses
+    /// the tracker, so this is only a footgun for ad-hoc shell users.
+    static var autoWakeEnabled: Bool {
+        UserDefaults.standard.bool(forKey: autoWakeEnabledKey)
+    }
+
+    // MARK: - Diagnostics
+
     /// UserDefaults key that gates the `fix_diagnostics` observability
     /// channel (see below).
     static let syncDiagnosticsEnabledKey = "syncDiagnosticsEnabled"

@@ -40,11 +40,22 @@ import UIKit
 ///   `AppContainer.init()` → `tracker.start()` startup path; there is no
 ///   second startup branch keyed on SLC. By the time the wake event is
 ///   delivered, the regular update stream is already running and is the
-///   authoritative source. SLC's battery cost is documented as
-///   negligible — the system delivers ~500 m displacement events from
-///   cellular triangulation that's already running for system-level
-///   features, so adding a subscription does not materially increase
-///   power use compared to the high-accuracy GPS stream we run anyway.
+///   authoritative source.
+/// - **Auto Wake kill switch** (1.2.12). The wake-monitor subscription
+///   is **off by default**, gated behind `Config.autoWakeEnabled`
+///   (UserDefaults). The hidden settings sheet — reached via 10 taps
+///   on the unsynced-points counter in `ContentView` — calls
+///   `setAutoWakeEnabled(_:)`, which persists the choice and runs the
+///   matching `startMonitoringSignificantLocationChanges()` /
+///   `stopMonitoringSignificantLocationChanges()` call so the disable
+///   is a real OS-level effect, not just a UI flag. Disable is
+///   re-enforced on every launch via the init-time
+///   `applyAutoWakeSetting()` call, which both arms (if the user
+///   previously opted in) and disarms (defensively, in case an older
+///   app version left an SLC subscription registered with the OS).
+///   This keeps the always-on regular tracking unchanged: opening the
+///   app still starts `manager.startUpdatingLocation()` regardless of
+///   the Auto Wake setting.
 final class LocationTracker: NSObject, ObservableObject {
 
     /// Conditions that prevent the tracker from recording a complete
@@ -128,22 +139,34 @@ final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var motionMode: MotionClassifier.Mode = .unknown
     @Published private(set) var impairments: Set<TrackingImpairment> = []
 
+    /// Mirror of `Config.autoWakeEnabled` for SwiftUI bindings. Mutated
+    /// only by `setAutoWakeEnabled(_:)` so the persisted UserDefaults
+    /// value, the OS-level SLC subscription, and the on-screen toggle
+    /// stay in lockstep. Read on the main thread (the Toggle in
+    /// `AutoWakeSettingsView` reads it through a `Binding(get:set:)`
+    /// pair).
+    @Published private(set) var autoWakeEnabled: Bool
+
     private let manager = CLLocationManager()
 
     /// Dedicated low-power CLLocationManager for the
     /// `startMonitoringSignificantLocationChanges()` subscription. Kept
     /// separate from `manager` so SLC fixes do **not** flow through the
     /// tracking pipeline (filter → smoother → stationary → persist).
-    /// SLC is registered once on the first authorization grant and stays
-    /// armed for the rest of the install's lifetime — the OS retains the
-    /// subscription across app launches even when the process is
-    /// terminated, and re-issuing
-    /// `startMonitoringSignificantLocationChanges()` on every authorized
-    /// startup is the documented Apple pattern for re-arming the wake
-    /// path. We never call `stop` on it: the only reason to disarm SLC
-    /// would be permission revocation, which iOS handles for us by
-    /// silently ceasing delivery, and stopping it ourselves would
-    /// throw away the relaunch path the next time auth is regained.
+    ///
+    /// As of 1.2.12 the subscription is **off by default** and only
+    /// armed when the user explicitly opts into Auto Wake via the
+    /// hidden settings sheet. `applyAutoWakeSetting()` is the single
+    /// point that calls `start...` / `stop...` on this manager: it
+    /// runs from `init()` (so an upgrade from an older version that
+    /// left an OS-level subscription behind is actively disarmed),
+    /// from `handleAuthorizationState(.authorizedAlways)` (re-arms
+    /// after an auth grant if the user had Auto Wake on), and from
+    /// `setAutoWakeEnabled(_:)` (the toggle's side effect). The OS
+    /// retains SLC subscriptions across launches, so calling
+    /// `stop...` here is what makes the OFF state a real
+    /// system-level disable — not just a UI flag.
+    ///
     /// `internal` (not `private`) so `WakeMonitorRoutingTests` can
     /// route synthetic CLLocations through this manager's delegate
     /// path and assert no persistence occurs.
@@ -187,6 +210,10 @@ final class LocationTracker: NSObject, ObservableObject {
         self.database = database
         self.appState = appState
         self.authStatus = manager.authorizationStatus
+        // Seed the published mirror from the persisted preference so a
+        // returning user with Auto Wake previously enabled sees the
+        // toggle pre-flipped on the next launch.
+        self.autoWakeEnabled = Config.autoWakeEnabled
         super.init()
 
         manager.delegate = self
@@ -236,6 +263,18 @@ final class LocationTracker: NSObject, ObservableObject {
         // the no-op path without disturbing the tracking pipeline.
         wakeMonitor.delegate = self
         wakeMonitor.allowsBackgroundLocationUpdates = true
+
+        // Apply the persisted Auto Wake state immediately. With the
+        // default OFF, this issues `stopMonitoringSignificantLocationChanges()`
+        // — which is what makes a clean install (or an upgrade from a
+        // pre-1.2.12 version where SLC was always armed) start with no
+        // OS-level wake subscription, instead of silently inheriting
+        // the previous state. With ON, this issues `start...` so the
+        // wake path is armed as early as possible (CoreLocation no-ops
+        // the call until Always auth is granted, at which point
+        // `handleAuthorizationState(.authorizedAlways)` re-runs this
+        // helper and the subscription becomes effective).
+        applyAutoWakeSetting()
 
         classifier.onModeChange = { [weak self] mode in
             self?.apply(mode: mode)
@@ -354,29 +393,59 @@ final class LocationTracker: NSObject, ObservableObject {
         // burns the recovery path. iOS already ceases SLC delivery when
         // permission is revoked, so leaving the subscription armed is
         // safe — the OS handles disarming for us and re-arms it the
-        // next time `ensureWakeMonitorRegistered()` runs after a grant.
+        // next time `applyAutoWakeSetting()` runs after a grant.
         DispatchQueue.main.async { [weak self] in
             self?.isTracking = false
         }
     }
 
-    /// Idempotent. Subscribes `wakeMonitor` to
-    /// `startMonitoringSignificantLocationChanges()`. Called from
-    /// `handleAuthorizationState(.authorizedAlways)` so the wake path
-    /// is armed once on first grant and re-armed on every subsequent
-    /// launch (Apple's documented contract: even though iOS retains
-    /// SLC across launches, each new process must re-issue the start
-    /// call to receive the next event). Re-calling on an already-armed
-    /// manager is a no-op, so an SLC-driven relaunch that re-runs this
-    /// path does not double-subscribe.
+    /// Bidirectional, idempotent. Aligns the OS-level SLC subscription
+    /// on `wakeMonitor` with the persisted `Config.autoWakeEnabled`
+    /// preference. ON ⇒ start, OFF ⇒ stop. Called from three sites:
     ///
-    /// Always-authorization is required for SLC delivery; we gate this
-    /// call accordingly. With `.authorizedWhenInUse`, the OS would
-    /// silently refuse to deliver SLC events anyway, so calling start
-    /// would be wasted — and the impairment banner already directs the
-    /// user to upgrade.
-    private func ensureWakeMonitorRegistered() {
-        wakeMonitor.startMonitoringSignificantLocationChanges()
+    ///   - `init()` — defensively disarms any subscription left by a
+    ///     pre-1.2.12 build where SLC was armed unconditionally, and
+    ///     arms the subscription pre-emptively if the user previously
+    ///     opted in. With Always auth not yet granted, the call is a
+    ///     no-op until grant.
+    ///   - `handleAuthorizationState(.authorizedAlways)` — re-arms
+    ///     after a fresh grant or a re-grant following denial, so the
+    ///     subscription becomes effective the moment the OS will
+    ///     accept it.
+    ///   - `setAutoWakeEnabled(_:)` — the toggle's side effect. Apple
+    ///     guarantees `stopMonitoringSignificantLocationChanges()` is
+    ///     a real OS-level halt: the subscription is removed from the
+    ///     system database, so iOS will not relaunch this app on
+    ///     significant displacement until `start...` is called again.
+    ///
+    /// Re-calling start on an already-armed manager and stop on a
+    /// never-armed manager are both documented no-ops, so the three
+    /// call sites do not need to coordinate.
+    private func applyAutoWakeSetting() {
+        if Config.autoWakeEnabled {
+            wakeMonitor.startMonitoringSignificantLocationChanges()
+        } else {
+            wakeMonitor.stopMonitoringSignificantLocationChanges()
+        }
+    }
+
+    /// Toggle the Auto Wake (SLC-based relaunch) feature. Persists the
+    /// user's choice in `UserDefaults` so the next launch picks it up
+    /// via `Config.autoWakeEnabled`, updates the published mirror
+    /// driving the UI, and immediately arms or disarms the OS-level
+    /// SLC subscription via `applyAutoWakeSetting()`. The OFF path is
+    /// what gives the kill switch its teeth: it produces a real
+    /// `stopMonitoringSignificantLocationChanges()` call, not just a
+    /// UI flag — iOS will not wake the app from significant
+    /// displacement until the user toggles back on.
+    ///
+    /// Has no side effect on regular tracking, sync, points, or
+    /// device identity. Must be called on the main thread (the only
+    /// caller is the SwiftUI Toggle binding in `AutoWakeSettingsView`).
+    func setAutoWakeEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Config.autoWakeEnabledKey)
+        autoWakeEnabled = enabled
+        applyAutoWakeSetting()
     }
 
     /// Single place that reacts to every authorization state change. Keeps
@@ -390,12 +459,15 @@ final class LocationTracker: NSObject, ObservableObject {
             // location auth, and start/resume the update stream.
             removeImpairment(.permissionDenied)
             removeImpairment(.backgroundRequiresAlways)
-            // Arm the SLC wake path. Idempotent — re-calling on an
-            // already-armed manager is a no-op — so it's safe to run
-            // this on every grant transition (cold start, re-grant
-            // after deny, SLC-driven relaunch). SLC requires Always,
-            // which is exactly the branch we're in.
-            ensureWakeMonitorRegistered()
+            // Apply the Auto Wake state with the OS now ready to
+            // accept SLC. If the user has opted in (and SLC was
+            // pre-issued in init while auth was still pending), this
+            // re-issue is what activates the subscription per Apple's
+            // contract. If the user has opted out, this is a defensive
+            // stop — same effect as init's call, kept for symmetry so
+            // every authoritative state transition leaves the wake
+            // subscription in a known state.
+            applyAutoWakeSetting()
             if !isTracking {
                 // Re-grant after a previous denial: drop stale filter
                 // anchors so the first accepted fix becomes a fresh

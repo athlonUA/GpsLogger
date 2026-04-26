@@ -22,6 +22,24 @@ import CoreLocation
 /// accepted.
 final class WakeMonitorRoutingTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // Keep tests deterministic regardless of the developer's
+        // machine state. `Config.autoWakeEnabled` is read by
+        // `LocationTracker.init` to decide whether the wake monitor
+        // should be armed at startup; if a previous run (or the user
+        // manually flipping the in-app toggle) left the key set to
+        // `true`, the start-on-init call would still be harmless here
+        // (no permission, so no SLC delivery), but pinning the key to
+        // its default OFF state keeps the test surface predictable.
+        UserDefaults.standard.removeObject(forKey: Config.autoWakeEnabledKey)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: Config.autoWakeEnabledKey)
+        super.tearDown()
+    }
+
     /// Yield long enough for any incorrectly-scheduled async work
     /// (`persistQueue.async`, then a hop back to main for the
     /// `unsyncedCount` bump) to drain. 250 ms is conservative — both

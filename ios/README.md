@@ -41,7 +41,8 @@ ios/
     ├── StationaryDetectorTests.swift   ← 11 cases for Phase-A/B state machine + clock-skew guard + gap-reset
     ├── TrackingImpairmentTests.swift    ←  7 cases for the 1.2.8 silent-failure mappings
     ├── SyncPolicyTests.swift           ← 10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config + diagnostics flag
-    └── WakeMonitorRoutingTests.swift   ←  3 cases locking in the 1.2.11 wake-only SLC contract (no persist on wake events)
+    ├── WakeMonitorRoutingTests.swift   ←  3 cases locking in the 1.2.11 wake-only SLC contract (no persist on wake events)
+    └── AutoWakeSettingsTests.swift     ←  8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
 ```
 
 ## One-time setup (xcodegen-based)
@@ -269,17 +270,44 @@ covers every device you've built for.
   flow runs through the existing `AppContainer.init()` →
   `tracker.start()` startup path (no second startup branch keyed on
   SLC); by the time the wake event is delivered the regular update
-  stream is already running and is the authoritative source. The SLC
-  subscription is armed once on the first `.authorizedAlways` grant
-  via `ensureWakeMonitorRegistered()` (idempotent) and re-armed on
-  every subsequent launch following Apple's documented contract; it
-  is never actively stopped, since iOS implicitly halts SLC delivery
-  on permission revocation and stopping it ourselves would just throw
-  away the relaunch path the next time auth is regained. **Battery:**
-  SLC is system-level cellular triangulation that is already running
-  for OS-level features, so adding the subscription does not
-  materially increase power use compared to the high-accuracy GPS
-  stream the app runs anyway.
+  stream is already running and is the authoritative source.
+- **Auto Wake kill switch** (1.2.12). The wake-monitor subscription
+  is now an explicit opt-in, **off by default**. State lives in
+  `UserDefaults` under `Config.autoWakeEnabledKey` (key
+  `"autoWakeEnabled"`); the absence-or-`false` default is what makes
+  a clean install (or an upgrade from a pre-1.2.12 build that armed
+  SLC unconditionally) start with no OS-level wake subscription.
+  `LocationTracker.applyAutoWakeSetting()` is the single point that
+  reconciles the persisted preference with the OS — ON ⇒
+  `startMonitoringSignificantLocationChanges()`, OFF ⇒
+  `stopMonitoringSignificantLocationChanges()` — and it runs from
+  three places: `init()` (so an upgrade actively disarms a leftover
+  subscription), `handleAuthorizationState(.authorizedAlways)` (so
+  the subscription becomes effective the moment Always auth is
+  granted), and `setAutoWakeEnabled(_:)` (the toggle's side effect).
+  The OFF path produces a real OS-level halt of SLC delivery, not
+  just a UI flag — iOS will not relaunch the app on significant
+  movement until the user re-enables Auto Wake. Toggling has zero
+  side effect on stored points, device identity, sync state, or
+  always-on regular tracking; opening the app manually still calls
+  `manager.startUpdatingLocation()` regardless.
+
+  **Hidden access.** The toggle has no visible entry point on the
+  main screen. To reach it, tap the unsynced-points counter ten
+  times in a row (≤ 1.5 s between taps); a single-row Auto Wake
+  settings sheet then appears. The 10-tap accumulator lives in
+  `ContentView`'s local `@State` and resets on every present, on a
+  dropped-cadence stray gap, and on every cold launch. The thresholds
+  (`tapWindow = 1.5 s`, `tapsToReveal = 10`) sit comfortably above
+  iOS's double-tap interval so the gesture doesn't interfere with
+  accessibility shortcuts.
+
+  **Battery.** When the user opts in, SLC is system-level cellular
+  triangulation that is already running for OS-level features, so
+  adding the subscription does not materially increase power use
+  compared to the high-accuracy GPS stream the app runs anyway. When
+  opted out, the subscription is actively removed at the OS level so
+  the device spends no power on wake monitoring.
 - **Multi-modal `activityType`**: a single install covers walking,
   cycling, and motorized transport (car, bus, train) through
   `MotionClassifier`. It wraps `CMMotionActivityManager` — which reads
