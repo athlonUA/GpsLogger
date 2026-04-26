@@ -54,7 +54,18 @@ function FitBounds({ points }: { points: Point[] }) {
     const bounds = L.latLngBounds(
       points.map((p) => [p.latitude, p.longitude] as [number, number]),
     );
-    map.fitBounds(bounds, { padding: [60, 60], maxZoom: 17 });
+    // Auto-visualize on a fresh tab can resolve the fetch before Leaflet
+    // has finished measuring its container; fitBounds then computes zoom
+    // against a stale (often 0) size and snaps the view to the world.
+    // Re-measure first via `invalidateSize`, and defer one frame so the
+    // panel/map flex layout has settled before the fit lands. The
+    // `resize` that `invalidateSize` fires also wakes `WorldMinZoom`,
+    // so its minZoom floor matches the now-correct container size.
+    const id = requestAnimationFrame(() => {
+      map.invalidateSize({ animate: false });
+      map.fitBounds(bounds, { padding: [60, 60], maxZoom: 17 });
+    });
+    return () => cancelAnimationFrame(id);
   }, [points, map]);
   return null;
 }
