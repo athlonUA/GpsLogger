@@ -26,6 +26,25 @@ import UIKit
 ///   and cycling use `.fitness`, motorized transport (car, bus, train) uses
 ///   `.automotiveNavigation`, and the default on startup — before CoreMotion
 ///   has had time to classify — is `.fitness`. See `MotionClassifier.swift`.
+/// - **Two-manager design** (1.2.11). The tracker owns two
+///   `CLLocationManager` instances with strictly separated roles:
+///     1. `manager` drives `startUpdatingLocation()` and is the *only*
+///        path into the persist pipeline.
+///     2. `wakeMonitor` is dedicated to
+///        `startMonitoringSignificantLocationChanges()`. Its sole purpose
+///        is to let iOS relaunch the process from a terminated state if
+///        the user has stopped opening the app. Its delegate callbacks
+///        are intentional no-ops — SLC is **only a wake trigger**, never
+///        a tracking source.
+///   The relaunch flow runs through the existing
+///   `AppContainer.init()` → `tracker.start()` startup path; there is no
+///   second startup branch keyed on SLC. By the time the wake event is
+///   delivered, the regular update stream is already running and is the
+///   authoritative source. SLC's battery cost is documented as
+///   negligible — the system delivers ~500 m displacement events from
+///   cellular triangulation that's already running for system-level
+///   features, so adding a subscription does not materially increase
+///   power use compared to the high-accuracy GPS stream we run anyway.
 final class LocationTracker: NSObject, ObservableObject {
 
     /// Conditions that prevent the tracker from recording a complete
@@ -110,6 +129,26 @@ final class LocationTracker: NSObject, ObservableObject {
     @Published private(set) var impairments: Set<TrackingImpairment> = []
 
     private let manager = CLLocationManager()
+
+    /// Dedicated low-power CLLocationManager for the
+    /// `startMonitoringSignificantLocationChanges()` subscription. Kept
+    /// separate from `manager` so SLC fixes do **not** flow through the
+    /// tracking pipeline (filter → smoother → stationary → persist).
+    /// SLC is registered once on the first authorization grant and stays
+    /// armed for the rest of the install's lifetime — the OS retains the
+    /// subscription across app launches even when the process is
+    /// terminated, and re-issuing
+    /// `startMonitoringSignificantLocationChanges()` on every authorized
+    /// startup is the documented Apple pattern for re-arming the wake
+    /// path. We never call `stop` on it: the only reason to disarm SLC
+    /// would be permission revocation, which iOS handles for us by
+    /// silently ceasing delivery, and stopping it ourselves would
+    /// throw away the relaunch path the next time auth is regained.
+    /// `internal` (not `private`) so `WakeMonitorRoutingTests` can
+    /// route synthetic CLLocations through this manager's delegate
+    /// path and assert no persistence occurs.
+    let wakeMonitor = CLLocationManager()
+
     private let database: Database
     private let appState: AppState
 
@@ -183,6 +222,20 @@ final class LocationTracker: NSObject, ObservableObject {
         manager.pausesLocationUpdatesAutomatically = false
         manager.allowsBackgroundLocationUpdates = true
         manager.showsBackgroundLocationIndicator = true
+
+        // Wake monitor: minimum config. `desiredAccuracy`,
+        // `distanceFilter`, `activityType`, and
+        // `pausesLocationUpdatesAutomatically` do not influence SLC —
+        // the system delivers cellular-triangulation fixes at its own
+        // cadence regardless. Setting `allowsBackgroundLocationUpdates`
+        // is a defensive no-op (SLC delivery does not require it, but
+        // some Apple Forum reports show the property defending against
+        // edge cases on older OS revisions). The delegate is shared
+        // with `manager`; `LocationTracker` identity-checks the source
+        // in every callback so wake-monitor events can be routed to
+        // the no-op path without disturbing the tracking pipeline.
+        wakeMonitor.delegate = self
+        wakeMonitor.allowsBackgroundLocationUpdates = true
 
         classifier.onModeChange = { [weak self] mode in
             self?.apply(mode: mode)
@@ -286,20 +339,6 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private func beginUpdates() {
         manager.startUpdatingLocation()
-        // Significant-location-changes is a secondary wake path. iOS can
-        // suspend or kill the app under memory pressure even with
-        // `.location` bg mode active; when that happens, regular
-        // `didUpdateLocations` callbacks stop until `distanceFilter` is
-        // crossed. SLC is cellular-triangulation powered (no extra GPS
-        // radio cost), fires on ~500 m displacements, and critically
-        // **relaunches the app** via `UIApplicationLaunchOptionsLocationKey`
-        // even from terminated state. On relaunch, `AppContainer.init`
-        // reconstructs the tracker and calls `start()` → `beginUpdates()`
-        // → the regular update stream resumes. Defense in depth against
-        // long background blackouts; no behavior change under normal
-        // operation because SLC fixes flow through the same filter path
-        // and either get accepted or correctly rejected on poor accuracy.
-        manager.startMonitoringSignificantLocationChanges()
         DispatchQueue.main.async { [weak self] in
             self?.isTracking = true
         }
@@ -307,10 +346,37 @@ final class LocationTracker: NSObject, ObservableObject {
 
     private func stopUpdates() {
         manager.stopUpdatingLocation()
-        manager.stopMonitoringSignificantLocationChanges()
+        // Intentionally do **not** call
+        // `wakeMonitor.stopMonitoringSignificantLocationChanges()` here.
+        // The wake subscription is the only thing that lets iOS relaunch
+        // a terminated app for a user who forgot to open it; throwing it
+        // away on every authorization revocation or transient stop just
+        // burns the recovery path. iOS already ceases SLC delivery when
+        // permission is revoked, so leaving the subscription armed is
+        // safe — the OS handles disarming for us and re-arms it the
+        // next time `ensureWakeMonitorRegistered()` runs after a grant.
         DispatchQueue.main.async { [weak self] in
             self?.isTracking = false
         }
+    }
+
+    /// Idempotent. Subscribes `wakeMonitor` to
+    /// `startMonitoringSignificantLocationChanges()`. Called from
+    /// `handleAuthorizationState(.authorizedAlways)` so the wake path
+    /// is armed once on first grant and re-armed on every subsequent
+    /// launch (Apple's documented contract: even though iOS retains
+    /// SLC across launches, each new process must re-issue the start
+    /// call to receive the next event). Re-calling on an already-armed
+    /// manager is a no-op, so an SLC-driven relaunch that re-runs this
+    /// path does not double-subscribe.
+    ///
+    /// Always-authorization is required for SLC delivery; we gate this
+    /// call accordingly. With `.authorizedWhenInUse`, the OS would
+    /// silently refuse to deliver SLC events anyway, so calling start
+    /// would be wasted — and the impairment banner already directs the
+    /// user to upgrade.
+    private func ensureWakeMonitorRegistered() {
+        wakeMonitor.startMonitoringSignificantLocationChanges()
     }
 
     /// Single place that reacts to every authorization state change. Keeps
@@ -324,6 +390,12 @@ final class LocationTracker: NSObject, ObservableObject {
             // location auth, and start/resume the update stream.
             removeImpairment(.permissionDenied)
             removeImpairment(.backgroundRequiresAlways)
+            // Arm the SLC wake path. Idempotent — re-calling on an
+            // already-armed manager is a no-op — so it's safe to run
+            // this on every grant transition (cold start, re-grant
+            // after deny, SLC-driven relaunch). SLC requires Always,
+            // which is exactly the branch we're in.
+            ensureWakeMonitorRegistered()
             if !isTracking {
                 // Re-grant after a previous denial: drop stale filter
                 // anchors so the first accepted fix becomes a fresh
@@ -500,6 +572,12 @@ final class LocationTracker: NSObject, ObservableObject {
 
 extension LocationTracker: CLLocationManagerDelegate {
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        // Both managers share the app's authorization state, so iOS
+        // fires this on each instance. Respond once via the primary
+        // tracking manager; the wakeMonitor's redundant callback
+        // would just re-run the same idempotent body and is safe to
+        // ignore.
+        guard manager === self.manager else { return }
         let status = manager.authorizationStatus
         DispatchQueue.main.async { [weak self] in
             self?.authStatus = status
@@ -522,6 +600,9 @@ extension LocationTracker: CLLocationManagerDelegate {
     /// waiting for the next system event. Idempotent — re-calling
     /// `startUpdatingLocation` on an already-running manager is a no-op.
     func locationManagerDidPauseLocationUpdates(_ manager: CLLocationManager) {
+        // SLC has no pause/resume semantics; only the regular update
+        // stream can pause. Ignore any spurious wake-monitor callback.
+        guard manager === self.manager else { return }
         #if DEBUG
         print("[tracker] locationManagerDidPauseLocationUpdates — re-issuing startUpdatingLocation()")
         #endif
@@ -533,12 +614,32 @@ extension LocationTracker: CLLocationManagerDelegate {
     }
 
     func locationManagerDidResumeLocationUpdates(_ manager: CLLocationManager) {
+        guard manager === self.manager else { return }
         #if DEBUG
         print("[tracker] locationManagerDidResumeLocationUpdates")
         #endif
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        // SLC events from `wakeMonitor` are intentional no-ops here.
+        // Their job — relaunching a terminated process via
+        // `UIApplicationLaunchOptionsLocationKey` — is already done by
+        // the time this delegate fires; the relaunched
+        // `AppContainer.init()` has called `tracker.start()`, which
+        // started the regular update stream, and that stream is the
+        // authoritative source. Persisting the SLC fix on top of it
+        // would just produce a low-quality, non-GNSS row, double-bump
+        // the unsynced counter, and trigger a redundant sync — exactly
+        // the duplicate work this design eliminates.
+        guard manager === self.manager else {
+            #if DEBUG
+            if let last = locations.last {
+                print("[tracker] SLC wake event x\(locations.count) @ \(last.coordinate.latitude),\(last.coordinate.longitude) — ignored (regular tracking authoritative)")
+            }
+            #endif
+            return
+        }
+
         // Apple documents `locations` as already sorted ascending by
         // timestamp, and the spike-buffer + chronology logic in
         // `LocationFilter` depends on that ordering. Sort defensively
@@ -683,6 +784,17 @@ extension LocationTracker: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        // Wake-monitor errors do not affect the tracking pipeline; log
+        // them under DEBUG and return. We never call `stopUpdates()`
+        // off a wake-monitor error, since doing so would pull down the
+        // regular tracking stream that has nothing to do with the SLC
+        // failure.
+        guard manager === self.manager else {
+            #if DEBUG
+            print("[tracker] wakeMonitor error: \(error.localizedDescription) — ignoring")
+            #endif
+            return
+        }
         // `CLError` carries a coded reason; the raw `error.localizedDescription`
         // throws useful context away. Handle the codes we care about and
         // log the rest under DEBUG.

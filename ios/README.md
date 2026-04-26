@@ -40,7 +40,8 @@ ios/
     ├── MotionClassifierTests.swift     ← 10 cases for the pure classification rules
     ├── StationaryDetectorTests.swift   ← 11 cases for Phase-A/B state machine + clock-skew guard + gap-reset
     ├── TrackingImpairmentTests.swift    ←  7 cases for the 1.2.8 silent-failure mappings
-    └── SyncPolicyTests.swift           ← 10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config + diagnostics flag
+    ├── SyncPolicyTests.swift           ← 10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config + diagnostics flag
+    └── WakeMonitorRoutingTests.swift   ←  3 cases locking in the 1.2.11 wake-only SLC contract (no persist on wake events)
 ```
 
 ## One-time setup (xcodegen-based)
@@ -256,12 +257,29 @@ covers every device you've built for.
   The `didUpdateLocations` array is sorted ascending by timestamp
   before iteration (1.2.5 defensive sort) so a future iOS change in
   array ordering cannot corrupt the spike-buffer logic.
-  `startMonitoringSignificantLocationChanges` is subscribed alongside
-  the regular update stream (1.2.6 fallback wake) so iOS can relaunch
-  the app via `UIApplicationLaunchOptionsLocationKey` even from a
-  terminated state; SLC fires on ~500 m movements and is
-  cellular-triangulation powered, so the extra subscription has no
-  battery cost.
+- **SLC as a wake-only trigger** (refined 1.2.11). The tracker owns a
+  second `CLLocationManager` (`wakeMonitor`) dedicated solely to
+  `startMonitoringSignificantLocationChanges()`. Its only purpose is
+  to let iOS relaunch the process via
+  `UIApplicationLaunchOptionsLocationKey` for users who haven't opened
+  the app in a while. SLC is **not** a tracking source — wake-monitor
+  delegate callbacks are intentional no-ops, identity-checked against
+  `self.wakeMonitor` so SLC fixes never enter the
+  filter → smoother → stationary → persist pipeline. The relaunch
+  flow runs through the existing `AppContainer.init()` →
+  `tracker.start()` startup path (no second startup branch keyed on
+  SLC); by the time the wake event is delivered the regular update
+  stream is already running and is the authoritative source. The SLC
+  subscription is armed once on the first `.authorizedAlways` grant
+  via `ensureWakeMonitorRegistered()` (idempotent) and re-armed on
+  every subsequent launch following Apple's documented contract; it
+  is never actively stopped, since iOS implicitly halts SLC delivery
+  on permission revocation and stopping it ourselves would just throw
+  away the relaunch path the next time auth is regained. **Battery:**
+  SLC is system-level cellular triangulation that is already running
+  for OS-level features, so adding the subscription does not
+  materially increase power use compared to the high-accuracy GPS
+  stream the app runs anyway.
 - **Multi-modal `activityType`**: a single install covers walking,
   cycling, and motorized transport (car, bus, train) through
   `MotionClassifier`. It wraps `CMMotionActivityManager` — which reads
