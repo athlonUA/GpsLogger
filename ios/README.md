@@ -43,7 +43,7 @@ ios/
     ├── SyncPolicyTests.swift           ← 10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config + diagnostics flag
     ├── WakeMonitorRoutingTests.swift   ←  3 cases locking in the 1.2.11 wake-only SLC contract (no persist on wake events)
     ├── AutoWakeSettingsTests.swift     ←  8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
-    └── HomeZoneTests.swift             ← 19 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
+    └── HomeZoneTests.swift             ← 23 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
 ```
 
 ## One-time setup (xcodegen-based)

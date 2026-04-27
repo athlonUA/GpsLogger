@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (104 cases across 10 test files)
+### iOS unit tests (108 cases across 10 test files)
 
 ```
 cd ios
@@ -209,7 +209,7 @@ kill switch contract:
   the points table — pure side-effect on UserDefaults + the SLC
   subscription
 
-**`HomeZoneTests` (19 cases)** — the 1.2.13 unified home-zone
+**`HomeZoneTests` (23 cases)** — the 1.2.13 unified home-zone
 anchor + deferred mode + state-machine invariants:
 
 - *Anchor round-trip + freshness*: `lastAnchor()` returns nil

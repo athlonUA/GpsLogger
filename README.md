@@ -470,7 +470,7 @@ flowchart LR
     `launchOptions[.location]` flag instead of guessing from
     `applicationState`. The `@UIApplicationDelegateAdaptor` is
     the minimal SwiftUI hook needed to surface that dictionary.
-  - 19 new tests in `HomeZoneTests` cover the round-trip + freshness
+  - 23 new tests in `HomeZoneTests` cover the round-trip + freshness
     invariants, the four-condition decision matrix for
     `shouldEnterDeferredMode`, wake-fix evaluation (inside / outside /
     no-anchor), persist-pipeline gating (suppress / promote / stale /
@@ -1055,5 +1055,5 @@ GpsLogger/
         ├── SyncPolicyTests.swift           10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config regression guard + diagnostics flag default/override
         ├── WakeMonitorRoutingTests.swift    3 cases for the 1.2.11 wake-only SLC contract (no persist on wake events)
         ├── AutoWakeSettingsTests.swift      8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
-        └── HomeZoneTests.swift             19 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
+        └── HomeZoneTests.swift             23 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
 ```
