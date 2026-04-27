@@ -1,8 +1,41 @@
 import SwiftUI
 import BackgroundTasks
+import UIKit
+
+/// AppDelegate exists for one specific reason: capturing
+/// `application(_:didFinishLaunchingWithOptions:)` so we can read
+/// `launchOptions[.location]` — Apple's authoritative signal that
+/// iOS spawned the process to deliver a SLC event. Pure-SwiftUI
+/// lifecycle does not surface that dictionary, so without an
+/// `@UIApplicationDelegateAdaptor` we'd be guessing at SLC-launch
+/// context based on `applicationState` heuristics, which is fragile.
+///
+/// The delegate also kicks off the second phase of `AppContainer`'s
+/// boot sequence (`bootstrap(launchedForLocation:)`), which is where
+/// `tracker.start` actually fires. This lets us thread the
+/// SLC-launch flag into the tracker's mode decision (`.fullTracking`
+/// vs `.deferred`) without relying on a global mutable flag.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        let launchedForLocation = launchOptions?[.location] != nil
+        #if DEBUG
+        if launchedForLocation {
+            print("[app] launched by SLC event")
+        } else {
+            print("[app] launched by user / system (no SLC key)")
+        }
+        #endif
+        AppContainer.shared.bootstrap(launchedForLocation: launchedForLocation)
+        return true
+    }
+}
 
 @main
 struct GpsLoggerApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var appState = AppContainer.shared.appState
     @StateObject private var tracker = AppContainer.shared.tracker
     @Environment(\.scenePhase) private var scenePhase
@@ -39,11 +72,27 @@ struct GpsLoggerApp: App {
                 .environmentObject(tracker)
         }
         .onChange(of: scenePhase) { phase in
-            // Queue the next refresh on every background transition. Calls
-            // to `submit` replace any existing pending request for the same
-            // identifier, so it is safe to call this repeatedly.
-            if phase == .background {
+            switch phase {
+            case .background:
+                // Queue the next refresh on every background
+                // transition. Calls to `submit` replace any existing
+                // pending request for the same identifier, so it is
+                // safe to call this repeatedly.
                 Self.scheduleBackgroundRefresh()
+            case .active:
+                // User just opened the app (or returned to it from
+                // backgrounded state). If we are in `.deferred`
+                // (because iOS launched us via SLC into a fresh home
+                // zone), promote to full tracking now — the user's
+                // explicit interaction is the strongest possible
+                // signal of intent. exitDeferredIfNeeded is a no-op
+                // when already in `.fullTracking`, so this is safe to
+                // run on every .active transition.
+                tracker.exitDeferredIfNeeded()
+            case .inactive:
+                break
+            @unknown default:
+                break
             }
         }
     }

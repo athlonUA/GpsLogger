@@ -16,7 +16,7 @@ Minimal end-to-end GPS tracking system.
 
 | Component | Tech | Purpose |
 |---|---|---|
-| **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis |
+| **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis; opt-in Auto Wake via SLC (1.2.12) with a unified home-zone anchor (1.2.13) that silences overnight wake-up phantoms and indoor-jitter writes |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
 | **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
@@ -411,6 +411,88 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **Unified home-zone anchor** (1.2.13). Three previously
+  independent decisions — should we enter `.deferred` on a
+  SLC-launch, should a wake-monitor fix promote out of `.deferred`,
+  should this accepted fix bypass the persist pipeline — collapse
+  into one predicate: distance from the persisted anchor against
+  `Config.homeZoneRadiusMeters` (100 m). Anchor lives in
+  `UserDefaults` as a triple (`lastAnchorLatitude`,
+  `lastAnchorLongitude`, `lastAnchorTimestamp`), updated by
+  `LocationTracker.persist(_:)` after every successful SQLite
+  insert, so it tracks the user's most recent recorded position
+  without any "set my home" UI. Stale anchors (> 24 h) short-
+  circuit all three call sites back to pre-1.2.13 always-on
+  behavior, so a returning user from a long trip immediately
+  records again at the new location.
+  - **Phantom-points fix.** The 2026-04-26 forensic case (two
+    points appearing 33 m and 44 m from the evening's last
+    accepted fix, after a 19-minute LocationFilter-rejected
+    indoor window — both inside the 100 m home zone but bypassed
+    by `StationaryDetector`'s gap-reset rule) is the original
+    motivator. The home-zone gate sits above smoother + stationary
+    in `LocationTracker.maybePersist`, so any fix landing within
+    the radius is suppressed before the gap-reset can fire.
+  - **Overnight quiet contract.** When iOS spawns the process
+    specifically because of a SLC event
+    (`launchOptions[.location] != nil` captured by a new
+    `AppDelegate`), Auto Wake is enabled, and a fresh anchor
+    exists, the tracker enters `.deferred` mode — regular GPS
+    stream stays off, only the wake-monitor subscription is
+    armed. The blue location indicator does not light up; iOS
+    re-suspends the process shortly. The first wake-monitor SLC
+    fix outside the home zone promotes to `.fullTracking`.
+    Eliminates the visible blue-pill blink + phantom one-off
+    points that overnight cellular-tower handoffs produced on
+    every SLC delivery.
+  - **Conscious-launch UX preserved bit-for-bit.** Manual
+    app-icon taps, App Switcher returns, and BGAppRefresh wakes
+    have `launchOptions[.location] == nil`, so
+    `shouldEnterDeferredMode` returns `false` regardless of
+    anchor / Auto Wake state. The deferred path is unreachable
+    from any user-initiated launch.
+  - **Single-evaluation contract for the SLC-launch flag.**
+    `launchedForLocation` is cleared at the end of every
+    `handleAuthorizationState` evaluation, so a user who revokes
+    permission and re-grants it later (while actively in the
+    foreground app) is NOT pushed back into deferred. The flag
+    captures *boot* context, not a persistent property.
+  - **Mode invariants under permission downgrade.** An
+    `.authorizedAlways → .authorizedWhenInUse` downgrade while in
+    `.deferred` defensively promotes to `.fullTracking` — SLC
+    requires Always per Apple's contract, so under WhenInUse the
+    wake-monitor would go silent and we'd otherwise be stuck.
+  - **Bootstrapping change.** `AppContainer.init()` is now
+    lightweight (DB / identity / state only). A new
+    `bootstrap(launchedForLocation:)` is called from
+    `AppDelegate.application(_:didFinishLaunchingWithOptions:)`
+    so the tracker's mode decision sees the authoritative
+    `launchOptions[.location]` flag instead of guessing from
+    `applicationState`. The `@UIApplicationDelegateAdaptor` is
+    the minimal SwiftUI hook needed to surface that dictionary.
+  - 19 new tests in `HomeZoneTests` cover the round-trip + freshness
+    invariants, the four-condition decision matrix for
+    `shouldEnterDeferredMode`, wake-fix evaluation (inside / outside /
+    no-anchor), persist-pipeline gating (suppress / promote / stale /
+    anchor-update), `exitDeferredIfNeeded` idempotency, the
+    flag-clear contract under both Always and WhenInUse grants,
+    and the WhenInUse mode invariants (cold grant + downgrade-from-
+    deferred).
+- **Auto Wake kill switch + dedicated wake monitor** (1.2.11 / 1.2.12).
+  The SLC subscription is owned by a separate `CLLocationManager`
+  (`wakeMonitor`) so SLC fixes never enter the persist pipeline —
+  they identity-check against `self.wakeMonitor` in the delegate
+  and short-circuit. As of 1.2.12 the subscription is **off by
+  default**, gated behind `Config.autoWakeEnabled` (UserDefaults
+  key `autoWakeEnabled`). The hidden settings sheet is reached by
+  tapping the unsynced-points counter ten times in a row
+  (≤ 1.5 s between taps); the toggle's setter persists the
+  preference and runs the matching `start...` /
+  `stopMonitoringSignificantLocationChanges()` call so OFF is a
+  real OS-level halt, not a UI flag. Toggling has zero side
+  effect on stored points, sync state, or the always-on regular
+  tracking; manual app launches still record regardless of the
+  setting.
 - **Wi-Fi-only uploads + opt-in diagnostics** (1.2.10). Battery-first,
   LAN-first product policy: sync must never run on cellular, personal
   hotspot, or Low Data Mode. The LAN backend isn't even reachable on
@@ -970,5 +1052,8 @@ GpsLogger/
         ├── MotionClassifierTests.swift     10 cases for the pure classification rules
         ├── StationaryDetectorTests.swift   11 cases for the Phase-A/B state machine + clock-skew guard + gap-reset
         ├── TrackingImpairmentTests.swift    7 cases covering the 1.2.8 silent-failure mappings (accuracyAuthorization, backgroundRefreshStatus, shortMessage sanity)
-        └── SyncPolicyTests.swift           10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config regression guard + diagnostics flag default/override
+        ├── SyncPolicyTests.swift           10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config regression guard + diagnostics flag default/override
+        ├── WakeMonitorRoutingTests.swift    3 cases for the 1.2.11 wake-only SLC contract (no persist on wake events)
+        ├── AutoWakeSettingsTests.swift      8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
+        └── HomeZoneTests.swift             19 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
 ```

@@ -42,7 +42,8 @@ ios/
     ├── TrackingImpairmentTests.swift    ←  7 cases for the 1.2.8 silent-failure mappings
     ├── SyncPolicyTests.swift           ← 10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config + diagnostics flag
     ├── WakeMonitorRoutingTests.swift   ←  3 cases locking in the 1.2.11 wake-only SLC contract (no persist on wake events)
-    └── AutoWakeSettingsTests.swift     ←  8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
+    ├── AutoWakeSettingsTests.swift     ←  8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
+    └── HomeZoneTests.swift             ← 19 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
 ```
 
 ## One-time setup (xcodegen-based)
@@ -267,10 +268,13 @@ covers every device you've built for.
   delegate callbacks are intentional no-ops, identity-checked against
   `self.wakeMonitor` so SLC fixes never enter the
   filter → smoother → stationary → persist pipeline. The relaunch
-  flow runs through the existing `AppContainer.init()` →
-  `tracker.start()` startup path (no second startup branch keyed on
-  SLC); by the time the wake event is delivered the regular update
-  stream is already running and is the authoritative source.
+  flow runs through the
+  `AppContainer.bootstrap(launchedForLocation:)` →
+  `tracker.start(launchedForLocation:)` startup path (single startup
+  branch); by the time the wake event is delivered the regular
+  update stream is either already running (`.fullTracking`) or
+  intentionally idle awaiting displacement confirmation
+  (`.deferred`, see 1.2.13 home-zone below).
 - **Auto Wake kill switch** (1.2.12). The wake-monitor subscription
   is now an explicit opt-in, **off by default**. State lives in
   `UserDefaults` under `Config.autoWakeEnabledKey` (key
@@ -308,6 +312,83 @@ covers every device you've built for.
   compared to the high-accuracy GPS stream the app runs anyway. When
   opted out, the subscription is actively removed at the OS level so
   the device spends no power on wake monitoring.
+- **Unified home-zone anchor** (1.2.13). A single
+  last-known-position triple persisted in `UserDefaults`
+  (`lastAnchorLatitude` / `lastAnchorLongitude` /
+  `lastAnchorTimestamp`) drives three previously independent
+  decisions through one predicate — distance against
+  `Config.homeZoneRadiusMeters` (100 m):
+
+  1. **Cold-start under SLC-launch context.** When iOS launches the
+     process specifically because of a SLC event
+     (`launchOptions[.location] != nil`, captured by
+     `AppDelegate.application(_:didFinishLaunchingWithOptions:)`)
+     **and** Auto Wake is enabled **and** a fresh anchor exists
+     (within `Config.anchorMaxAgeSeconds = 24 h`), the tracker
+     enters `.deferred` mode. Regular GPS stream stays off, only
+     the wake-monitor subscription is armed. Eliminates the
+     overnight blue-pill blink + phantom one-off points that iOS
+     produced on every cellular-tower handoff while the user slept.
+  2. **Wake-monitor delegate while in `.deferred`.** The first SLC
+     fix delivered to the wake-monitor identity-checks against the
+     anchor. Inside the radius → stay deferred (iOS will re-suspend
+     us shortly). Outside → `exitDeferredIfNeeded` engages
+     `manager.startUpdatingLocation()` and the regular pipeline.
+  3. **`maybePersist` pre-pipeline gate.** Even in `.fullTracking`,
+     any accepted fix landing inside the home zone is suppressed
+     before reaching smoother / stationary / `points` insert. This
+     plugs the indoor-jitter phantom-points hole exposed on
+     2026-04-26 (a 19-minute LocationFilter-rejected window
+     followed by two fixes 33–44 m from the evening's last accepted
+     point — both inside the 100 m home zone). Without the gate,
+     `StationaryDetector`'s gap-reset rule treats the returning fix
+     as a fresh anchor and writes it.
+
+  **Anchor lifecycle.** `LocationTracker.persist(_:)` updates the
+  anchor in `UserDefaults` immediately after every successful
+  SQLite insert, so it naturally tracks the user's most recent
+  recorded position across days. Walking → anchor moves with each
+  accepted fix. Arrived somewhere → anchor freezes at the last fix
+  before stationary suppression kicks in. Left that place →
+  anchor moves again. No explicit "where do you live" UI is
+  required.
+
+  **Anchor freshness.** `Config.anchorMaxAgeSeconds = 24 h` bounds
+  trust. Returning users from a long trip have a stale anchor — all
+  three call sites short-circuit back to the pre-1.2.13 always-on
+  behavior, recording everything and rebuilding a fresh anchor on
+  the first persist of the new session.
+
+  **Conscious-launch UX is preserved bit-for-bit.** Manual
+  app-icon taps, App Switcher returns, and BGAppRefresh wakes have
+  `launchOptions[.location] == nil`, so `launchedForLocation` is
+  `false` and `shouldEnterDeferredMode` returns `false` regardless
+  of anchor / Auto Wake state. The deferred path is unreachable
+  from any user-initiated launch.
+
+  **Single-evaluation contract.** `launchedForLocation` is cleared
+  at the end of every `handleAuthorizationState(.authorizedAlways)`
+  / `.authorizedWhenInUse` evaluation, so a later revoke + re-grant
+  while the user is in foreground does NOT push the tracker back
+  into deferred. The flag captures *boot* context, not a persistent
+  property.
+
+  **Mode invariants under permission downgrade.** An
+  `.authorizedAlways → .authorizedWhenInUse` downgrade while in
+  `.deferred` defensively promotes to `.fullTracking` — SLC
+  requires Always per Apple's contract, so the wake-monitor would
+  go silent under WhenInUse and we'd be stuck in a state machine
+  with no exit. The defensive `exitDeferredIfNeeded` in the
+  WhenInUse branch closes that hole.
+
+  **Bootstrapping change.** `AppContainer.init()` is now
+  lightweight (DB / identity / state only); a new
+  `bootstrap(launchedForLocation:)` is called from
+  `AppDelegate.application(_:didFinishLaunchingWithOptions:)` so the
+  tracker's mode decision sees the authoritative
+  `launchOptions[.location]` flag instead of guessing from
+  `applicationState`. The `@UIApplicationDelegateAdaptor` is the
+  minimal SwiftUI hook needed to surface that dictionary.
 - **Multi-modal `activityType`**: a single install covers walking,
   cycling, and motorized transport (car, bus, train) through
   `MotionClassifier`. It wraps `CMMotionActivityManager` — which reads

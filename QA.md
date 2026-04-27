@@ -4,7 +4,7 @@ Covers automated tests and manual end-to-end scenarios.
 
 ## Automated tests
 
-### iOS unit tests (74 cases across 7 test files)
+### iOS unit tests (104 cases across 10 test files)
 
 ```
 cd ios
@@ -175,6 +175,71 @@ mapping helpers. Pure static functions, testable without mocking
 - `Config.syncDiagnosticsEnabled` honors a UserDefaults override
   (`defaults write … syncDiagnosticsEnabled -bool YES`) so the
   runtime enable path works without a rebuild
+
+**`WakeMonitorRoutingTests` (3 cases)** — the 1.2.11 wake-only
+SLC contract that locks the dedicated `wakeMonitor` manager out of
+the persist pipeline:
+
+- a clean GNSS-quality fix routed via `wakeMonitor` produces zero
+  rows in `points` and zero increment to `appState.unsyncedCount`
+  (the same fix routed via the regular tracking manager would be
+  accepted, so the assertion is meaningful)
+- a 5-fix burst delivered to `wakeMonitor` in one delegate call
+  also persists nothing — every element of the array hits the
+  identity check, not just the first
+- `wakeMonitor` is a distinct CLLocationManager instance from
+  the regular tracking one, so `manager === self.manager` is a
+  real discriminator and not a no-op
+
+**`AutoWakeSettingsTests` (8 cases)** — the 1.2.12 Auto Wake
+kill switch contract:
+
+- `Config.autoWakeEnabled` default is `false` (opt-in only)
+- UserDefaults round-trip (write `true` → reader sees `true`,
+  write `false` → reader sees `false`)
+- `LocationTracker.init` mirrors the persisted preference into
+  the `@Published autoWakeEnabled` (both off and on directions)
+- `setAutoWakeEnabled(true)` updates the published mirror **and**
+  persists the value
+- `setAutoWakeEnabled(false)` updates the published mirror **and**
+  persists the value
+- a six-step on/off/on/on/off/off sequence preserves every
+  intermediate state
+- toggling Auto Wake does **not** delete or modify any rows in
+  the points table — pure side-effect on UserDefaults + the SLC
+  subscription
+
+**`HomeZoneTests` (19 cases)** — the 1.2.13 unified home-zone
+anchor + deferred mode + state-machine invariants:
+
+- *Anchor round-trip + freshness*: `lastAnchor()` returns nil
+  when never written; round-trips lat/lon/timestamp through
+  UserDefaults; `isFresh()` true within `anchorMaxAgeSeconds`,
+  false past it
+- *`shouldEnterDeferredMode` decision matrix*: all four
+  preconditions met → true; each one flipped → false
+  (launchedForLocation, autoWakeEnabled, anchor exists, anchor
+  fresh)
+- *Wake-fix evaluation in deferred*: SLC fix inside home zone
+  (50 m) keeps `.deferred`; outside (200 m) promotes to
+  `.fullTracking`; defensive promote when no anchor exists
+- *`maybePersist` home-zone gate*: fix inside zone (33 m, the
+  exact 2026-04-26 phantom-points pattern) suppressed before the
+  pipeline; fix outside (200 m) flows through to `points`; stale
+  anchor (>24 h) bypasses the gate; successful persist updates
+  the anchor with the new fix's coordinates
+- *`exitDeferredIfNeeded` idempotency*: no-op when already in
+  `.fullTracking`; flips `.deferred` to `.fullTracking` and
+  resets filter / smoother / stationary anchors
+- *Single-evaluation contract for `launchedForLocation`*: flag
+  persists before first auth-state evaluation; cleared after
+  `.authorizedAlways` grant; cleared after `.authorizedWhenInUse`
+  grant; subsequent grants do not re-enter deferred (regression
+  guard for the revoke + re-grant scenario)
+- *WhenInUse mode invariant*: cold WhenInUse grant lands at
+  `.fullTracking`; downgrade-from-deferred (`.authorizedAlways →
+  .authorizedWhenInUse` while in `.deferred`) defensively promotes
+  to `.fullTracking`
 
 ### Backend validator unit tests
 
@@ -994,6 +1059,138 @@ Verifies the UserDefaults override works without a rebuild.
   `committedPending`, `discard:poorAccuracy`, etc.).
 - Turn flag back off, relaunch. Expected: row count stops growing on
   the next tick.
+
+### 33a. Overnight quiet under Auto Wake (1.2.13)
+
+Confirms the unified home-zone anchor silences the overnight
+SLC-relaunch artifacts that motivated 1.2.13. Requires Auto Wake
+ON (10-tap the unsynced counter → toggle on) and at least one
+fully-synced trace ending at the user's typical sleeping location
+(so a fresh anchor exists on disk).
+
+- Plug the phone in for the night, leave it in its usual indoor
+  location, do not interact with it for 6+ hours.
+- In the morning: do **not** unlock the phone yet. Glance at the
+  status-bar location indicator. Expected: **no blue pill / no
+  green pill** at any time during the night you happen to glance.
+- Open the app. Inspect the unsynced counter — it should match
+  the count from the previous evening (no overnight increments).
+- Visualize the previous calendar day in the frontend: the trace
+  ends at the evening's last walk point with no isolated
+  cluster of 1–4 phantom points appearing at clock times like
+  04:00 / 05:00 / 07:00 (the pattern documented on 2026-04-26).
+- Backend SQL canary:
+  ```sql
+  SELECT COUNT(*) FROM points
+  WHERE device_id = '<your-device-id>'
+    AND created_at BETWEEN '<bedtime UTC>' AND '<wake-time UTC>';
+  ```
+  Expected: zero rows.
+- Note: a single isolated row immediately after waking and
+  starting a real walk is *not* a regression — that is the
+  wake-monitor SLC fix proving displacement out of the home zone
+  and engaging `.fullTracking`.
+
+### 33b. Walk-out from home triggers fullTracking (1.2.13)
+
+Confirms the wake-monitor → `.deferred` → `.fullTracking`
+promotion path on a real outdoor exit. Same setup as 33a: Auto
+Wake ON, fresh anchor at home.
+
+- Force-quit the app (swipe up on the App Switcher card) to
+  guarantee a cold launch via SLC, then put the phone in pocket
+  and walk outside in your normal direction. Walk continuously
+  for 5+ minutes (≥ 300 m of total displacement).
+- Do **not** open the app until you've covered ≥ 300 m.
+- Open the app. Expected: tracking is active (green dot pulsing,
+  unsynced counter incrementing). The mode is `.fullTracking`.
+- Visualize today: the trace exists. The first recorded point
+  is **not at your front door** — it should be ~100 m or more
+  from the home anchor (the radius at which SLC fired and
+  `.fullTracking` engaged). Acceptable trade-off for the home-
+  zone gate.
+- Walk back home. After 12+ minutes of being indoors with the
+  app idle, the trace must show the home approach but no further
+  phantom points after you put the phone down (re-enters the
+  same home zone, future SLC events suppressed).
+
+### 33c. Indoor jitter no longer writes phantoms (1.2.13)
+
+Direct regression guard for the 2026-04-26 case. Use a phone
+location with documented multi-meter indoor GPS drift — most
+modern apartments qualify.
+
+- Walk back home from any outdoor walk. Note the time of the
+  last accepted outdoor point (the home anchor for this test).
+- Put the phone on a counter / table inside, do not move it for
+  30 minutes. Don't open the app.
+- After 30 min, open the app and let the upload tick complete.
+- Frontend / backend check: the `points` table for this device
+  must show **zero rows** between the last walk-end fix and your
+  next intentional movement. Compare:
+  ```sql
+  SELECT created_at FROM points
+  WHERE device_id = '<your-device-id>'
+    AND created_at > '<walk-end UTC>'
+    AND created_at < NOW() - interval '5 minutes'
+  ORDER BY created_at;
+  ```
+  Expected: empty result. Without 1.2.13, this query would
+  return 1–4 rows clustered within ~30–50 m of the home anchor.
+
+### 33d. Conscious launch unaffected (1.2.13)
+
+Symmetry guarantee: no manual app-launch path can land in
+`.deferred`. Keep Auto Wake ON for this test.
+
+- Open the app from the Home screen by tapping its icon.
+  Expected: tracking active immediately, green dot pulsing,
+  blue location pill (or full-screen banner if iOS shows it on
+  your device) appears at once.
+- Force-quit, then re-launch via App Switcher. Expected: same
+  behavior, no perceptible delay vs. pre-1.2.13 builds.
+- Background the app, wait 30 seconds, return via App Switcher.
+  Expected: tracking still active, no mode flip.
+- These three subscenarios verify that `launchedForLocation` is
+  correctly `false` for every user-initiated launch path,
+  bypassing `shouldEnterDeferredMode`.
+
+### 33e. Returning user with stale anchor (1.2.13)
+
+Verifies the `anchorMaxAgeSeconds = 24 h` fallback. Hardest to
+reproduce naturally; easiest to simulate with the simulator or
+by going off-grid for a full day.
+
+- Force-quit the app. Do not open it for 25+ hours. Let any
+  outdoor walks during this window happen *without* the app
+  recording — manually unlock + open + close so the app does
+  not rebuild a fresh anchor.
+- After the gap, take a normal walk somewhere not at the old
+  "home" coordinate. Open the app on arrival.
+- Expected: the entire walk is recorded normally. The home-zone
+  gate is bypassed because the anchor is stale (>24 h since last
+  successful persist), so behavior reverts to pre-1.2.13
+  always-on. After the first persist of the new session, the
+  anchor refreshes to the current location.
+
+### 33f. Re-grant permission while in foreground (1.2.13, edge case)
+
+Regression guard for the `launchedForLocation` flag-clear bug
+fixed during the 1.2.13 audit. Optional — only meaningful if you
+genuinely want to confirm the state machine is robust under
+permission-cycling.
+
+- Open the app, confirm tracking is active.
+- Background the app, go to **Settings → Privacy & Security →
+  Location Services → GpsLogger** and switch to **Never**.
+- Wait 5–10 seconds, then switch back to **Always**.
+- Return to the app via App Switcher. Expected: tracking is
+  active immediately (green dot pulsing). Mode is
+  `.fullTracking`, not `.deferred` — even if the original
+  process launch was via SLC.
+- Without the flag-clear fix, this re-grant would push the
+  tracker back into `.deferred` even though the user is in
+  foreground.
 
 ### 34. Frontend distance-from-start + uniform color (1.4.1)
 

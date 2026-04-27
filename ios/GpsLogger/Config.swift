@@ -308,6 +308,152 @@ enum Config {
         UserDefaults.standard.bool(forKey: autoWakeEnabledKey)
     }
 
+    // MARK: - Home zone (last-known-position anchor)
+
+    /// UserDefaults keys persisting the last successfully recorded
+    /// point. The triple (lat, lon, timestamp) is the **single
+    /// authoritative reference** answering the question "is the user
+    /// still where I last saw them?". Used by three call sites:
+    ///
+    ///   1. `LocationTracker.start(launchedForLocation:)` — at cold
+    ///      start under SLC-launch context, decides whether to enter
+    ///      `.deferred` mode (anchor fresh and `Config.autoWakeEnabled`
+    ///      both required) or run the full pipeline.
+    ///   2. `LocationTracker.locationManager(_:didUpdateLocations:)`
+    ///      wake-monitor branch — when a SLC fix arrives during
+    ///      `.deferred`, distance from anchor decides whether to
+    ///      promote to `.fullTracking`.
+    ///   3. `LocationTracker.maybePersist(_:)` — pre-pipeline gate
+    ///      that suppresses any accepted fix landing inside the home
+    ///      zone, so indoor jitter cannot manufacture phantom points
+    ///      after a long gap (the 1.2.6 gap-reset escape was
+    ///      symptomatic of this — it forced the returning fix through
+    ///      as a fresh anchor without checking whether the user had
+    ///      actually moved).
+    ///
+    /// The triple is updated by `LocationTracker.persist(_:)` after
+    /// every successful SQLite insert: the anchor naturally tracks
+    /// the user's most recent recorded position, so the home zone
+    /// follows the user across days without any explicit "where do
+    /// you live" configuration.
+    static let lastAnchorLatitudeKey = "lastAnchorLatitude"
+    static let lastAnchorLongitudeKey = "lastAnchorLongitude"
+    static let lastAnchorTimestampKey = "lastAnchorTimestamp"
+
+    /// Radius (in meters) of the home zone. A fix within this radius
+    /// of the persisted anchor is treated as "still in the same
+    /// place"; outside, as "real movement".
+    ///
+    /// 100 m chosen as the unified threshold across all three call
+    /// sites for two reasons:
+    ///
+    ///   - SLC fixes (delivered via cellular triangulation) typically
+    ///     report `horizontalAccuracy` of 50–100 m. A tighter radius
+    ///     (e.g. 50 m) would risk false-positive "displacement"
+    ///     promotions on the SLC-launch decision purely due to fix
+    ///     noise. 100 m is comfortably above that noise floor.
+    ///   - Sits well below Apple's documented SLC delivery threshold
+    ///     of "around 500 meters," so a real SLC event always
+    ///     reflects displacement large enough to clear our 100 m
+    ///     gate. We never accidentally suppress a genuine
+    ///     departure-from-home fix as "still home".
+    ///
+    /// Trade-off: when the user actually leaves home, the first
+    /// ~100 m of walking is not recorded — the trace begins at the
+    /// edge of the home zone, not the front door. For a 1–2 km
+    /// walking trace this is 5–10 % missed prefix, an acceptable
+    /// cost for eliminating phantom indoor points and silencing
+    /// overnight SLC wake-ups.
+    static let homeZoneRadiusMeters: CLLocationDistance = 100
+
+    /// Maximum age of the persisted anchor before we treat it as
+    /// stale and bypass the home-zone path entirely (cold-start
+    /// promotes straight to `.fullTracking`; runtime maybePersist
+    /// no longer suppresses based on it).
+    ///
+    /// 24 hours covers the realistic "user opened the app yesterday
+    /// evening, opens it again today" cadence while invalidating an
+    /// anchor from a prior trip / a long absence: if the user has
+    /// not recorded any point for a full day, we cannot trust that
+    /// they are still in the same location, and the safe default is
+    /// to fall back to the pre-1.2.13 behavior (record everything,
+    /// rebuild the anchor on the first persist of the new session).
+    static let anchorMaxAgeSeconds: TimeInterval = 24 * 60 * 60
+
+    /// Lightweight value carrier for the persisted anchor. Returned
+    /// from `lastAnchor()` so call sites do not have to re-decode
+    /// the three UserDefaults keys themselves.
+    struct AnchorRecord {
+        let latitude: Double
+        let longitude: Double
+        let timestamp: Date
+
+        /// Convenience for distance-from-fix arithmetic without
+        /// constructing a throwaway CLLocation at every call site.
+        var location: CLLocation {
+            CLLocation(latitude: latitude, longitude: longitude)
+        }
+
+        /// Anchor freshness check. Compared against
+        /// `Config.anchorMaxAgeSeconds`; returns `true` when the
+        /// anchor is still recent enough to drive the home-zone
+        /// suppression decisions.
+        func isFresh(now: Date = Date()) -> Bool {
+            now.timeIntervalSince(timestamp) < Config.anchorMaxAgeSeconds
+        }
+    }
+
+    /// Persist the most recent successfully-recorded position as the
+    /// new home-zone anchor. Called by `LocationTracker.persist(_:)`
+    /// after the SQLite insert succeeds — coupling the anchor write
+    /// to a successful row gives us a free invariant: the anchor is
+    /// always backed by a row in `points`, so the user never sees a
+    /// home-zone gate that doesn't correspond to data they could
+    /// look up on the map.
+    ///
+    /// UserDefaults writes are atomic per-key; the three writes
+    /// here are not transactional but a partially-updated anchor is
+    /// still consistent with `lastAnchor()` because that reader
+    /// guards on the timestamp key being present (see below).
+    static func updateLastAnchor(latitude: Double, longitude: Double, timestamp: Date) {
+        let defaults = UserDefaults.standard
+        defaults.set(latitude, forKey: lastAnchorLatitudeKey)
+        defaults.set(longitude, forKey: lastAnchorLongitudeKey)
+        defaults.set(timestamp.timeIntervalSince1970, forKey: lastAnchorTimestampKey)
+    }
+
+    /// Read the persisted anchor. Returns `nil` when there has never
+    /// been a successful persist — `bool(forKey:)` and
+    /// `double(forKey:)` both return zero for an absent key, which
+    /// would otherwise produce a phantom anchor at lat/lon 0,0
+    /// (Atlantic ocean) with timestamp 1970. The presence check on
+    /// `lastAnchorTimestampKey` is what distinguishes "never written"
+    /// from "written, value is genuinely 0" — a non-nil object
+    /// indicates the anchor exists.
+    static func lastAnchor() -> AnchorRecord? {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: lastAnchorTimestampKey) != nil else {
+            return nil
+        }
+        return AnchorRecord(
+            latitude: defaults.double(forKey: lastAnchorLatitudeKey),
+            longitude: defaults.double(forKey: lastAnchorLongitudeKey),
+            timestamp: Date(timeIntervalSince1970: defaults.double(forKey: lastAnchorTimestampKey))
+        )
+    }
+
+    /// Test-only helper. Production code never calls this directly —
+    /// the anchor's natural lifecycle is "written by persist, read
+    /// by start / wake-monitor / maybePersist". Tests use this to
+    /// reset state between cases without colliding with whatever the
+    /// developer's app session left behind on the build machine.
+    static func clearLastAnchor() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: lastAnchorLatitudeKey)
+        defaults.removeObject(forKey: lastAnchorLongitudeKey)
+        defaults.removeObject(forKey: lastAnchorTimestampKey)
+    }
+
     // MARK: - Diagnostics
 
     /// UserDefaults key that gates the `fix_diagnostics` observability

@@ -36,11 +36,12 @@ import UIKit
 ///        the user has stopped opening the app. Its delegate callbacks
 ///        are intentional no-ops — SLC is **only a wake trigger**, never
 ///        a tracking source.
-///   The relaunch flow runs through the existing
-///   `AppContainer.init()` → `tracker.start()` startup path; there is no
-///   second startup branch keyed on SLC. By the time the wake event is
-///   delivered, the regular update stream is already running and is the
-///   authoritative source.
+///   The relaunch flow runs through
+///   `AppContainer.bootstrap(launchedForLocation:)` → `tracker.start(launchedForLocation:)`
+///   startup path; there is no second startup branch keyed on SLC.
+///   By the time the wake event is delivered, the regular update
+///   stream is either already running (.fullTracking) or the home-zone
+///   evaluation has decided to keep us in `.deferred` (1.2.13).
 /// - **Auto Wake kill switch** (1.2.12). The wake-monitor subscription
 ///   is **off by default**, gated behind `Config.autoWakeEnabled`
 ///   (UserDefaults). The hidden settings sheet — reached via 10 taps
@@ -56,6 +57,46 @@ import UIKit
 ///   This keeps the always-on regular tracking unchanged: opening the
 ///   app still starts `manager.startUpdatingLocation()` regardless of
 ///   the Auto Wake setting.
+/// - **Home-zone unification** (1.2.13). A single mechanism — distance
+///   from the persisted `Config.lastAnchor` against
+///   `Config.homeZoneRadiusMeters` — answers the question "is this
+///   point real movement or is the user still where I last saw them?"
+///   in three places:
+///
+///     1. **Cold start under SLC-launch context.** When iOS launches
+///        the process because of a significant-location-change event
+///        (`launchedForLocation == true`) and the user has opted into
+///        Auto Wake, the tracker enters `.deferred` mode instead of
+///        running `startUpdatingLocation()` unconditionally. The
+///        regular GPS stream stays off until the wake-monitor
+///        delivers a SLC fix proving displacement greater than the
+///        home-zone radius. Saves the overnight blue-pill blink
+///        (and the phantom one-off points it produced) on a phone
+///        that iOS re-launches several times a night because of
+///        cellular tower handoffs while the user sleeps.
+///     2. **Wake-monitor delegate while in `.deferred`.** A SLC fix
+///        within the home zone is logged and ignored; iOS will
+///        re-suspend the process. A SLC fix outside the home zone
+///        promotes mode to `.fullTracking` and starts the regular
+///        update stream.
+///     3. **`maybePersist` pre-pipeline gate.** Even in
+///        `.fullTracking`, any accepted fix landing inside the home
+///        zone is suppressed before it reaches the smoother /
+///        stationary detector / `points` insert. This guards
+///        against the indoor-jitter phantoms documented on
+///        2026-04-26 (a 19-minute LocationFilter-rejected window
+///        followed by two fixes 33–44 m from the evening's last
+///        accepted point — both inside the 100 m home zone). Without
+///        the gate, `StationaryDetector`'s gap-reset rule treats
+///        the returning fix as a fresh anchor and writes it.
+///
+///   The persisted anchor is updated by `persist(_:)` after every
+///   successful SQLite insert, so the home zone naturally follows
+///   the user across days without explicit "set my home" UI: the
+///   anchor is wherever the last persisted point landed. Anchor
+///   freshness is bounded by `Config.anchorMaxAgeSeconds` (24 h);
+///   stale anchors short-circuit all three call sites back to the
+///   pre-1.2.13 always-on behavior.
 final class LocationTracker: NSObject, ObservableObject {
 
     /// Conditions that prevent the tracker from recording a complete
@@ -134,10 +175,44 @@ final class LocationTracker: NSObject, ObservableObject {
         }
     }
 
+    /// Two-state runtime classifier governing whether the regular
+    /// GPS stream (`manager.startUpdatingLocation()`) is engaged.
+    ///
+    /// - `.fullTracking` — the regular stream is running. Fixes flow
+    ///   through filter → smoother → stationary → persist. This is
+    ///   the steady state during any user-initiated app launch and
+    ///   any post-promotion period after a confirmed displacement.
+    /// - `.deferred` — the regular stream is **not** running. Only
+    ///   the wake-monitor SLC subscription is armed (assuming
+    ///   `Config.autoWakeEnabled`); the process otherwise consumes
+    ///   no GPS power. Reachable only via SLC-launch into a fresh
+    ///   home-zone anchor (see `start(launchedForLocation:)`). Exits
+    ///   on three triggers — wake-monitor SLC fix outside the home
+    ///   zone, scenePhase becoming `.active` (user opened the app),
+    ///   or an authorization-state change to `.authorizedAlways`
+    ///   that wasn't already armed.
+    ///
+    /// The transition is one-way per session: once we promote to
+    /// `.fullTracking`, we do not drop back to `.deferred` mid-run.
+    /// (Any future "auto-suspend after long stationary" feature
+    /// would need to reason about how often it can flip and what
+    /// the user-visible cost of the GPS warm-up is — outside the
+    /// scope of 1.2.13.)
+    enum TrackingMode: String, Equatable {
+        case fullTracking
+        case deferred
+    }
+
     @Published private(set) var isTracking = false
     @Published private(set) var authStatus: CLAuthorizationStatus
     @Published private(set) var motionMode: MotionClassifier.Mode = .unknown
     @Published private(set) var impairments: Set<TrackingImpairment> = []
+
+    /// Current runtime mode. Starts at `.fullTracking` for the
+    /// pre-1.2.13 always-on default; `start(launchedForLocation:)`
+    /// may downgrade to `.deferred` when SLC-launched into a fresh
+    /// home zone with Auto Wake enabled.
+    @Published private(set) var mode: TrackingMode = .fullTracking
 
     /// Mirror of `Config.autoWakeEnabled` for SwiftUI bindings. Mutated
     /// only by `setAutoWakeEnabled(_:)` so the persisted UserDefaults
@@ -358,12 +433,35 @@ final class LocationTracker: NSObject, ObservableObject {
         updateBackgroundRefreshImpairment()
     }
 
-    /// Kick off tracking. Called once from `AppContainer` at launch.
-    /// The actual state transitions (notDetermined → requested → granted /
-    /// denied / downgraded) are all handled in
+    /// Cached SLC-launch context, captured at `start(launchedForLocation:)`
+    /// time and consulted by `handleAuthorizationState` to make the
+    /// `.fullTracking` vs `.deferred` decision when an authorization
+    /// grant is what actually triggers the `beginUpdates` call.
+    /// Defaults to `false` so any code path that constructs a
+    /// LocationTracker without going through `start(launchedForLocation:)`
+    /// (e.g. unit tests that just instantiate and exercise the
+    /// delegate) treats it as a regular foreground session.
+    private var launchedForLocation: Bool = false
+
+    /// Kick off tracking. Called once from `AppContainer.bootstrap`
+    /// at launch. The actual state transitions (notDetermined → requested →
+    /// granted / denied / downgraded) are all handled in
     /// `locationManagerDidChangeAuthorization`, which is also where
     /// `beginUpdates` is invoked on any grant path.
-    func start() {
+    ///
+    /// **`launchedForLocation`** is `true` when iOS spawned this
+    /// process specifically to deliver a SLC event (i.e.
+    /// `application(_:didFinishLaunchingWithOptions:)` saw
+    /// `launchOptions[.location] != nil`). When that's the case
+    /// **and** Auto Wake is enabled **and** a fresh home-zone anchor
+    /// is on disk, we enter `.deferred` mode — the regular GPS
+    /// stream stays off until the wake-monitor confirms displacement
+    /// out of the home zone. Any other launch path (manual tap,
+    /// BGAppRefresh, no anchor, stale anchor, Auto Wake off)
+    /// proceeds with the pre-1.2.13 always-on `.fullTracking`
+    /// behavior — full symmetry with the conscious-launch UX.
+    func start(launchedForLocation: Bool) {
+        self.launchedForLocation = launchedForLocation
         switch manager.authorizationStatus {
         case .notDetermined:
             manager.requestAlwaysAuthorization()
@@ -374,6 +472,62 @@ final class LocationTracker: NSObject, ObservableObject {
         @unknown default:
             break
         }
+    }
+
+    /// Pure decision predicate for the deferred-mode entry, kept
+    /// separate from `start(launchedForLocation:)` so unit tests can
+    /// exercise the matrix (SLC-launch yes/no × Auto Wake yes/no ×
+    /// anchor fresh / stale / missing) without spinning up a
+    /// CLLocationManager. All four pre-conditions must be true:
+    ///
+    ///   1. iOS launched us specifically for a location event.
+    ///   2. The user has opted into Auto Wake — without the SLC
+    ///      subscription armed, deferred mode would never receive a
+    ///      promotion signal and the app would stay silent forever.
+    ///   3. A persistent anchor exists on disk — without one, we
+    ///      have no reference point against which to evaluate the
+    ///      next SLC fix's distance.
+    ///   4. That anchor is fresh (within
+    ///      `Config.anchorMaxAgeSeconds`). A stale anchor (from a
+    ///      trip a week ago, say) is not safe to silence today's
+    ///      first fix against.
+    ///
+    /// Made `internal` so `HomeZoneTests` can assert the matrix
+    /// without going through `start`.
+    func shouldEnterDeferredMode() -> Bool {
+        guard launchedForLocation,
+              Config.autoWakeEnabled,
+              let anchor = Config.lastAnchor(),
+              anchor.isFresh()
+        else { return false }
+        return true
+    }
+
+    /// Exit `.deferred` mode and start the regular GPS stream. Called
+    /// from three sites:
+    ///   - SwiftUI's `scenePhase = .active` observer in
+    ///     `GpsLoggerApp` — user opened the app manually, so they
+    ///     expect tracking to engage immediately.
+    ///   - The wake-monitor delegate — a SLC fix outside the home
+    ///     zone confirmed real displacement.
+    ///   - `handleAuthorizationState(.authorizedAlways)` after a
+    ///     fresh permission grant, in case the auth-state path is
+    ///     the one bringing us out of deferred.
+    ///
+    /// Idempotent: calling on a tracker already in `.fullTracking`
+    /// is a no-op (re-issuing `startUpdatingLocation` on a running
+    /// manager is also idempotent per Apple's contract).
+    func exitDeferredIfNeeded() {
+        guard mode == .deferred else { return }
+        mode = .fullTracking
+        // Reset filter / smoother / stationary anchors so the first
+        // accepted fix on the resumed stream is treated as a fresh
+        // baseline — we have no reason to compare it against
+        // anything that was running pre-deferred.
+        filter.reset()
+        smoother.reset()
+        stationary.reset()
+        beginUpdates()
     }
 
     private func beginUpdates() {
@@ -429,6 +583,90 @@ final class LocationTracker: NSObject, ObservableObject {
         }
     }
 
+    /// Decide whether a wake-monitor SLC fix proves displacement out
+    /// of the home zone large enough to exit `.deferred` mode and
+    /// engage the regular GPS stream.
+    ///
+    /// Read like this: we are dozing. iOS just nudged us awake to
+    /// say "the user moved significantly, you might want to record
+    /// it." We compare that fix against where we last saw the user.
+    /// If it's still inside the home-zone radius, the SLC was almost
+    /// certainly a cellular-tower-handoff or Wi-Fi-fingerprint shift
+    /// rather than real movement (the very pattern we observed all
+    /// of 2026-04-26 night), and we stay quiet. iOS will re-suspend
+    /// us shortly. If it's clearly outside the radius, the user has
+    /// really gone somewhere and we promote.
+    ///
+    /// Stale anchor or no anchor: defensive promote. If we don't
+    /// have a fresh reference point, we cannot prove the fix is
+    /// "still home", so the safe default is full-tracking — exactly
+    /// the pre-1.2.13 behavior.
+    ///
+    /// Made `internal` so unit tests can drive the decision without
+    /// staging a real CLLocationManager.
+    func evaluateWakeFixForDeferredExit(_ fix: CLLocation) {
+        guard let anchor = Config.lastAnchor(), anchor.isFresh() else {
+            // No reference point — promote to be safe.
+            exitDeferredIfNeeded()
+            return
+        }
+        let displacement = fix.distance(from: anchor.location)
+        if displacement > Config.homeZoneRadiusMeters {
+            #if DEBUG
+            print("[tracker] deferred → fullTracking: SLC fix \(Int(displacement))m from anchor")
+            #endif
+            exitDeferredIfNeeded()
+        } else {
+            #if DEBUG
+            print("[tracker] deferred kept: SLC fix \(Int(displacement))m from anchor (≤ \(Int(Config.homeZoneRadiusMeters)))")
+            #endif
+        }
+    }
+
+    /// Test-only escape hatch. Production code never calls this:
+    /// `mode` is supposed to be governed exclusively by
+    /// `start(launchedForLocation:)`, the wake-monitor branch in
+    /// `didUpdateLocations`, and `exitDeferredIfNeeded`. This helper
+    /// exists so unit tests can stage the `.deferred` state without
+    /// reproducing the entire SLC-launch lifecycle (which would
+    /// require a real CLLocationManager grant + UserDefaults setup
+    /// + scene phase plumbing). Annotated with the suffix so any
+    /// production-code caller is immediately obvious in code review.
+    func forceDeferredModeForTesting() {
+        mode = .deferred
+    }
+
+    /// Test-only accessor for the regular tracking-manager instance.
+    /// Mirrors the existing `wakeMonitor` accessor pattern (which is
+    /// `internal` so `WakeMonitorRoutingTests` can route synthetic
+    /// fixes through the wake delegate path). `HomeZoneTests` needs
+    /// the regular-manager handle so it can drive the
+    /// `manager === self.manager` branch of `didUpdateLocations`,
+    /// which is where the home-zone pre-check sits.
+    func testingTrackingManager() -> CLLocationManager {
+        manager
+    }
+
+    /// Test-only: drive `handleAuthorizationState(_:)` directly,
+    /// since the production path (CLLocationManager delegate
+    /// callback) requires real authorization state that the test
+    /// bundle cannot provide. Used by `HomeZoneTests` to verify the
+    /// mode-decision logic + the single-evaluation contract for
+    /// `launchedForLocation` (cleared after every grant evaluation).
+    func handleAuthorizationStateForTesting(_ status: CLAuthorizationStatus) {
+        handleAuthorizationState(status)
+    }
+
+    /// Test-only read of the SLC-launch flag. Production code never
+    /// inspects it directly — `shouldEnterDeferredMode()` is the
+    /// single decision boundary. Tests use this to assert the
+    /// single-evaluation contract: the flag must be `false` after
+    /// any `handleAuthorizationState(.authorizedAlways)` /
+    /// `.authorizedWhenInUse` call.
+    var launchedForLocationFlagForTesting: Bool {
+        launchedForLocation
+    }
+
     /// Toggle the Auto Wake (SLC-based relaunch) feature. Persists the
     /// user's choice in `UserDefaults` so the next launch picks it up
     /// via `Config.autoWakeEnabled`, updates the published mirror
@@ -452,6 +690,17 @@ final class LocationTracker: NSObject, ObservableObject {
     /// filter/stationary state in sync (a re-grant after denial resets the
     /// internal anchors so stale state doesn't bleed into the new session)
     /// and translates Apple's five-valued enum into at-most-one impairment.
+    ///
+    /// **Single-evaluation contract for `launchedForLocation`** (1.2.13).
+    /// The flag captures the SLC-launch context at app boot; it is
+    /// only meaningful for the **first** authorization-grant call after
+    /// launch. Subsequent grant calls (revoke + re-grant, downgrade +
+    /// upgrade) must NOT be treated as SLC-launches — by then the user
+    /// has been alive in some mode for a while and a fresh deferred
+    /// entry would surprise them. The flag is therefore cleared after
+    /// every grant evaluation here, so any subsequent
+    /// `handleAuthorizationState(.authorizedAlways)` always lands in
+    /// `.fullTracking` regardless of how the original launch happened.
     private func handleAuthorizationState(_ status: CLAuthorizationStatus) {
         switch status {
         case .authorizedAlways:
@@ -469,15 +718,47 @@ final class LocationTracker: NSObject, ObservableObject {
             // subscription in a known state.
             applyAutoWakeSetting()
             if !isTracking {
-                // Re-grant after a previous denial: drop stale filter
-                // anchors so the first accepted fix becomes a fresh
-                // baseline instead of being compared against an hours-old
-                // last-accepted position.
-                filter.reset()
-                smoother.reset()
-                stationary.reset()
-                beginUpdates()
+                // Decide: full pipeline or `.deferred` quiet wait?
+                // The deferred path is reachable only when iOS
+                // launched us specifically for a SLC event AND Auto
+                // Wake is on AND we have a fresh home-zone anchor —
+                // any other launch context (user tap, no anchor,
+                // stale anchor, Auto Wake off) goes straight to
+                // `.fullTracking` so the conscious-launch UX is
+                // bit-for-bit identical to the pre-1.2.13 behavior.
+                if shouldEnterDeferredMode() {
+                    mode = .deferred
+                    // Do **not** call beginUpdates(). The wake-monitor
+                    // is already armed by applyAutoWakeSetting() above
+                    // and will deliver the first SLC fix when iOS
+                    // decides to. exitDeferredIfNeeded() takes us out
+                    // when that fix is far enough or when the user
+                    // opens the app.
+                } else {
+                    // Re-grant after a previous denial (or any other
+                    // non-deferred path): drop stale filter anchors so
+                    // the first accepted fix becomes a fresh baseline
+                    // instead of being compared against an hours-old
+                    // last-accepted position.
+                    mode = .fullTracking
+                    filter.reset()
+                    smoother.reset()
+                    stationary.reset()
+                    beginUpdates()
+                }
+            } else if mode == .deferred {
+                // Defensive: isTracking == true together with mode ==
+                // .deferred is a state-machine inconsistency, reachable
+                // only via test helpers or an iOS callback ordering we
+                // didn't anticipate. Promote to fullTracking to put the
+                // tracker back into a coherent state.
+                exitDeferredIfNeeded()
             }
+            // Single-evaluation contract: see the function-level
+            // docstring. After this branch the flag has fulfilled its
+            // purpose and any subsequent grant must not re-trigger the
+            // deferred path.
+            launchedForLocation = false
         case .authorizedWhenInUse:
             // Foreground-only. iOS silently stops delivering updates once
             // the app is backgrounded, even with
@@ -486,11 +767,27 @@ final class LocationTracker: NSObject, ObservableObject {
             removeImpairment(.permissionDenied)
             addImpairment(.backgroundRequiresAlways)
             if !isTracking {
+                // WhenInUse cannot drive deferred — Apple documents
+                // SLC as requiring `.authorizedAlways`, so the
+                // wake-monitor will never deliver a promotion signal
+                // under WhenInUse. Always go straight to fullTracking
+                // here, with a fresh filter baseline.
+                mode = .fullTracking
                 filter.reset()
                 smoother.reset()
                 stationary.reset()
                 beginUpdates()
+            } else if mode == .deferred {
+                // Reachable only after an `.authorizedAlways → .authorizedWhenInUse`
+                // downgrade while we were sitting in deferred. The
+                // wake-monitor will go silent under WhenInUse, so
+                // we'd otherwise be stuck. Defensive promote.
+                exitDeferredIfNeeded()
             }
+            // Same single-evaluation contract as the .authorizedAlways
+            // branch — clear the SLC-launch flag once the first grant
+            // evaluation has happened.
+            launchedForLocation = false
         case .denied, .restricted:
             // Tracking can no longer proceed. Stop cleanly so we aren't
             // hanging on to the CLLocationManager stream, and surface the
@@ -579,6 +876,21 @@ final class LocationTracker: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     appState.unsyncedCount += 1
                 }
+                // Update the home-zone anchor to reflect the new
+                // most-recent persisted point. UserDefaults writes
+                // are atomic per-key and thread-safe; doing this on
+                // the persist queue keeps the work off main and
+                // co-located with the SQLite insert it follows. The
+                // anchor naturally tracks the user across the day:
+                // walking → anchor moves with each accepted fix;
+                // arrived somewhere → anchor freezes at the last fix
+                // before stationary suppression kicks in; left that
+                // place → anchor moves again.
+                Config.updateLastAnchor(
+                    latitude: lat,
+                    longitude: lon,
+                    timestamp: timestamp
+                )
             }
         }
     }
@@ -605,6 +917,36 @@ final class LocationTracker: NSObject, ObservableObject {
     /// the detector could not be tuned against real data.
     @discardableResult
     private func maybePersist(_ loc: CLLocation) -> StationaryDetector.Decision {
+        // Home-zone pre-check (1.2.13). Any fix landing within the
+        // home-zone radius of a fresh persisted anchor is suppressed
+        // before reaching the smoother / stationary detector. This is
+        // the gate that kills the indoor-jitter phantom-points pattern
+        // documented on 2026-04-26: a 19-minute LocationFilter-rejected
+        // window followed by two fixes 33 m and 44 m from the
+        // evening's last accepted point. Both well inside the 100 m
+        // home zone — both should never have been written.
+        //
+        // Without this gate, the surviving fixes hit
+        // `StationaryDetector.consume` after the gap-reset path
+        // promoted the returning fix to a fresh candidate anchor,
+        // producing the phantom rows. The pre-check makes that path
+        // unreachable while we're sitting in a known place.
+        //
+        // Stale anchor (>24 h) or no anchor → behave exactly like
+        // pre-1.2.13: every accepted fix flows through smoother +
+        // stationary detector unchanged. So a returning user from a
+        // long trip immediately starts collecting data again at the
+        // new location.
+        if let anchor = Config.lastAnchor(),
+           anchor.isFresh(),
+           loc.distance(from: anchor.location) <= Config.homeZoneRadiusMeters {
+            #if DEBUG
+            let d = Int(loc.distance(from: anchor.location))
+            print("[tracker] suppress home-zone @ \(loc.coordinate.latitude),\(loc.coordinate.longitude) (\(d)m from anchor)")
+            #endif
+            return .suppress
+        }
+
         let smoothed = smoother.consume(loc)
         let decision = stationary.consume(smoothed)
         switch decision {
@@ -693,20 +1035,25 @@ extension LocationTracker: CLLocationManagerDelegate {
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        // SLC events from `wakeMonitor` are intentional no-ops here.
-        // Their job — relaunching a terminated process via
-        // `UIApplicationLaunchOptionsLocationKey` — is already done by
-        // the time this delegate fires; the relaunched
-        // `AppContainer.init()` has called `tracker.start()`, which
-        // started the regular update stream, and that stream is the
-        // authoritative source. Persisting the SLC fix on top of it
-        // would just produce a low-quality, non-GNSS row, double-bump
-        // the unsynced counter, and trigger a redundant sync — exactly
-        // the duplicate work this design eliminates.
+        // SLC events from `wakeMonitor` are intentional no-ops as far
+        // as the persist pipeline is concerned. They never enter
+        // filter → smoother → stationary → persist; their job —
+        // relaunching the process via `UIApplicationLaunchOptionsLocationKey`
+        // — is already done by the time this delegate fires.
+        //
+        // The one purpose they DO serve (1.2.13) is to drive the
+        // exit from `.deferred` mode. When we boot via SLC into a
+        // fresh home zone, the regular update stream is intentionally
+        // left off. The wake-monitor's first fix is what tells us
+        // where we actually are; if it's outside the home zone, the
+        // user has genuinely moved and we promote to `.fullTracking`.
         guard manager === self.manager else {
+            if mode == .deferred, let fix = locations.last {
+                evaluateWakeFixForDeferredExit(fix)
+            }
             #if DEBUG
             if let last = locations.last {
-                print("[tracker] SLC wake event x\(locations.count) @ \(last.coordinate.latitude),\(last.coordinate.longitude) — ignored (regular tracking authoritative)")
+                print("[tracker] SLC wake event x\(locations.count) @ \(last.coordinate.latitude),\(last.coordinate.longitude) — mode=\(mode.rawValue)")
             }
             #endif
             return
