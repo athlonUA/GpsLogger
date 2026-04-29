@@ -298,11 +298,14 @@ final class HomeZoneTests: XCTestCase {
     // MARK: - maybePersist home-zone pre-check
 
     func testFixInsideHomeZoneSuppressedFromPersist() {
-        // The 2026-04-26 phantom-points scenario. Anchor at "home"
-        // (the evening's last persisted point), incoming fix 33 m
-        // away (well inside 100 m). With the gate, the fix is
-        // suppressed and never reaches `points`.
-        Config.updateLastAnchor(latitude: anchorLat, longitude: anchorLon, timestamp: Date())
+        // 2026-04-26 phantom-points: 19 min quiet, fix 33 m from anchor
+        // → suppressed by the combined gap + distance gate.
+        let nineteenMinAgo = Date().addingTimeInterval(-19 * 60)
+        Config.updateLastAnchor(
+            latitude: anchorLat,
+            longitude: anchorLon,
+            timestamp: nineteenMinAgo
+        )
         let (db, state, tracker) = makeFreshTracker()
         XCTAssertEqual(db.initialCount(), 0)
 
@@ -310,17 +313,44 @@ final class HomeZoneTests: XCTestCase {
             lat: coordinate(metersNorth: 33, of: anchorLat),
             lon: anchorLon
         )
-        // Drive the regular tracking-manager delegate path; this is
-        // the path that reaches maybePersist() through the full
-        // filter → smoother → stationary chain.
         tracker.locationManager(tracker.testingTrackingManager(), didUpdateLocations: [phantom])
         waitForAsyncDrain()
 
         XCTAssertEqual(
             db.initialCount(), 0,
-            "Fix inside home zone must not produce a points row"
+            "Fix inside home zone after a long quiet window must not produce a points row"
         )
         XCTAssertEqual(state.unsyncedCount, 0)
+    }
+
+    func testContinuousWalkingFixInsideHomeZoneIsNotSuppressed() {
+        // 2026-04-29 regression: rolling anchor + fresh fix at 15 m must
+        // NOT be suppressed — the gap clause gates the home-zone radius
+        // so dense walks cannot trip it.
+        let twoSecondsAgo = Date().addingTimeInterval(-2)
+        Config.updateLastAnchor(
+            latitude: anchorLat,
+            longitude: anchorLon,
+            timestamp: twoSecondsAgo
+        )
+        let (db, state, tracker) = makeFreshTracker()
+        XCTAssertEqual(db.initialCount(), 0)
+
+        let nextStep = cleanGnssFix(
+            lat: coordinate(metersNorth: 15, of: anchorLat),
+            lon: anchorLon
+        )
+        tracker.locationManager(
+            tracker.testingTrackingManager(),
+            didUpdateLocations: [nextStep]
+        )
+        waitForAsyncDrain()
+
+        XCTAssertEqual(
+            db.initialCount(), 1,
+            "Continuous walking fix must reach `points` even when within 100 m of the anchor"
+        )
+        XCTAssertEqual(state.unsyncedCount, 1)
     }
 
     func testFixOutsideHomeZoneStillFlowsToPersist() {

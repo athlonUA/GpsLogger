@@ -80,15 +80,14 @@ import UIKit
 ///        promotes mode to `.fullTracking` and starts the regular
 ///        update stream.
 ///     3. **`maybePersist` pre-pipeline gate.** Even in
-///        `.fullTracking`, any accepted fix landing inside the home
+///        `.fullTracking`, an accepted fix landing inside the home
 ///        zone is suppressed before it reaches the smoother /
-///        stationary detector / `points` insert. This guards
-///        against the indoor-jitter phantoms documented on
-///        2026-04-26 (a 19-minute LocationFilter-rejected window
-///        followed by two fixes 33–44 m from the evening's last
-///        accepted point — both inside the 100 m home zone). Without
-///        the gate, `StationaryDetector`'s gap-reset rule treats
-///        the returning fix as a fresh anchor and writes it.
+///        stationary detector / `points` insert **iff** the gap
+///        since the last persisted point exceeds
+///        `Config.resumeGapSeconds`. This stops the rolling anchor
+///        from turning the 100 m radius into a continuous-walk
+///        downsampler (the 2026-04-29 regression), while still
+///        intercepting the indoor-jitter phantom path (2026-04-26).
 ///
 ///   The persisted anchor is updated by `persist(_:)` after every
 ///   successful SQLite insert, so the home zone naturally follows
@@ -917,32 +916,19 @@ final class LocationTracker: NSObject, ObservableObject {
     /// the detector could not be tuned against real data.
     @discardableResult
     private func maybePersist(_ loc: CLLocation) -> StationaryDetector.Decision {
-        // Home-zone pre-check (1.2.13). Any fix landing within the
-        // home-zone radius of a fresh persisted anchor is suppressed
-        // before reaching the smoother / stationary detector. This is
-        // the gate that kills the indoor-jitter phantom-points pattern
-        // documented on 2026-04-26: a 19-minute LocationFilter-rejected
-        // window followed by two fixes 33 m and 44 m from the
-        // evening's last accepted point. Both well inside the 100 m
-        // home zone — both should never have been written.
-        //
-        // Without this gate, the surviving fixes hit
-        // `StationaryDetector.consume` after the gap-reset path
-        // promoted the returning fix to a fresh candidate anchor,
-        // producing the phantom rows. The pre-check makes that path
-        // unreachable while we're sitting in a known place.
-        //
-        // Stale anchor (>24 h) or no anchor → behave exactly like
-        // pre-1.2.13: every accepted fix flows through smoother +
-        // stationary detector unchanged. So a returning user from a
-        // long trip immediately starts collecting data again at the
-        // new location.
+        // Home-zone pre-check (1.2.14). Suppress fixes within 100 m of a
+        // fresh anchor only after a quiet window > resumeGapSeconds — the
+        // 2026-04-26 indoor-jitter phantom pattern. Without the gap
+        // clause, the rolling anchor silently downsamples a continuous
+        // walk to one row per ~100 m (2026-04-29 regression).
         if let anchor = Config.lastAnchor(),
            anchor.isFresh(),
+           loc.timestamp.timeIntervalSince(anchor.timestamp) > Config.resumeGapSeconds,
            loc.distance(from: anchor.location) <= Config.homeZoneRadiusMeters {
             #if DEBUG
             let d = Int(loc.distance(from: anchor.location))
-            print("[tracker] suppress home-zone @ \(loc.coordinate.latitude),\(loc.coordinate.longitude) (\(d)m from anchor)")
+            let gap = Int(loc.timestamp.timeIntervalSince(anchor.timestamp))
+            print("[tracker] suppress home-zone @ \(loc.coordinate.latitude),\(loc.coordinate.longitude) (\(d)m from anchor, gap=\(gap)s)")
             #endif
             return .suppress
         }
