@@ -190,10 +190,46 @@ describe('buildRenderData', () => {
   it('emits a singleton for a single point', () => {
     const p = mk(0, 10, 20);
     const out = buildRenderData([p]);
+    expect(out.groups).toHaveLength(1);
+    expect(out.groups[0]).toHaveLength(1);
     expect(out.segments).toHaveLength(0);
     expect(out.singletons).toHaveLength(1);
     expect(out.singletons[0].point).toBe(p);
     expect(out.distancesMeters).toEqual([0]);
+  });
+
+  it('emits a segment for a two-point trace', () => {
+    const pts = [mk(0, 10, 20), mk(1, 10.001, 20)];
+    const out = buildRenderData(pts);
+    expect(out.groups).toHaveLength(1);
+    expect(out.groups[0]).toHaveLength(2);
+    expect(out.segments).toHaveLength(1);
+    expect(out.singletons).toHaveLength(0);
+    expect(out.segments[0].positions).toHaveLength(2);
+  });
+
+  it('produces stable shapes across 0/1/2/multi-point inputs', () => {
+    const cases: Point[][] = [
+      [],
+      [mk(0, 1, 1)],
+      [mk(0, 1, 1), mk(1, 1.001, 1)],
+      northwardTrace(20, 1.5, 1),
+    ];
+    for (const input of cases) {
+      const out = buildRenderData(input);
+      expect(Array.isArray(out.groups)).toBe(true);
+      expect(Array.isArray(out.segments)).toBe(true);
+      expect(Array.isArray(out.singletons)).toBe(true);
+      expect(Array.isArray(out.sampled)).toBe(true);
+      expect(Array.isArray(out.distancesMeters)).toBe(true);
+      expect(out.distancesMeters).toHaveLength(out.sampled.length);
+      const totalGroupPoints = out.groups.reduce((s, g) => s + g.length, 0);
+      expect(totalGroupPoints).toBe(out.sampled.length);
+      const singletonGroups = out.groups.filter((g) => g.length === 1).length;
+      const segmentGroups = out.groups.filter((g) => g.length >= 2).length;
+      expect(out.singletons).toHaveLength(singletonGroups);
+      expect(out.segments).toHaveLength(segmentGroups);
+    }
   });
 
   it('emits one polyline per group', () => {

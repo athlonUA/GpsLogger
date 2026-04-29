@@ -62,6 +62,7 @@ export default function App() {
   const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [hasQueried, setHasQueried] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   // Persist device ID on every change. An empty value clears the key so a
@@ -112,10 +113,12 @@ export default function App() {
 
     setError(null);
     setLoading(true);
+    setHasQueried(true);
     try {
       const result = await fetchPoints(deviceId, new Date(from), new Date(to), ac.signal);
-      setPoints(result.data);
-      setTruncated(result.truncated);
+      const safe = Array.isArray(result?.data) ? result.data : [];
+      setPoints(safe);
+      setTruncated(result?.truncated === true);
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
       setError(e instanceof Error ? e.message : String(e));
@@ -143,6 +146,7 @@ export default function App() {
     setDeviceId('');
     setPoints([]);
     setError(null);
+    setHasQueried(false);
     setFrom(toLocalInputValue(defaultFrom));
     setTo(toLocalInputValue(defaultTo));
     // Clear query params too, so the refreshed URL reflects the logged-out
@@ -170,9 +174,11 @@ export default function App() {
       ? 'Loading…'
       : points.length > 0
         ? pointsLabel
-        : deviceId
-          ? 'Select range and click Visualize'
-          : 'Enter device ID to begin';
+        : hasQueried
+          ? 'No points found for this time range'
+          : deviceId
+            ? 'Select range and click Visualize'
+            : 'Enter device ID to begin';
 
   return (
     <div className="app">

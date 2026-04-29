@@ -299,8 +299,12 @@ function RouteMinimap({
   //
   // The rect is clamped to the minimap's container bounds so it never
   // escapes the thumb area when the main map is zoomed out past the route.
+  //
+  // Bail when positions is empty: the inner MapContainer unmounts but
+  // `mini` lags — calling latLngToContainerPoint on a torn-down map
+  // throws and crashes the React tree.
   useEffect(() => {
-    if (!mini || !mainMap || !miniReady) return;
+    if (!mini || !mainMap || !miniReady || positions.length === 0) return;
     const update = () => {
       const b = mainMap.getBounds();
       const nw = mini.latLngToContainerPoint(b.getNorthWest());
