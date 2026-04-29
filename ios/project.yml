@@ -32,6 +32,23 @@ targets:
         CFBundleDisplayName: GpsLogger
         CFBundleShortVersionString: "1.2.13"
         CFBundleVersion: "18"
+        # Plain-PNG app-icon path. Bypasses actool because Xcode 26.4.1
+        # hard-fails the Assets.xcassets compile step on a Mac with no
+        # iOS Simulator runtime installed — actool's internal "thinned
+        # variant" pass refuses to run without one ("No available
+        # simulator runtimes for platform iphonesimulator.
+        # SimServiceContext supportedRuntimes=[]"), even when the build
+        # target is iphoneos-only. iOS still honours the legacy
+        # CFBundleIcons / CFBundleIconFiles map, so we ship
+        # `AppIcon@2x.png` (120 px), `AppIcon@3x.png` (180 px), and
+        # `AppIcon.png` (1024 px marketing) directly in the bundle and
+        # reference them by basename here. iOS picks the right
+        # resolution at runtime.
+        CFBundleIcons:
+          CFBundlePrimaryIcon:
+            CFBundleIconFiles:
+              - AppIcon
+            CFBundleIconName: AppIcon
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
