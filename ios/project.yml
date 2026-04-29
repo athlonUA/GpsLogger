@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.2.13"
-    CURRENT_PROJECT_VERSION: "18"
+    MARKETING_VERSION: "1.2.14"
+    CURRENT_PROJECT_VERSION: "19"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
 targets:
@@ -30,8 +30,8 @@ targets:
       path: GpsLogger/Info-generated.plist
       properties:
         CFBundleDisplayName: GpsLogger
-        CFBundleShortVersionString: "1.2.13"
-        CFBundleVersion: "18"
+        CFBundleShortVersionString: "1.2.14"
+        CFBundleVersion: "19"
         # Plain-PNG app-icon path. Bypasses actool because Xcode 26.4.1
         # hard-fails the Assets.xcassets compile step on a Mac with no
         # iOS Simulator runtime installed — actool's internal "thinned

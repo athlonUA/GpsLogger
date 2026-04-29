@@ -43,7 +43,7 @@ ios/
     ├── SyncPolicyTests.swift           ← 10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config + diagnostics flag
     ├── WakeMonitorRoutingTests.swift   ←  3 cases locking in the 1.2.11 wake-only SLC contract (no persist on wake events)
     ├── AutoWakeSettingsTests.swift     ←  8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
-    └── HomeZoneTests.swift             ← 23 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
+    └── HomeZoneTests.swift             ← 24 cases for the 1.2.13 unified home-zone anchor + 1.2.14 gap clause (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate with gap discriminator + continuous-walk regression + flag-clear contract + WhenInUse invariants)
 ```
 
 ## One-time setup (xcodegen-based)
@@ -335,14 +335,22 @@ covers every device you've built for.
      us shortly). Outside → `exitDeferredIfNeeded` engages
      `manager.startUpdatingLocation()` and the regular pipeline.
   3. **`maybePersist` pre-pipeline gate.** Even in `.fullTracking`,
-     any accepted fix landing inside the home zone is suppressed
-     before reaching smoother / stationary / `points` insert. This
-     plugs the indoor-jitter phantom-points hole exposed on
-     2026-04-26 (a 19-minute LocationFilter-rejected window
+     an accepted fix landing inside the home zone is suppressed
+     before reaching smoother / stationary / `points` insert
+     **iff the gap since the last persisted point exceeds
+     `Config.resumeGapSeconds`** (1.2.14, 60 s). The combined
+     predicate plugs the indoor-jitter phantom-points hole exposed
+     on 2026-04-26 (a 19-minute LocationFilter-rejected window
      followed by two fixes 33–44 m from the evening's last accepted
-     point — both inside the 100 m home zone). Without the gate,
-     `StationaryDetector`'s gap-reset rule treats the returning fix
-     as a fresh anchor and writes it.
+     point — both inside the 100 m home zone) without
+     downsampling continuous walks (the 2026-04-29 regression: a
+     pure-distance gate trips on every step of an active walk
+     because the rolling anchor sits ~10–15 m behind, the
+     `minDistance` floor — `p50 = 105 m` between persisted points
+     vs. the pre-1.2.13 ~11 m baseline). Gap clause aligns with
+     `StationaryDetector`'s gap-reset path, the same threshold
+     past which the detector would otherwise accept the returning
+     fix unconditionally and produce the phantom row.
 
   **Anchor lifecycle.** `LocationTracker.persist(_:)` updates the
   anchor in `UserDefaults` immediately after every successful

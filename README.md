@@ -16,7 +16,7 @@ Minimal end-to-end GPS tracking system.
 
 | Component | Tech | Purpose |
 |---|---|---|
-| **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis; opt-in Auto Wake via SLC (1.2.12) with a unified home-zone anchor (1.2.13) that silences overnight wake-up phantoms and indoor-jitter writes |
+| **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis; opt-in Auto Wake via SLC (1.2.12) with a unified home-zone anchor (1.2.13) and a gap clause on the persist gate (1.2.14) so the anchor silences overnight wake-up phantoms and indoor-jitter writes without downsampling continuous walks |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
 | **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
@@ -411,6 +411,60 @@ flowchart LR
     `.denied` stops the tracker and surfaces a permission impairment,
     `.locationUnknown` is ignored as transient, the rest is logged
     only under DEBUG.
+- **Home-zone gap clause** (1.2.14). The 1.2.13 home-zone gate at
+  the top of `LocationTracker.maybePersist` was unconditionally
+  suppressing any fix landing within
+  `Config.homeZoneRadiusMeters` (100 m) of a fresh persisted
+  anchor. Because the anchor follows the user (it is updated by
+  `persist(_:)` after every successful insert), a continuous walk
+  produced fixes that were by definition only ~10–15 m from the
+  previous anchor (the `minDistance` floor) — and every one of
+  them tripped the gate. The trace silently downsampled to one
+  row per ~100 m of walking. Field-test data from 2026-04-29
+  (iPhone 13 Pro Max, urban evening walk, 27 consecutive pairs):
+  `p50 = 105 m`, `min = 99.9 m`, `max = 108.6 m` between
+  consecutive persisted points — vs. the pre-1.2.13 baseline of
+  `p50 ≈ 11 m` on the same device. A ~10× density loss invisible
+  to anything except a SQL distance histogram.
+  - **Fix.** Add a gap clause to the gate: only suppress when the
+    inter-fix interval exceeds `Config.resumeGapSeconds` (60 s,
+    the same threshold `StationaryDetector`'s gap-reset uses to
+    decide a returning fix is "fresh"). The combined predicate
+    intercepts precisely the indoor-jitter phantom path (long
+    quiet window + close-to-anchor returning fix — the
+    2026-04-26 case) without touching the dense pedestrian
+    stream (sub-second cadence — gap clause never arms).
+  - **Test:** added
+    `testContinuousWalkingFixInsideHomeZoneIsNotSuppressed` —
+    anchor refreshed 2 s ago, fix 15 m away, must reach
+    `points`. Updated `testFixInsideHomeZoneSuppressedFromPersist`
+    to use a 19-min-old anchor so it actually exercises the gap
+    clause it claims to test (the prior version coincidentally
+    passed because the rolling-anchor bug was matching its
+    expectation).
+  - **What did NOT change:** LocationFilter, KalmanSmoother,
+    StationaryDetector, the SLC wake monitor, the home-zone
+    radius, the deadlock fix from 1.2.6 / 1.2.9. The fix is
+    one extra `&&` clause on the existing predicate.
+- **Frontend empty-range crash fix** (1.5.2). Selecting a time
+  range with zero points produced a white screen (`TypeError:
+  Cannot read properties of undefined (reading '_leaflet_pos')`).
+  Cause: `RouteMinimap`'s rect-update effect called
+  `mini.latLngToContainerPoint(...)` on a Leaflet map that had
+  just been torn down — the inner `<MapContainer>` unmounts when
+  `points.length === 0` (the existing render-time short-circuit),
+  but the parent's `mini` state retained the now-detached
+  reference and the effect ran one more time on the
+  `positions`-changed re-render. React unwound the entire tree on
+  the unhandled error → blank page. **Fix:** add
+  `positions.length === 0` to the effect's early-return guard so
+  it cannot outlive the map. App.tsx already had defensive guards
+  for empty / malformed responses (`Array.isArray(result?.data)`,
+  `hasQueried` flag for the `"No points found for this time
+  range"` status); they were defending a level above where the
+  crash actually occurred. Verified end-to-end via Playwright
+  (empty → non-empty → empty round-trip, zero console errors,
+  map stays rendered, status text updates).
 - **Unified home-zone anchor** (1.2.13). Three previously
   independent decisions — should we enter `.deferred` on a
   SLC-launch, should a wake-monitor fix promote out of `.deferred`,
@@ -1055,5 +1109,5 @@ GpsLogger/
         ├── SyncPolicyTests.swift           10 cases for the 1.2.10 Wi-Fi-only predicate + URLSession config regression guard + diagnostics flag default/override
         ├── WakeMonitorRoutingTests.swift    3 cases for the 1.2.11 wake-only SLC contract (no persist on wake events)
         ├── AutoWakeSettingsTests.swift      8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
-        └── HomeZoneTests.swift             23 cases for the 1.2.13 unified home-zone anchor (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate + flag-clear contract + WhenInUse invariants)
+        └── HomeZoneTests.swift             24 cases for the 1.2.13 unified home-zone anchor + 1.2.14 gap clause (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate with gap discriminator + continuous-walk regression + flag-clear contract + WhenInUse invariants)
 ```
