@@ -3,10 +3,40 @@
 Minimal SwiftUI app that records GPS points in the background and syncs them
 to the backend. Uses raw `sqlite3` (system library) — no external Swift packages.
 
+## Control Widget (iOS 18+) — 1.3.0
+
+A single-tap Control Center / Lock Screen button that opens GpsLogger.
+The widget contains **no tracking logic** — tapping it simply launches the
+app, and the app's existing auto-start behavior begins GPS recording.
+
+**How it works:**
+
+- `GpsLoggerControlWidget` is a `WidgetBundle`-based `ControlWidget` extension
+  embedded in the app.
+- `OpenGpsLoggerIntent` is an `AppIntent` with `openAppWhenRun = true`.
+  iOS 18 natively handles the app launch when the intent is performed.
+- No URL schemes, no `NSUserActivity`, no App Groups — the widget is a
+  pass-through button.
+
+**Adding the widget to Control Center / Lock Screen:**
+
+1. Swipe into Control Center → long-press → "Add a Control".
+2. Scroll to the GpsLogger section → tap **Track**.
+3. The control appears on Lock Screen and Control Center.
+4. Tapping it opens the app (requires device unlock from Lock Screen —
+   standard iOS security policy).
+
+**What the widget does NOT do:**
+
+- Does not display tracking status, point count, or any dynamic data.
+- Does not start/stop GPS — that's the app's job.
+- Does not communicate with the app in any way except launching it.
+- Does not add CPU/network overhead when idle.
+
 ## Requirements
 
 - macOS with Xcode 15 or newer
-- iPhone running iOS 16 or newer
+- iPhone running iOS 16 or newer (iOS 18+ required for Control Widget)
 - Free Apple ID (no paid Developer Program needed)
 - USB cable or Wi-Fi pairing between Mac and iPhone
 
@@ -15,7 +45,7 @@ to the backend. Uses raw `sqlite3` (system library) — no external Swift packag
 ```
 ios/
 ├── README.md                           ← this file
-├── project.yml                         ← xcodegen spec (app + test target)
+├── project.yml                         ← xcodegen spec (app + widget + test targets)
 ├── GpsLogger.xcconfig.example          ← template for DEVELOPMENT_TEAM + API_BASE_URL
 ├── GpsLogger/
 │   ├── GpsLoggerApp.swift              ← @main entry
@@ -33,6 +63,9 @@ ios/
 │   ├── Config.swift                    ← tunables + apiBaseURL resolver + Wi-Fi URLSession factory + diagnostics flag
 │   ├── GpsLogger.entitlements
 │   └── Info.plist                      ← reference plist with required keys
+├── GpsLoggerControlWidget/             ← Control Widget extension (1.3.0, iOS 18+)
+│   ├── GpsLoggerControlWidget.swift    ← @main WidgetBundle + ControlWidget
+│   └── OpenGpsLoggerIntent.swift       ← AppIntent (opens app, no business logic)
 └── GpsLoggerTests/
     ├── LocationFilterTests.swift       ← 20 cases covering every filter gate + pending-timeout + automotive spike-jump widening
     ├── KalmanSmootherTests.swift        ←  9 cases covering first-fix passthrough, attenuation, outlier damping, reset paths, ENU round-trip
@@ -226,18 +259,21 @@ covers every device you've built for.
 
 ## Usage
 
-1. Launch the app. Tracking starts immediately — there is no Start/Stop button.
-2. iOS prompts for location permission — choose **Allow While Using App**, then
+1. **Quick launch via Control Widget** (iOS 18+): add the **Track** control
+   to Control Center or Lock Screen (see Control Widget section above). One
+   tap opens the app with tracking started automatically.
+2. Launch the app (or tap the widget). Tracking starts immediately — there is no Start/Stop button.
+3. iOS prompts for location permission — choose **Allow While Using App**, then
    upgrade to **Always** in Settings → GpsLogger → Location for background
    tracking.
-3. The pulsing **green dot** in the top-right corner indicates the tracker is
+4. The pulsing **green dot** in the top-right corner indicates the tracker is
    active. A solid gray dot means permission was denied or not yet granted.
-4. The large number is the **unsynced points** counter — it increments on save
+5. The large number is the **unsynced points** counter — it increments on save
    and decrements as batches upload.
-5. The **Device ID** row at the bottom shows the stable identifier for this
+6. The **Device ID** row at the bottom shows the stable identifier for this
    install. Tap the copy icon to copy it to the clipboard, then paste it into
    the web UI's Device ID field to visualize this device's points.
-6. Go for a drive/walk. Points save every ~10 m and are filtered for accuracy,
+7. Go for a drive/walk. Points save every ~10 m and are filtered for accuracy,
    teleport-class spikes, and stationary jitter clusters before insert.
 
 ## How it works

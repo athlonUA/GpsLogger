@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.2.14"
-    CURRENT_PROJECT_VERSION: "19"
+    MARKETING_VERSION: "1.3.0"
+    CURRENT_PROJECT_VERSION: "20"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
 targets:
@@ -25,13 +25,17 @@ targets:
           # Reference plist; xcodegen synthesizes the real one from the
           # info.properties block below.
           - Info.plist
+      - path: GpsLoggerControlWidget/OpenGpsLoggerIntent.swift
+
+    dependencies:
+      - target: GpsLoggerControlWidget
 
     info:
       path: GpsLogger/Info-generated.plist
       properties:
         CFBundleDisplayName: GpsLogger
-        CFBundleShortVersionString: "1.2.14"
-        CFBundleVersion: "19"
+        CFBundleShortVersionString: "1.3.0"
+        CFBundleVersion: "20"
         # Plain-PNG app-icon path. Bypasses actool because Xcode 26.4.1
         # hard-fails the Assets.xcassets compile step on a Mac with no
         # iOS Simulator runtime installed — actool's internal "thinned
@@ -50,6 +54,10 @@ targets:
               - AppIcon
             CFBundleIconName: AppIcon
         LSRequiresIPhoneOS: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.gpslogger.personal
+            CFBundleURLSchemes:
+              - gpslogger
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -107,6 +115,36 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         CODE_SIGN_STYLE: Automatic
+
+  GpsLoggerControlWidget:
+    type: app-extension
+    platform: iOS
+
+    sources:
+      - path: GpsLoggerControlWidget
+
+    configFiles:
+      Debug: GpsLogger.xcconfig
+      Release: GpsLogger.xcconfig
+
+    info:
+      path: GpsLoggerControlWidget/Info-generated.plist
+      properties:
+        CFBundleDisplayName: Track
+        CFBundleShortVersionString: "1.3.0"
+        CFBundleVersion: "20"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gpslogger.personal.control-widget
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        MARKETING_VERSION: "1.3.0"
+        CURRENT_PROJECT_VERSION: "20"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
 
   GpsLoggerTests:
     type: bundle.unit-test

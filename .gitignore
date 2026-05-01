@@ -21,6 +21,7 @@ ios/build-device
 
 # xcodegen-generated Info plist
 ios/GpsLogger/Info-generated.plist
+ios/GpsLoggerControlWidget/Info-generated.plist
 
 # Local signing config — contains personal DEVELOPMENT_TEAM, see
 # ios/GpsLogger.xcconfig.example for the template.
