@@ -447,12 +447,15 @@ final class LocationTracker: NSObject, ObservableObject {
     /// delegate) treats it as a regular foreground session.
     private var launchedForLocation: Bool = false
 
-    /// Sticky copy of `launchedForLocation` set once in `start()` and
-    /// never cleared. Consumed by `maybePersist` to decide whether the
-    /// home-zone gap clause should apply — SLC wake-ups (phone
-    /// re-launched mid-night) need the clause to suppress phantom
-    /// indoor jitter; manual launches explicitly signal the user's
-    /// intent to track and must record immediately.
+    /// Sticky copy of `launchedForLocation` set in `start()`, cleared
+    /// unconditionally in `exitDeferredIfNeeded()`. Consumed by
+    /// `maybePersist` to decide whether the home-zone gap clause
+    /// should apply — SLC wake-ups (phone re-launched mid-night)
+    /// need the clause to suppress phantom indoor jitter; any
+    /// explicit transition out of deferred (user opens app or
+    /// wake-monitor confirms displacement) signals genuine tracking
+    /// intent and clears the flag so the resumed stream records
+    /// immediately.
     private var isSLCLaunch: Bool = false
 
     /// Kick off tracking. Called once from `AppContainer.bootstrap`
@@ -531,15 +534,17 @@ final class LocationTracker: NSObject, ObservableObject {
     /// is a no-op (re-issuing `startUpdatingLocation` on a running
     /// manager is also idempotent per Apple's contract).
     func exitDeferredIfNeeded() {
+        // Any call to this method — whether from scenePhase=.active
+        // (user opened the app), the wake-monitor delegate (SLC fix
+        // confirmed displacement), or handleAuthorizationState
+        // (defensive promotion) — signals that tracking should
+        // proceed without the SLC-era jitter guard. Clear the flag
+        // unconditionally so the home-zone gap clause does not
+        // suppress fixes even when mode was already .fullTracking
+        // (reachable via SLC launch with stale/missing anchor).
+        isSLCLaunch = false
         guard mode == .deferred else { return }
         mode = .fullTracking
-        // Any explicit transition out of deferred — whether triggered
-        // by the user opening the app (scenePhase=.active) or by the
-        // wake-monitor confirming real displacement — is a signal
-        // that tracking should proceed without the SLC-era jitter
-        // guard. Clear the sticky flag so the home-zone gap clause
-        // does not suppress the first fixes of the resumed stream.
-        isSLCLaunch = false
         // Reset filter / smoother / stationary anchors so the first
         // accepted fix on the resumed stream is treated as a fresh
         // baseline — we have no reason to compare it against
