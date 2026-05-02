@@ -411,6 +411,52 @@ final class HomeZoneTests: XCTestCase {
         XCTAssertEqual(state.unsyncedCount, 1)
     }
 
+    func testWakeMonitorPromotionClearsSLCFlag() {
+        // 1.3.1: wake-monitor path (evaluateWakeFixForDeferredExit)
+        // also calls exitDeferredIfNeeded internally — verify the
+        // SLC flag is cleared so post-promotion fixes inside the
+        // home zone persist without gap-clause suppression.
+        let nineteenMinAgo = Date().addingTimeInterval(-19 * 60)
+        Config.updateLastAnchor(
+            latitude: anchorLat,
+            longitude: anchorLon,
+            timestamp: nineteenMinAgo
+        )
+        let (db, state, tracker) = makeFreshTracker()
+
+        // SLC-launch → deferred context
+        tracker.start(launchedForLocation: true)
+        tracker.forceDeferredModeForTesting()
+        XCTAssertEqual(tracker.mode, .deferred)
+
+        // Wake-monitor delivers a fix outside the home zone —
+        // this triggers promotion to fullTracking and must clear
+        // isSLCLaunch.
+        let farFix = cleanGnssFix(
+            lat: coordinate(metersNorth: 200, of: anchorLat),
+            lon: anchorLon
+        )
+        tracker.evaluateWakeFixForDeferredExit(farFix)
+        XCTAssertEqual(
+            tracker.mode, .fullTracking,
+            "Wake-monitor displacement must promote to fullTracking"
+        )
+
+        // Now a fix inside the home zone after promotion must persist
+        let fix = cleanGnssFix(
+            lat: coordinate(metersNorth: 33, of: anchorLat),
+            lon: anchorLon
+        )
+        tracker.locationManager(tracker.testingTrackingManager(), didUpdateLocations: [fix])
+        waitForAsyncDrain()
+
+        XCTAssertEqual(
+            db.initialCount(), 1,
+            "Fix after wake-monitor promotion must persist — isSLCLaunch cleared"
+        )
+        XCTAssertEqual(state.unsyncedCount, 1)
+    }
+
     func testContinuousWalkingFixInsideHomeZoneIsNotSuppressed() {
         // 2026-04-29 regression: rolling anchor + fresh fix at 15 m must
         // NOT be suppressed — the gap clause gates the home-zone radius
