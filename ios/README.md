@@ -370,15 +370,19 @@ covers every device you've built for.
      anchor. Inside the radius → stay deferred (iOS will re-suspend
      us shortly). Outside → `exitDeferredIfNeeded` engages
      `manager.startUpdatingLocation()` and the regular pipeline.
-  3. **`maybePersist` pre-pipeline gate.** Even in `.fullTracking`,
-     an accepted fix landing inside the home zone is suppressed
-     before reaching smoother / stationary / `points` insert
-     **iff the gap since the last persisted point exceeds
-     `Config.resumeGapSeconds`** (1.2.14, 60 s). The combined
-     predicate plugs the indoor-jitter phantom-points hole exposed
-     on 2026-04-26 (a 19-minute LocationFilter-rejected window
-     followed by two fixes 33–44 m from the evening's last accepted
-     point — both inside the 100 m home zone) without
+   3. **`maybePersist` pre-pipeline gate (narrowed in 1.3.1).** In
+      `.fullTracking` under an SLC-launched session
+      (`isSLCLaunch == true`), an accepted fix landing inside the
+      home zone is suppressed before reaching smoother / stationary /
+      `points` insert **iff the gap since the last persisted point
+      exceeds `Config.resumeGapSeconds`** (1.2.14, 60 s). Manual
+      launches skip this gate entirely (1.3.1) — the user's explicit
+      intent to track overrides the jitter guard, fixing the "first
+      point requires walking >100 m from home" morning-walk dead zone.
+      The combined predicate plugs the indoor-jitter phantom-points
+      hole exposed on 2026-04-26 (a 19-minute LocationFilter-rejected
+      window followed by two fixes 33–44 m from the evening's last
+      accepted point — both inside the 100 m home zone) without
      downsampling continuous walks (the 2026-04-29 regression: a
      pure-distance gate trips on every step of an active walk
      because the rolling anchor sits ~10–15 m behind, the

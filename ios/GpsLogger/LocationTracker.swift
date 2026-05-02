@@ -79,15 +79,20 @@ import UIKit
 ///        re-suspend the process. A SLC fix outside the home zone
 ///        promotes mode to `.fullTracking` and starts the regular
 ///        update stream.
-///     3. **`maybePersist` pre-pipeline gate.** Even in
-///        `.fullTracking`, an accepted fix landing inside the home
-///        zone is suppressed before it reaches the smoother /
-///        stationary detector / `points` insert **iff** the gap
+///     3. **`maybePersist` pre-pipeline gate.** In `.fullTracking`,
+///        an accepted fix landing inside the home zone is suppressed
+///        before it reaches the smoother / stationary detector /
+///        `points` insert **iff** the session was SLC-launched
+///        (`isSLCLaunch == true`), the anchor is fresh, the gap
 ///        since the last persisted point exceeds
-///        `Config.resumeGapSeconds`. This stops the rolling anchor
-///        from turning the 100 m radius into a continuous-walk
-///        downsampler (the 2026-04-29 regression), while still
-///        intercepting the indoor-jitter phantom path (2026-04-26).
+///        `Config.resumeGapSeconds`, AND the fix is within
+///        `Config.homeZoneRadiusMeters`. This stops the rolling
+///        anchor from turning the 100 m radius into a
+///        continuous-walk downsampler (the 2026-04-29 regression),
+///        while still intercepting the indoor-jitter phantom path
+///        (2026-04-26). Manual launches skip this gate — the user's
+///        explicit intent to track overrides the jitter guard
+///        (1.3.1).
 ///
 ///   The persisted anchor is updated by `persist(_:)` after every
 ///   successful SQLite insert, so the home zone naturally follows

@@ -297,9 +297,13 @@ final class HomeZoneTests: XCTestCase {
 
     // MARK: - maybePersist home-zone pre-check
 
-    func testFixInsideHomeZoneSuppressedFromPersist() {
+    func testSLCLaunchFixInsideHomeZoneSuppressedFromPersist() {
         // 2026-04-26 phantom-points: 19 min quiet, fix 33 m from anchor
         // → suppressed by the combined gap + distance gate.
+        // 1.3.1: the gap clause is now SLC-only. This test must
+        // simulate the SLC-launch context (start + auth grant) so
+        // isSLCLaunch=true and the gate engages. Renamed from
+        // testFixInsideHomeZoneSuppressedFromPersist.
         let nineteenMinAgo = Date().addingTimeInterval(-19 * 60)
         Config.updateLastAnchor(
             latitude: anchorLat,
@@ -307,6 +311,12 @@ final class HomeZoneTests: XCTestCase {
             timestamp: nineteenMinAgo
         )
         let (db, state, tracker) = makeFreshTracker()
+
+        // SLC-launch context: isSLCLaunch must be true for the gap
+        // clause to fire. Simulate the SLC-wake flow.
+        tracker.start(launchedForLocation: true)
+        tracker.handleAuthorizationStateForTesting(.authorizedAlways)
+
         XCTAssertEqual(db.initialCount(), 0)
 
         let phantom = cleanGnssFix(
@@ -318,9 +328,43 @@ final class HomeZoneTests: XCTestCase {
 
         XCTAssertEqual(
             db.initialCount(), 0,
-            "Fix inside home zone after a long quiet window must not produce a points row"
+            "SLC-launch: fix inside home zone after a long quiet window must not produce a points row"
         )
         XCTAssertEqual(state.unsyncedCount, 0)
+    }
+
+    func testManualLaunchFixInsideHomeZoneIsNotSuppressed() {
+        // 1.3.1 regression test. Manual launch (isSLCLaunch=false)
+        // must NOT suppress fixes within the home zone, even after
+        // a long gap. The user explicitly launched the app — they
+        // expect tracking to start immediately, not after walking
+        // >100 m from their last-anchor position.
+        let nineteenMinAgo = Date().addingTimeInterval(-19 * 60)
+        Config.updateLastAnchor(
+            latitude: anchorLat,
+            longitude: anchorLon,
+            timestamp: nineteenMinAgo
+        )
+        let (db, state, tracker) = makeFreshTracker()
+
+        // Manual-launch context
+        tracker.start(launchedForLocation: false)
+        tracker.handleAuthorizationStateForTesting(.authorizedAlways)
+
+        XCTAssertEqual(db.initialCount(), 0)
+
+        let fix = cleanGnssFix(
+            lat: coordinate(metersNorth: 33, of: anchorLat),
+            lon: anchorLon
+        )
+        tracker.locationManager(tracker.testingTrackingManager(), didUpdateLocations: [fix])
+        waitForAsyncDrain()
+
+        XCTAssertEqual(
+            db.initialCount(), 1,
+            "Manual launch + fresh anchor + long gap + fix within 100 m → must persist"
+        )
+        XCTAssertEqual(state.unsyncedCount, 1)
     }
 
     func testContinuousWalkingFixInsideHomeZoneIsNotSuppressed() {
