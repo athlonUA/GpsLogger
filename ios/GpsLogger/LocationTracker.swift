@@ -442,6 +442,14 @@ final class LocationTracker: NSObject, ObservableObject {
     /// delegate) treats it as a regular foreground session.
     private var launchedForLocation: Bool = false
 
+    /// Sticky copy of `launchedForLocation` set once in `start()` and
+    /// never cleared. Consumed by `maybePersist` to decide whether the
+    /// home-zone gap clause should apply — SLC wake-ups (phone
+    /// re-launched mid-night) need the clause to suppress phantom
+    /// indoor jitter; manual launches explicitly signal the user's
+    /// intent to track and must record immediately.
+    private var isSLCLaunch: Bool = false
+
     /// Kick off tracking. Called once from `AppContainer.bootstrap`
     /// at launch. The actual state transitions (notDetermined → requested →
     /// granted / denied / downgraded) are all handled in
@@ -461,6 +469,7 @@ final class LocationTracker: NSObject, ObservableObject {
     /// behavior — full symmetry with the conscious-launch UX.
     func start(launchedForLocation: Bool) {
         self.launchedForLocation = launchedForLocation
+        self.isSLCLaunch = launchedForLocation
         switch manager.authorizationStatus {
         case .notDetermined:
             manager.requestAlwaysAuthorization()
@@ -921,7 +930,13 @@ final class LocationTracker: NSObject, ObservableObject {
         // 2026-04-26 indoor-jitter phantom pattern. Without the gap
         // clause, the rolling anchor silently downsamples a continuous
         // walk to one row per ~100 m (2026-04-29 regression).
-        if let anchor = Config.lastAnchor(),
+        //
+        // 1.3.0: only apply the gap clause for SLC wake-up launches
+        // (phone re-launched mid-night). Manual launches are explicit
+        // user intent to track — suppressing the first ~100 m of a
+        // morning walk is a bad UX and makes the app feel broken.
+        if isSLCLaunch,
+           let anchor = Config.lastAnchor(),
            anchor.isFresh(),
            loc.timestamp.timeIntervalSince(anchor.timestamp) > Config.resumeGapSeconds,
            loc.distance(from: anchor.location) <= Config.homeZoneRadiusMeters {
