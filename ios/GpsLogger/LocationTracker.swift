@@ -533,6 +533,13 @@ final class LocationTracker: NSObject, ObservableObject {
     func exitDeferredIfNeeded() {
         guard mode == .deferred else { return }
         mode = .fullTracking
+        // Any explicit transition out of deferred — whether triggered
+        // by the user opening the app (scenePhase=.active) or by the
+        // wake-monitor confirming real displacement — is a signal
+        // that tracking should proceed without the SLC-era jitter
+        // guard. Clear the sticky flag so the home-zone gap clause
+        // does not suppress the first fixes of the resumed stream.
+        isSLCLaunch = false
         // Reset filter / smoother / stationary anchors so the first
         // accepted fix on the resumed stream is treated as a fresh
         // baseline — we have no reason to compare it against
@@ -936,10 +943,12 @@ final class LocationTracker: NSObject, ObservableObject {
         // clause, the rolling anchor silently downsamples a continuous
         // walk to one row per ~100 m (2026-04-29 regression).
         //
-        // 1.3.0: only apply the gap clause for SLC wake-up launches
+        // 1.3.1: only apply the gap clause for SLC wake-up launches
         // (phone re-launched mid-night). Manual launches are explicit
-        // user intent to track — suppressing the first ~100 m of a
-        // morning walk is a bad UX and makes the app feel broken.
+        // user intent to track. Additionally, any exit from .deferred
+        // mode (user opening app or wake-monitor confirming real
+        // displacement) clears isSLCLaunch, so a promoted-from-
+        // deferred session also records immediately.
         if isSLCLaunch,
            let anchor = Config.lastAnchor(),
            anchor.isFresh(),

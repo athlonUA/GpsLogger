@@ -367,6 +367,50 @@ final class HomeZoneTests: XCTestCase {
         XCTAssertEqual(state.unsyncedCount, 1)
     }
 
+    func testDeferredExitClearsSLCFlag() {
+        // 1.3.1 edge case: SLC-launched → deferred overnight → user
+        // opens app in morning → exitDeferredIfNeeded → gap clause
+        // must NOT suppress the first fix after promotion.
+        //
+        // Simulate: SLC launch sets isSLCLaunch=true. Force deferred
+        // (as the overnight SLC wake would). Then promote — this
+        // must clear the sticky flag so the resumed stream records
+        // immediately.
+        let nineteenMinAgo = Date().addingTimeInterval(-19 * 60)
+        Config.updateLastAnchor(
+            latitude: anchorLat,
+            longitude: anchorLon,
+            timestamp: nineteenMinAgo
+        )
+        let (db, state, tracker) = makeFreshTracker()
+
+        // SLC-launch context — sets isSLCLaunch=true
+        tracker.start(launchedForLocation: true)
+        tracker.forceDeferredModeForTesting()
+        XCTAssertEqual(tracker.mode, .deferred)
+
+        // User opens app → exit from deferred → must clear isSLCLaunch
+        tracker.exitDeferredIfNeeded()
+        XCTAssertEqual(tracker.mode, .fullTracking)
+
+        // Now drive a fix inside the home zone. Without the flag
+        // clear, the gap clause would suppress it (anchor 19 min ago,
+        // gap > 60s, within 100m). With the flag cleared by exit,
+        // it must persist.
+        let fix = cleanGnssFix(
+            lat: coordinate(metersNorth: 33, of: anchorLat),
+            lon: anchorLon
+        )
+        tracker.locationManager(tracker.testingTrackingManager(), didUpdateLocations: [fix])
+        waitForAsyncDrain()
+
+        XCTAssertEqual(
+            db.initialCount(), 1,
+            "Fix after deferred exit must persist — isSLCLaunch cleared on promotion"
+        )
+        XCTAssertEqual(state.unsyncedCount, 1)
+    }
+
     func testContinuousWalkingFixInsideHomeZoneIsNotSuppressed() {
         // 2026-04-29 regression: rolling anchor + fresh fix at 15 m must
         // NOT be suppressed — the gap clause gates the home-zone radius
