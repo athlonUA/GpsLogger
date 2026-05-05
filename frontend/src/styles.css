@@ -157,10 +157,6 @@ html {
   cursor: pointer;
 }
 
-html.dark .panel input[type="datetime-local"]::-webkit-calendar-picker-indicator {
-  filter: invert(1);
-}
-
 .panel input[type="datetime-local"]:hover,
 .panel input[type="text"]:hover {
   background: var(--input-bg-hover);
