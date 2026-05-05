@@ -96,6 +96,10 @@ body,
   font-feature-settings: "cv11", "ss01";
 }
 
+html {
+  color-scheme: light;
+}
+
 .app {
   display: flex;
   flex-direction: column;

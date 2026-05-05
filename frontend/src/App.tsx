@@ -28,7 +28,14 @@ function useTheme(): [Theme, (t: Theme) => void] {
 
   useEffect(() => {
     const root = document.documentElement;
-    const apply = () => root.classList.toggle('dark', resolveIsDark(theme));
+    const apply = () => {
+      const dark = resolveIsDark(theme);
+      if (dark) {
+        root.classList.add('dark');
+      } else {
+        root.classList.remove('dark');
+      }
+    };
     apply();
     const mq = matchMedia('(prefers-color-scheme: dark)');
     const onChange = () => { if (theme === 'system') apply(); };
