@@ -1033,7 +1033,7 @@ export default function MapView({ points }: { points: Point[] }) {
             center={[selected.lat, selected.lng]}
             radius={11}
             pathOptions={{
-              color: '#0f172a',
+              color: '#3b82f6',
               fillOpacity: 0,
               weight: 2,
               dashArray: '3 3',
