@@ -49,6 +49,10 @@ export type RenderData = {
   /// (no polyline spans it), but the running total carries over so the
   /// last sampled point reports the true total traced distance.
   distancesMeters: number[];
+  /// Cumulative elapsed time from the first point, seconds, aligned to
+  /// `sampled`. Includes time-gap durations so "time from start" reflects
+  /// the total wall-clock duration since the route began.
+  timesFromStartSeconds: number[];
   /// One polyline per gap-group.
   segments: Segment[];
   /// Isolated fixes (groups of exactly one point after gap-splitting).
@@ -158,6 +162,24 @@ export function cumulativeDistances(groups: Point[][]): number[][] {
   return result;
 }
 
+/// Cumulative elapsed time from the first point in the query window,
+/// per raw point, grouped, in seconds. Continuous across time gaps —
+/// the gap time is included so "time from start" reflects the total
+/// duration since the route began, not just active movement.
+export function cumulativeTimesSeconds(groups: Point[][]): number[][] {
+  if (groups.length === 0 || groups[0].length === 0) return [];
+  const t0 = new Date(groups[0][0].created_at).getTime();
+  const result: number[][] = [];
+  for (const g of groups) {
+    const cum: number[] = [];
+    for (const p of g) {
+      cum.push((new Date(p.created_at).getTime() - t0) / 1000);
+    }
+    result.push(cum);
+  }
+  return result;
+}
+
 // --------------------------------------------------------------------------
 // Downsampling
 // --------------------------------------------------------------------------
@@ -206,6 +228,7 @@ export function buildRenderData(points: Point[]): RenderData {
       groups: [],
       sampled: [],
       distancesMeters: [],
+      timesFromStartSeconds: [],
       segments: [],
       singletons: [],
     };
@@ -213,6 +236,7 @@ export function buildRenderData(points: Point[]): RenderData {
 
   const rawGroups = splitByTimeGaps(points);
   const rawCumDist = cumulativeDistances(rawGroups);
+  const rawCumTime = cumulativeTimesSeconds(rawGroups);
   const idx = downsampleIndices(rawGroups);
 
   const sampledGroups: Point[][] = rawGroups.map((g, gi) =>
@@ -222,6 +246,9 @@ export function buildRenderData(points: Point[]): RenderData {
   // inputs are the common case and there's no reason to allocate a new
   // array when every index maps to itself.
   const sampledCumDist: number[][] = rawCumDist.map((cum, gi) =>
+    idx[gi].length === cum.length ? cum : idx[gi].map((ii) => cum[ii]),
+  );
+  const sampledCumTime: number[][] = rawCumTime.map((cum, gi) =>
     idx[gi].length === cum.length ? cum : idx[gi].map((ii) => cum[ii]),
   );
 
@@ -243,6 +270,7 @@ export function buildRenderData(points: Point[]): RenderData {
     groups: sampledGroups,
     sampled: sampledGroups.flat(),
     distancesMeters: sampledCumDist.flat(),
+    timesFromStartSeconds: sampledCumTime.flat(),
     segments,
     singletons,
   };

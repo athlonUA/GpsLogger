@@ -5,6 +5,7 @@ import {
   arrowsAlong,
   buildRenderData,
   cumulativeDistances,
+  cumulativeTimesSeconds,
   downsampleGroups,
   downsampleIndices,
   GAP_MS,
@@ -175,6 +176,38 @@ describe('cumulativeDistances', () => {
   });
 });
 
+describe('cumulativeTimesSeconds', () => {
+  it('returns empty for empty input', () => {
+    expect(cumulativeTimesSeconds([])).toEqual([]);
+  });
+
+  it('returns empty for a group whose first element has no points', () => {
+    // defensive — groups with zero-length inner arrays can't happen
+    // from splitByTimeGaps but the function handles it.
+    expect(cumulativeTimesSeconds([[]])).toEqual([]);
+  });
+
+  it('starts at 0 and is monotonically increasing within a group', () => {
+    const trace = northwardTrace(10, 3, 1);
+    const [cum] = cumulativeTimesSeconds([trace]);
+    expect(cum[0]).toBe(0);
+    for (let i = 1; i < cum.length; i++) {
+      expect(cum[i]).toBeGreaterThan(cum[i - 1]);
+    }
+  });
+
+  it('includes gap time between groups', () => {
+    const g1 = northwardTrace(3, 2, 1, 0, 0);
+    // 10_000 s later
+    const g2 = northwardTrace(3, 2, 1, 10_000, 0);
+    const cum = cumulativeTimesSeconds([g1, g2]);
+    // g1 times: 0, 1, 2
+    // g2 times: 10_000, 10_001, 10_002
+    expect(cum[0]).toEqual([0, 1, 2]);
+    expect(cum[1]).toEqual([10_000, 10_001, 10_002]);
+  });
+});
+
 describe('buildRenderData', () => {
   it('returns empty render for empty input', () => {
     const out = buildRenderData([]);
@@ -182,6 +215,7 @@ describe('buildRenderData', () => {
       groups: [],
       sampled: [],
       distancesMeters: [],
+      timesFromStartSeconds: [],
       segments: [],
       singletons: [],
     });
@@ -196,6 +230,7 @@ describe('buildRenderData', () => {
     expect(out.singletons).toHaveLength(1);
     expect(out.singletons[0].point).toBe(p);
     expect(out.distancesMeters).toEqual([0]);
+    expect(out.timesFromStartSeconds).toEqual([0]);
   });
 
   it('emits a segment for a two-point trace', () => {
@@ -223,6 +258,8 @@ describe('buildRenderData', () => {
       expect(Array.isArray(out.sampled)).toBe(true);
       expect(Array.isArray(out.distancesMeters)).toBe(true);
       expect(out.distancesMeters).toHaveLength(out.sampled.length);
+      expect(Array.isArray(out.timesFromStartSeconds)).toBe(true);
+      expect(out.timesFromStartSeconds).toHaveLength(out.sampled.length);
       const totalGroupPoints = out.groups.reduce((s, g) => s + g.length, 0);
       expect(totalGroupPoints).toBe(out.sampled.length);
       const singletonGroups = out.groups.filter((g) => g.length === 1).length;
@@ -279,14 +316,18 @@ describe('buildRenderData', () => {
     const trace = northwardTrace(n, 2, 1);
     const out = buildRenderData(trace);
     expect(out.distancesMeters.length).toBe(out.sampled.length);
+    expect(out.timesFromStartSeconds.length).toBe(out.sampled.length);
     // Endpoints survive downsampling — their distances must too.
     expect(out.distancesMeters[0]).toBe(0);
+    expect(out.timesFromStartSeconds[0]).toBe(0);
     const lastSampled = out.sampled[out.sampled.length - 1];
     const lastDist = out.distancesMeters[out.distancesMeters.length - 1];
+    const lastTime = out.timesFromStartSeconds[out.timesFromStartSeconds.length - 1];
     // Full raw distance ≈ (n-1) segments × 2 m = (MAX_POINTS*3 - 1) * 2.
     // The sampled endpoint is the raw endpoint, so its cumulative matches.
     const rawTotal = (n - 1) * haversineMeters(trace[0], trace[1]);
     expect(lastDist).toBeCloseTo(rawTotal, 0);
+    expect(lastTime).toBe(n - 1);
     expect(lastSampled).toBe(trace[n - 1]);
   });
 
@@ -313,6 +354,10 @@ describe('buildRenderData', () => {
     // the time gap contributes zero.
     const walkAEndDist = out.distancesMeters[walkA.length - 1];
     expect(out.distancesMeters[singletonFlatIdx]).toBeCloseTo(walkAEndDist, 5);
+
+    // Its cumulative time includes the gap — the lone fix sits 10 min
+    // after the start (walkA has 5 points at 1 s intervals = 4 s).
+    expect(out.timesFromStartSeconds[singletonFlatIdx]).toBe(10 * 60 + 1);
   });
 });
 

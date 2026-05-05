@@ -386,7 +386,8 @@ body,
 
 .point-card__address,
 .point-card__time,
-.point-card__distance {
+.point-card__distance,
+.point-card__duration {
   line-height: 1.5;
   color: var(--text);
   min-height: 20px;
@@ -394,7 +395,8 @@ body,
 }
 
 .point-card__time,
-.point-card__distance {
+.point-card__distance,
+.point-card__duration {
   font-variant-numeric: tabular-nums;
 }
 

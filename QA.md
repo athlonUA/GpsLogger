@@ -326,9 +326,9 @@ global budget with per-group proportional allocation:
 - identical points return ≈ 0
 - 1° of latitude returns ≈ 111 km
 
-**`segmentLengths` (2 cases)** and **`cumulativeDistances` (2 cases)** —
-distance machinery backing the "X km from start" detail-card row
-(1.4.1):
+**`segmentLengths` (2 cases)** and **`cumulativeDistances` (2 cases)** and
+**`cumulativeTimesSeconds` (4 cases)** — distance and elapsed-time
+machinery backing the detail-card rows (1.4.1):
 
 - lengths are empty for groups shorter than 2
 - per-segment lengths sum very close to the end-to-end haversine
@@ -1205,15 +1205,19 @@ distance in the detail card.
   variants, no mode legend overlay. Start pin is green "S", End pin
   is red "E" — unchanged from 1.3.1.
 - **Distance row.** Click a point near the Start marker. The detail
-  card's "Distance" row reads `"0 m from start"` (or a few meters
-  from the snap offset). Click a point near the End marker: the row
-  reads the total kilometers. Click a point ~halfway along: the
-  reading should be approximately half the total, give or take
-  downsampling snap.
+  card's "Distance" row reads `"0 m"` (or a few meters from the snap
+  offset). Click a point near the End marker: the row reads the total
+  kilometers. Click a point ~halfway along: the reading should be
+  approximately half the total, give or take downsampling snap.
+- **Time row.** Click a point near the Start marker. The detail card's
+  "Time" row reads `"0 s"`. Click a point near the End marker: the row
+  reads the total elapsed wall-clock time (e.g. `"3 h 42 min"`). Time
+  gaps are included — a 10-minute gap between sessions adds 10 minutes.
 - **Formatting.** Distances below 1 km render as whole meters
-  (`"350 m from start"`). At 1 km and above, kilometers with one
-  decimal (`"2.5 km from start"`). `—` appears only if the value is
-  `NaN` (shouldn't happen on healthy data).
+  (`"350 m"`). At 1 km and above, kilometers with one decimal
+  (`"2.5 km"`). Elapsed times render as hours+minutes (`"3 h 42 min"`),
+  minutes+seconds (`"15 min 30 s"`), or seconds (`"45 s"`). `—` appears
+  only if the value is `NaN` (shouldn't happen on healthy data).
 - **Gap continuity.** Visualize a range that crosses a >5-minute
   time-gap (e.g. a morning walk at point A, then an afternoon walk at
   point B, same `device_id`). Click a point in the second group: the
@@ -1221,7 +1225,9 @@ distance in the detail card.
   (distance from group-2 start to clicked point)`. The ~10 km spatial
   jump during the gap is **not** added (the gap has no polyline; the
   running total carries over but picks up zero meters of bridge
-  distance).
+  distance). The time row for the same point includes the gap — the
+  elapsed reading equals `(group-1 end time) + gap duration + intra-g2
+  time`.
 - **Downsampled trace.** Insert 10k+ synthetic points with increasing
   coordinates (known total distance). Visualize. Click the last
   rendered point. Expected: the displayed kilometers are within a

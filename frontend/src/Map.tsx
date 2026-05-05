@@ -575,8 +575,26 @@ function formatLocal(iso: string): { localTime: string; timezone: string } {
 /// would be fake precision given GPS noise.
 function formatDistance(meters: number): string {
   if (!Number.isFinite(meters) || meters < 0) return '—';
-  if (meters < 1000) return `${Math.round(meters)} m from start`;
-  return `${(meters / 1000).toFixed(1)} km from start`;
+  if (meters < 1000) return `${Math.round(meters)} m`;
+  return `${(meters / 1000).toFixed(1)} km`;
+}
+
+/// Format elapsed seconds as human-readable duration for the detail card.
+/// Matches the precision level of `formatDistance`.
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '—';
+  const s = Math.round(seconds);
+  if (s < 60) return `${s} s`;
+  const minutes = Math.floor(s / 60);
+  const secs = s % 60;
+  if (minutes < 60) {
+    if (secs === 0) return `${minutes} min`;
+    return `${minutes} min ${secs} s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (mins === 0) return `${hours} h`;
+  return `${hours} h ${mins} min`;
 }
 
 // --------------------------------------------------------------------------
@@ -619,6 +637,7 @@ function DetailCard({
   lng,
   createdAt,
   distanceMeters,
+  secondsFromStart,
   address,
   onClose,
 }: {
@@ -626,12 +645,14 @@ function DetailCard({
   lng: number;
   createdAt: string;
   distanceMeters: number;
+  secondsFromStart: number;
   address: AddressState;
   onClose: () => void;
 }) {
   const coordsText = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
   const { localTime, timezone } = useMemo(() => formatLocal(createdAt), [createdAt]);
   const distanceText = useMemo(() => formatDistance(distanceMeters), [distanceMeters]);
+  const durationText = useMemo(() => formatDuration(secondsFromStart), [secondsFromStart]);
   const [copied, setCopied] = useState<CopyTarget | null>(null);
 
   const copy = useCallback(async (text: string, which: CopyTarget) => {
@@ -664,6 +685,9 @@ function DetailCard({
 
       <div className="point-card__label">Distance</div>
       <div className="point-card__distance">{distanceText}</div>
+
+      <div className="point-card__label">Time</div>
+      <div className="point-card__duration">{durationText}</div>
 
       <div className="point-card__label">Address</div>
       <div className="point-card__address">
@@ -706,7 +730,7 @@ function DetailCard({
 
 export default function MapView({ points }: { points: Point[] }) {
   const render = useMemo(() => buildRenderData(points), [points]);
-  const { groups, sampled, distancesMeters, segments, singletons } = render;
+  const { groups, sampled, distancesMeters, timesFromStartSeconds, segments, singletons } = render;
 
   // One halo polyline per group — keeps the subtle shadow under the route
   // but honors the same time-gap breaks so it does not bridge
@@ -768,7 +792,7 @@ export default function MapView({ points }: { points: Point[] }) {
   );
 
   const [selected, setSelected] = useState<
-    { lat: number; lng: number; createdAt: string; distanceMeters: number } | null
+    { lat: number; lng: number; createdAt: string; distanceMeters: number; secondsFromStart: number } | null
   >(null);
   const [address, setAddress] = useState<AddressState>({ status: 'idle' });
 
@@ -788,11 +812,11 @@ export default function MapView({ points }: { points: Point[] }) {
   }, [points]);
 
   const selectPoint = useCallback(
-    (point: Point, distanceMeters: number) => {
+    (point: Point, distanceMeters: number, secondsFromStart: number) => {
       const id = ++requestIdRef.current;
       const lat = point.latitude;
       const lng = point.longitude;
-      setSelected({ lat, lng, createdAt: point.created_at, distanceMeters });
+      setSelected({ lat, lng, createdAt: point.created_at, distanceMeters, secondsFromStart });
 
       const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
       const cached = cacheRef.current.get(key);
@@ -830,14 +854,19 @@ export default function MapView({ points }: { points: Point[] }) {
     [distancesMeters],
   );
 
+  const timeAt = useCallback(
+    (index: number) => timesFromStartSeconds[index] ?? 0,
+    [timesFromStartSeconds],
+  );
+
   const handleRouteClick = useCallback(
     (e: L.LeafletMouseEvent) => {
       const map = mapRef.current;
       if (!map) return;
       const nearest = findNearestPoint(sampled, map, e.latlng.lat, e.latlng.lng);
-      if (nearest) selectPoint(nearest.point, distanceAt(nearest.index));
+      if (nearest) selectPoint(nearest.point, distanceAt(nearest.index), timeAt(nearest.index));
     },
-    [sampled, selectPoint, distanceAt],
+    [sampled, selectPoint, distanceAt, timeAt],
   );
 
   // Start/end markers anchor the polyline endpoints, not any isolated
@@ -944,7 +973,7 @@ export default function MapView({ points }: { points: Point[] }) {
                 weight: 2,
               }}
               eventHandlers={{
-                click: () => selectPoint(s.point, distanceAt(flatIndex)),
+                click: () => selectPoint(s.point, distanceAt(flatIndex), timeAt(flatIndex)),
               }}
             />
           );
@@ -974,7 +1003,7 @@ export default function MapView({ points }: { points: Point[] }) {
             position={[firstInfo.point.latitude, firstInfo.point.longitude]}
             icon={startIcon}
             eventHandlers={{
-              click: () => selectPoint(firstInfo.point, distanceAt(firstInfo.index)),
+              click: () => selectPoint(firstInfo.point, distanceAt(firstInfo.index), timeAt(firstInfo.index)),
             }}
             zIndexOffset={1000}
           >
@@ -989,7 +1018,7 @@ export default function MapView({ points }: { points: Point[] }) {
             position={[lastInfo.point.latitude, lastInfo.point.longitude]}
             icon={endIcon}
             eventHandlers={{
-              click: () => selectPoint(lastInfo.point, distanceAt(lastInfo.index)),
+              click: () => selectPoint(lastInfo.point, distanceAt(lastInfo.index), timeAt(lastInfo.index)),
             }}
             zIndexOffset={1000}
           >
@@ -1027,6 +1056,7 @@ export default function MapView({ points }: { points: Point[] }) {
           lng={selected.lng}
           createdAt={selected.createdAt}
           distanceMeters={selected.distanceMeters}
+          secondsFromStart={selected.secondsFromStart}
           address={address}
           onClose={() => {
             abortRef.current?.abort();

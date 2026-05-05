@@ -19,7 +19,7 @@ Minimal end-to-end GPS tracking system.
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis; opt-in Auto Wake via SLC (1.2.12) with a unified home-zone anchor (1.2.13) and a gap clause on the persist gate (1.2.14) so the anchor silences overnight wake-up phantoms and indoor-jitter writes without downsampling continuous walks |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance and elapsed time from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
 | **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
 
 ## Data contract
@@ -993,12 +993,15 @@ flowchart LR
   that the gradient used to imply.
 - **Distance from start** (1.4.1). The detail card shown on point click
   reports cumulative distance from the first point of the query window,
-  formatted as `"350 m from start"` below 1 km or `"2.5 km from start"`
-  at or above. Computed by walking the raw (pre-downsample) points with
-  haversine so winding-road chord-shortening doesn't undercount;
-  continuous across time-gap groups (gap-jump distance is NOT added,
-  but the running total carries over, so the last point reports true
-  total traced distance).
+  formatted as `"350 m"` below 1 km or `"2.5 km"` at or above. Computed
+  by walking the raw (pre-downsample) points with haversine so
+  winding-road chord-shortening doesn't undercount; continuous across
+  time-gap groups (gap-jump distance is NOT added, but the running total
+  carries over, so the last point reports true total traced distance).
+- **Elapsed time** (1.4.1). The same detail card also shows wall-clock
+  elapsed time from the first point, formatted as `"3 h 42 min"`, `"15 min
+  30 s"`, or `"45 s"` depending on magnitude. Includes time-gap durations
+  so the value reflects total trip duration, not just active movement.
 - **Direction-of-travel arrows** (1.3.1): a small semi-transparent
   chevron every ~150 m along each polyline group, oriented to the
   segment's bearing, so direction reads instantly at any zoom.
