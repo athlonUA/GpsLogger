@@ -3,6 +3,97 @@ import { fetchPoints, type Point } from './api';
 import MapView from './Map';
 
 const DEVICE_ID_STORAGE_KEY = 'device_id';
+const THEME_STORAGE_KEY = 'theme';
+
+type Theme = 'light' | 'dark' | 'system';
+
+function readStoredTheme(): Theme {
+  try {
+    const v = localStorage.getItem(THEME_STORAGE_KEY);
+    if (v === 'dark' || v === 'light' || v === 'system') return v;
+  } catch {
+    /* storage disabled */
+  }
+  return 'system';
+}
+
+function resolveIsDark(theme: Theme): boolean {
+  if (theme === 'dark') return true;
+  if (theme === 'light') return false;
+  return matchMedia('(prefers-color-scheme: dark)').matches;
+}
+
+function useTheme(): [Theme, (t: Theme) => void, boolean] {
+  const [theme, setThemeState] = useState<Theme>(() => readStoredTheme());
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const apply = () => root.classList.toggle('dark', resolveIsDark(theme));
+    apply();
+    const mq = matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => { if (theme === 'system') apply(); };
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, [theme]);
+
+  const setTheme = useCallback((t: Theme) => {
+    try { localStorage.setItem(THEME_STORAGE_KEY, t); } catch { /* ignore */ }
+    setThemeState(t);
+  }, []);
+
+  const isDark = resolveIsDark(theme);
+  return [theme, setTheme, isDark];
+}
+
+function ThemeToggle({
+  theme,
+  setTheme,
+}: {
+  theme: Theme;
+  setTheme: (t: Theme) => void;
+}) {
+  return (
+    <div className="panel__theme-toggle" role="radiogroup" aria-label="Color theme">
+      <button
+        className={`panel__theme-btn${theme === 'light' ? ' panel__theme-btn--active' : ''}`}
+        onClick={() => setTheme('light')}
+        aria-label="Light theme"
+        role="radio"
+        aria-checked={theme === 'light'}
+      >
+        <svg viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="3.5" stroke="currentColor" strokeWidth="1.5" />
+          <path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.05 3.05l1.06 1.06M11.89 11.89l1.06 1.06M3.05 12.95l1.06-1.06M11.89 4.11l1.06-1.06" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        </svg>
+      </button>
+      <button
+        className={`panel__theme-btn${theme === 'dark' ? ' panel__theme-btn--active' : ''}`}
+        onClick={() => setTheme('dark')}
+        aria-label="Dark theme"
+        role="radio"
+        aria-checked={theme === 'dark'}
+      >
+        <svg viewBox="0 0 16 16" fill="none">
+          <path d="M13.5 9.5a6 6 0 0 1-7-7A6 6 0 1 0 13.5 9.5z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+        </svg>
+      </button>
+      <button
+        className={`panel__theme-btn${theme === 'system' ? ' panel__theme-btn--active' : ''}`}
+        onClick={() => setTheme('system')}
+        aria-label="System theme"
+        role="radio"
+        aria-checked={theme === 'system'}
+      >
+        <svg viewBox="0 0 16 16" fill="none">
+          <rect x="1" y="2" width="14" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.3" />
+          <path d="M5 14h6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+          <path d="M8 12v2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+          <circle cx="8" cy="7" r="1.5" stroke="currentColor" strokeWidth="1.2" />
+        </svg>
+      </button>
+    </div>
+  );
+}
 
 function toLocalInputValue(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -41,6 +132,7 @@ function readUrlDate(key: string): Date | undefined {
 }
 
 export default function App() {
+  const [theme, setTheme, isDark] = useTheme();
   // Defaults fall back to "today since local midnight". URL params
   // (if valid) override on first render so reloads / shared links
   // hydrate the same range the previous session was looking at.
@@ -225,8 +317,9 @@ export default function App() {
           </button>
         )}
         <span className={`stats${error ? ' error' : ''}`}>{status}</span>
+        <ThemeToggle theme={theme} setTheme={setTheme} />
       </div>
-      <MapView points={points} />
+      <MapView points={points} isDark={isDark} />
     </div>
   );
 }
