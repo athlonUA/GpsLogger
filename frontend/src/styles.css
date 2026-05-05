@@ -44,8 +44,8 @@ html.dark {
   --border-strong: #475569;
   --text: #e2e8f0;
   --text-muted: #94a3b8;
-  --accent: #2563eb;
-  --accent-hover: #3b82f6;
+  --accent: #3b82f6;
+  --accent-hover: #60a5fa;
   --accent-disabled: #334155;
   --error: #f87171;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
@@ -53,7 +53,7 @@ html.dark {
   --input-bg: #1e293b;
   --input-bg-hover: #334155;
   --input-bg-focus: #0f172a;
-  --focus-ring: rgba(37, 99, 235, 0.3);
+  --focus-ring: rgba(59, 130, 246, 0.3);
   --btn-text: #ffffff;
   --arrow-fill: #e2e8f0;
   --arrow-stroke: #1e293b;
@@ -71,7 +71,7 @@ html.dark {
   --copy-border-disabled: #065f46;
   --copy-text-disabled: #6ee7b7;
   --minimap-matte: rgba(148, 163, 184, 0.2);
-  --minimap-handle-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(37, 99, 235, 0.3);
+  --minimap-handle-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(59, 130, 246, 0.3);
   --pin-shadow: 0 2px 6px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.3);
   color-scheme: dark;
 }
@@ -154,7 +154,11 @@ html {
 }
 
 .panel input[type="datetime-local"]::-webkit-calendar-picker-indicator {
-  filter: invert(1) sepia(1) saturate(5000%) hue-rotate(200deg);
+  cursor: pointer;
+}
+
+html.dark .panel input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
 }
 
 .panel input[type="datetime-local"]:hover,
