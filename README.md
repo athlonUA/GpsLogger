@@ -19,7 +19,7 @@ Minimal end-to-end GPS tracking system.
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis; opt-in Auto Wake via SLC (1.2.12) with a unified home-zone anchor (1.2.13) and a gap clause on the persist gate (1.2.14) so the anchor silences overnight wake-up phantoms and indoor-jitter writes without downsampling continuous walks |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance and elapsed time from start (1.4.1); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance and elapsed time from start (1.4.1); dark/light/system theme support with FOUC prevention (1.6.0); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
 | **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
 
 ## Data contract
@@ -982,7 +982,7 @@ flowchart LR
   isolated fix in a sparse tracking window doesn't silently disappear
   between the status-bar count and the map.
 - **Single uniform route color** (1.4.1). The route is drawn in
-  `ROUTE_COLOR` (`hsl(260, 78%, 58%)` indigo-violet) — no time gradient,
+  `ROUTE_COLOR` (`hsl(215, 80%, 55%)` blue) — no time gradient,
   no speed-based classification, no mode overlay. A short-lived 1.4.x
   experiment inferred walking / cycling / vehicle from GPS-derived speed
   and painted the polyline accordingly; it was reverted because
@@ -1002,6 +1002,17 @@ flowchart LR
   elapsed time from the first point, formatted as `"3 h 42 min"`, `"15 min
   30 s"`, or `"45 s"` depending on magnitude. Includes time-gap durations
   so the value reflects total trip duration, not just active movement.
+- **Dark / light / system theme** (1.6.0). Three-state theme toggle in
+  the top bar (sun / moon / system icons). Persists choice to
+  `localStorage.theme`. System mode follows `prefers-color-scheme` and
+  reacts to OS changes live. FOUC prevention via inline `<script>` in
+  `index.html` with CSP sha256 hash. All 23 CSS custom properties swap
+  between `:root` and `html.dark`; ~40 hardcoded colors were tokenized.
+  Map tiles use CSS `invert(1) hue-rotate(180deg)` filter on the free
+  `light_all` CartoDB variant (the `dark_all` variant is not available
+  on the free tier). Native form controls follow `color-scheme` for
+  proper OS-level dark rendering (date pickers use the system accent
+  color, which cannot be overridden via CSS).
 - **Direction-of-travel arrows** (1.3.1): a small semi-transparent
   chevron every ~150 m along each polyline group, oriented to the
   segment's bearing, so direction reads instantly at any zoom.

@@ -564,7 +564,7 @@ All scenarios assume:
 - Visualize the range.
 - Expected: the polyline renders smoothly in <1 s. The status bar shows the
   full count ("10,247 points"). Internally, the map only renders ≤ 4000
-  points after downsampling. The line is a single uniform indigo-violet
+  points after downsampling. The line is a single uniform blue
   (1.4.1) — one polyline per time-gap group.
 
 ### 9. Time-gap polyline split
@@ -1200,8 +1200,8 @@ distance in the detail card.
 
 - Visualize a day with a continuous multi-kilometer trace (walk, bike
   ride, commute — anything with ≥ 2 km covered).
-- **Uniform color.** The whole polyline is a single indigo-violet
-  (`hsl(260, 78%, 58%)`). No blue→red gradient, no green/red segment
+- **Uniform color.** The whole polyline is a single blue
+  (`hsl(215, 80%, 55%)`). No blue→red gradient, no green/red segment
   variants, no mode legend overlay. Start pin is green "S", End pin
   is red "E" — unchanged from 1.3.1.
 - **Distance row.** Click a point near the Start marker. The detail
@@ -1234,6 +1234,36 @@ distance in the detail card.
   few percent of the true total — downsampling computes distances on
   the *raw* points before sampling, so chord-shortening on winding
   segments doesn't undercount.
+
+## 35. Dark / light / system theme (1.6.0)
+
+Verifies the three-state theme toggle and dark-mode rendering.
+
+- **Toggle visibility.** The top bar shows a segmented control with
+  sun / moon / system icons at the right end. The active button has
+  `background: var(--accent)` (blue `#3b82f6` in dark, `#2563eb` in
+  light).
+- **Light mode.** Click the sun icon. Expected: light backgrounds
+  (`#fafafa`), dark text, light CartoDB `light_all` tiles, no CSS
+  filter on map tiles.
+- **Dark mode.** Click the moon icon. Expected: dark backgrounds
+  (`#0f172a`), light text, light_all tiles with `invert(1)
+  hue-rotate(180deg) brightness(1.05) contrast(0.85)` CSS filter,
+  native form controls render via `color-scheme: dark`.
+- **System mode.** Click the system icon. Expected: follows
+  `prefers-color-scheme` media query. Change the OS appearance
+  setting — the page should switch within seconds.
+- **Persistence.** Toggle to dark, reload the page. Expected: dark
+  theme applies before React hydrates (FOUC prevention). Check
+  `localStorage.getItem('theme')` returns `"dark"`.
+- **Accent colors.** Both themes use the same blue family:
+  route `hsl(215, 80%, 55%)`, accent `#2563eb` (light) /
+  `#3b82f6` (dark). The Visualize button, theme toggle active state,
+  zoom slider handle, and focus rings all share the blue accent.
+- **Calendar picker.** The native date picker uses the OS accent
+  color for selected dates — this cannot be overridden via CSS
+  (`accent-color` does not apply to `datetime-local` popups). The
+  calendar icon adapts to `color-scheme`.
 
 ## Inspecting fix_diagnostics after an anomaly
 
