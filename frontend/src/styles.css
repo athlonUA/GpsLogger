@@ -145,11 +145,16 @@ html {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   outline: none;
+  accent-color: var(--accent);
   transition:
     border-color 0.15s ease,
     background 0.15s ease,
     box-shadow 0.15s ease;
   min-width: 180px;
+}
+
+.panel input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  filter: invert(1) sepia(1) saturate(5000%) hue-rotate(200deg);
 }
 
 .panel input[type="datetime-local"]:hover,
