@@ -24,12 +24,12 @@ export const GAP_MS = 5 * 60 * 1000;
 /// Spacing between direction arrows along a rendered polyline, in meters.
 export const ARROW_INTERVAL_METERS = 150;
 
-/// Single uniform color for the whole route — indigo-violet between
-/// pure blue (240°) and pure purple (285°). The map deliberately does
-/// not vary color by time, speed, or inferred movement mode; a uniform
-/// line reads cleanly at all zoom levels and avoids misleading the
-/// reader with classifier output that cannot be fully trusted.
-export const ROUTE_COLOR = 'hsl(260, 78%, 58%)';
+/// Single uniform color for the whole route — blue (215° hue). The map
+/// deliberately does not vary color by time, speed, or inferred movement
+/// mode; a uniform line reads cleanly at all zoom levels and avoids
+/// misleading the reader with classifier output that cannot be fully
+/// trusted.
+export const ROUTE_COLOR = 'hsl(215, 80%, 55%)';
 
 // --------------------------------------------------------------------------
 // Types
