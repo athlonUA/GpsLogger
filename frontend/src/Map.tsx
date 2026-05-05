@@ -214,11 +214,9 @@ type Rect = { left: number; top: number; width: number; height: number };
 function RouteMinimap({
   points,
   mainMap,
-  isDark,
 }: {
   points: Point[];
   mainMap: L.Map | null;
-  isDark: boolean;
 }) {
   const [mini, setMini] = useState<L.Map | null>(null);
   const [miniReady, setMiniReady] = useState(false);
@@ -440,7 +438,7 @@ function RouteMinimap({
           touchZoom={false}
         >
           <TileLayer
-            url={`https://{s}.basemaps.cartocdn.com/${isDark ? 'dark_all' : 'light_all'}/{z}/{x}/{y}{r}.png`}
+            url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
             subdomains="abcd"
             maxZoom={MINIMAP_MAX_ZOOM}
           />
@@ -730,7 +728,7 @@ function DetailCard({
 // Map
 // --------------------------------------------------------------------------
 
-export default function MapView({ points, isDark }: { points: Point[]; isDark: boolean }) {
+export default function MapView({ points }: { points: Point[] }) {
   const render = useMemo(() => buildRenderData(points), [points]);
   const { groups, sampled, distancesMeters, timesFromStartSeconds, segments, singletons } = render;
 
@@ -922,7 +920,7 @@ export default function MapView({ points, isDark }: { points: Point[]; isDark: b
       >
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
-          url={`https://{s}.basemaps.cartocdn.com/${isDark ? 'dark_all' : 'light_all'}/{z}/{x}/{y}{r}.png`}
+          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
           subdomains="abcd"
           maxZoom={MAX_ZOOM}
           noWrap
@@ -1050,7 +1048,7 @@ export default function MapView({ points, isDark }: { points: Point[]; isDark: b
         <MapRefCapture mapRef={mapRef} onReady={setMainMap} />
       </MapContainer>
 
-      <RouteMinimap points={sampled} mainMap={mainMap} isDark={isDark} />
+      <RouteMinimap points={sampled} mainMap={mainMap} />
 
       {selected && (
         <DetailCard

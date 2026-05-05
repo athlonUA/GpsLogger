@@ -228,13 +228,19 @@ body,
   height: 34px;
 }
 
-.panel__theme-btn {
+.panel .panel__theme-btn {
+  appearance: none;
+  -webkit-appearance: none;
   width: 34px;
   height: 34px;
+  min-height: unset;
   padding: 0;
   border: none;
+  border-radius: 0;
   background: transparent;
   color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -242,28 +248,29 @@ body,
   transition: background 0.15s ease, color 0.15s ease;
 }
 
-.panel__theme-btn:not(:last-child) {
+.panel .panel__theme-btn:not(:last-child) {
   border-right: 1px solid var(--border);
 }
 
-.panel__theme-btn:hover {
+.panel .panel__theme-btn:hover:not(.panel__theme-btn--active) {
   background: var(--input-bg-hover);
   color: var(--text);
 }
 
-.panel__theme-btn--active {
+.panel .panel__theme-btn--active {
   background: var(--accent);
   color: var(--btn-text);
 }
 
-.panel__theme-btn--active:hover {
+.panel .panel__theme-btn--active:hover {
   background: var(--accent-hover);
   color: var(--btn-text);
 }
 
-.panel__theme-btn svg {
+.panel .panel__theme-btn svg {
   width: 16px;
   height: 16px;
+  flex-shrink: 0;
   display: block;
 }
 
@@ -361,6 +368,14 @@ body,
   background: var(--bg);
   font-family: inherit;
   outline: none;
+}
+
+/* Dark-mode tile filter — inverts CARTO light_all tiles so they read
+   as dark without depending on the dark_all variant (not available on
+   the free tier). hue-rotate(180deg) preserves original hues after
+   inversion. */
+html.dark .leaflet-tile {
+  filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9);
 }
 
 /* Zoom control: clean, shadowed, consistent with panel button radius */

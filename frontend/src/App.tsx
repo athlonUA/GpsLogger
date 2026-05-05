@@ -23,7 +23,7 @@ function resolveIsDark(theme: Theme): boolean {
   return matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
-function useTheme(): [Theme, (t: Theme) => void, boolean] {
+function useTheme(): [Theme, (t: Theme) => void] {
   const [theme, setThemeState] = useState<Theme>(() => readStoredTheme());
 
   useEffect(() => {
@@ -41,8 +41,7 @@ function useTheme(): [Theme, (t: Theme) => void, boolean] {
     setThemeState(t);
   }, []);
 
-  const isDark = resolveIsDark(theme);
-  return [theme, setTheme, isDark];
+  return [theme, setTheme];
 }
 
 function ThemeToggle({
@@ -61,7 +60,7 @@ function ThemeToggle({
         role="radio"
         aria-checked={theme === 'light'}
       >
-        <svg viewBox="0 0 16 16" fill="none">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <circle cx="8" cy="8" r="3.5" stroke="currentColor" strokeWidth="1.5" />
           <path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.05 3.05l1.06 1.06M11.89 11.89l1.06 1.06M3.05 12.95l1.06-1.06M11.89 4.11l1.06-1.06" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
         </svg>
@@ -73,7 +72,7 @@ function ThemeToggle({
         role="radio"
         aria-checked={theme === 'dark'}
       >
-        <svg viewBox="0 0 16 16" fill="none">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <path d="M13.5 9.5a6 6 0 0 1-7-7A6 6 0 1 0 13.5 9.5z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
         </svg>
       </button>
@@ -84,7 +83,7 @@ function ThemeToggle({
         role="radio"
         aria-checked={theme === 'system'}
       >
-        <svg viewBox="0 0 16 16" fill="none">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <rect x="1" y="2" width="14" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.3" />
           <path d="M5 14h6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
           <path d="M8 12v2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
@@ -132,7 +131,7 @@ function readUrlDate(key: string): Date | undefined {
 }
 
 export default function App() {
-  const [theme, setTheme, isDark] = useTheme();
+  const [theme, setTheme] = useTheme();
   // Defaults fall back to "today since local midnight". URL params
   // (if valid) override on first render so reloads / shared links
   // hydrate the same range the previous session was looking at.
@@ -319,7 +318,7 @@ export default function App() {
         <span className={`stats${error ? ' error' : ''}`}>{status}</span>
         <ThemeToggle theme={theme} setTheme={setTheme} />
       </div>
-      <MapView points={points} isDark={isDark} />
+      <MapView points={points} />
     </div>
   );
 }
