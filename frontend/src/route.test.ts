@@ -2,15 +2,21 @@ import { describe, expect, it } from 'vitest';
 import type { Point } from './api';
 import {
   ARROW_INTERVAL_METERS,
+  ARROW_MIN_METERS,
+  ARROW_TARGET_PIXELS,
+  arrowIntervalForZoom,
   arrowsAlong,
   buildRenderData,
   cumulativeDistances,
   cumulativeTimesSeconds,
   downsampleGroups,
   downsampleIndices,
+  EARTH_CIRCUMFERENCE_M,
   GAP_MS,
   haversineMeters,
+  MAX_ARROWS_PER_GROUP,
   MAX_POINTS,
+  metersPerPixel,
   segmentLengths,
   splitByTimeGaps,
 } from './route';
@@ -422,10 +428,116 @@ describe('arrowsAlong', () => {
     }
   });
 
-  it('honors the ARROW_INTERVAL_METERS default', () => {
+  it('caps arrow count for long routes via maxArrows', () => {
     const arrows = arrowsAlong([step(0, 0), step(0, 10_000)]);
+    expect(arrows.length).toBeGreaterThan(0);
+    expect(arrows.length).toBeLessThanOrEqual(MAX_ARROWS_PER_GROUP);
+    // Effective interval is raised above the default because the route is long.
     const spacing = 10_000 / arrows.length;
-    expect(spacing).toBeGreaterThan(ARROW_INTERVAL_METERS - 30);
-    expect(spacing).toBeLessThan(ARROW_INTERVAL_METERS + 30);
+    expect(spacing).toBeGreaterThan(ARROW_INTERVAL_METERS + 30);
+  });
+
+  it('uses default interval for short routes where maxArrows does not cap', () => {
+    const arrows = arrowsAlong([step(0, 0), step(0, 1_000)]);
+    expect(arrows.length).toBeGreaterThanOrEqual(5);
+    expect(arrows.length).toBeLessThanOrEqual(7);
+  });
+});
+
+describe('metersPerPixel', () => {
+  it('at zoom 0 equator returns the full world width per 256 px tile', () => {
+    // 1 px at zoom 0 ≈ EARTH_CIRCUMFERENCE / 256 ≈ 156_543 m.
+    const mpp = metersPerPixel(0, 0);
+    expect(mpp).toBeCloseTo(EARTH_CIRCUMFERENCE_M / 256, 0);
+  });
+
+  it('halves with each zoom step at the same latitude', () => {
+    const a = metersPerPixel(10, 0);
+    const b = metersPerPixel(11, 0);
+    expect(b).toBeCloseTo(a / 2, 5);
+  });
+
+  it('shrinks with latitude (Mercator stretch) at fixed zoom', () => {
+    const eq = metersPerPixel(14, 0);
+    const mid = metersPerPixel(14, 39.5);
+    const high = metersPerPixel(14, 60);
+    expect(mid).toBeLessThan(eq);
+    expect(high).toBeLessThan(mid);
+    // At 60° N cos(60°) = 0.5, so mpp should be half the equator value.
+    expect(high).toBeCloseTo(eq * 0.5, 4);
+  });
+
+  it('returns NaN for non-finite inputs', () => {
+    expect(Number.isNaN(metersPerPixel(NaN, 0))).toBe(true);
+    expect(Number.isNaN(metersPerPixel(14, NaN))).toBe(true);
+    expect(Number.isNaN(metersPerPixel(14, Infinity))).toBe(true);
+  });
+});
+
+describe('arrowIntervalForZoom', () => {
+  it('interval grows as zoom decreases (wider screen-space gap covers more ground)', () => {
+    const z18 = arrowIntervalForZoom(18, 39.5);
+    const z14 = arrowIntervalForZoom(14, 39.5);
+    const z11 = arrowIntervalForZoom(11, 39.5);
+    expect(z14).toBeGreaterThan(z18);
+    expect(z11).toBeGreaterThan(z14);
+  });
+
+  it('matches the target pixel gap × meters/pixel at moderate zoom', () => {
+    const mpp = metersPerPixel(14, 39.5);
+    expect(arrowIntervalForZoom(14, 39.5)).toBeCloseTo(
+      ARROW_TARGET_PIXELS * mpp,
+      4,
+    );
+  });
+
+  it('clamps to the minimum metric floor at very high zoom', () => {
+    // Zoom 24 at any latitude resolves to sub-meter pixels; the target
+    // pixel gap × mpp is well below the floor.
+    expect(arrowIntervalForZoom(24, 39.5)).toBe(ARROW_MIN_METERS);
+  });
+
+  it('falls back to the default interval for invalid input', () => {
+    expect(arrowIntervalForZoom(NaN, 39.5)).toBe(ARROW_INTERVAL_METERS);
+    expect(arrowIntervalForZoom(14, NaN)).toBe(ARROW_INTERVAL_METERS);
+  });
+
+  it('respects custom target pixels and floor', () => {
+    // Doubling the target pixel gap doubles the metric interval (until
+    // the floor kicks in).
+    const a = arrowIntervalForZoom(14, 39.5, 100);
+    const b = arrowIntervalForZoom(14, 39.5, 200);
+    expect(b).toBeCloseTo(a * 2, 4);
+    // High floor wins when target * mpp would fall below it.
+    expect(arrowIntervalForZoom(20, 39.5, 1, 500)).toBe(500);
+  });
+});
+
+describe('arrowsAlong + arrowIntervalForZoom integration', () => {
+  // Reuses the `step` helper from the suite above by re-declaring it
+  // locally (separate describe block scope).
+  const step = (fromLat: number, metersNorth: number) => ({
+    latitude: fromLat + metersNorth / METERS_PER_DEG,
+    longitude: 0,
+  });
+
+  it('produces sparse arrows when zoomed out', () => {
+    // A ~10 km north-south trace viewed at z=11 should yield only a
+    // handful of arrows (interval ≈ km).
+    const interval = arrowIntervalForZoom(11, 39.5);
+    const arrows = arrowsAlong([step(0, 0), step(0, 10_000)], interval);
+    expect(arrows.length).toBeLessThanOrEqual(5);
+  });
+
+  it('produces denser arrows when zoomed in', () => {
+    // The same trace at z=15 should have noticeably more arrows.
+    const intervalZoomedOut = arrowIntervalForZoom(11, 39.5);
+    const intervalZoomedIn = arrowIntervalForZoom(15, 39.5);
+    const sparse = arrowsAlong([step(0, 0), step(0, 10_000)], intervalZoomedOut);
+    const dense = arrowsAlong([step(0, 0), step(0, 10_000)], intervalZoomedIn);
+    expect(dense.length).toBeGreaterThan(sparse.length);
+    // Per-group cap still binds when the screen-space target would
+    // otherwise emit more than MAX_ARROWS_PER_GROUP markers.
+    expect(dense.length).toBeLessThanOrEqual(MAX_ARROWS_PER_GROUP);
   });
 });

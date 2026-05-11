@@ -19,7 +19,7 @@ Minimal end-to-end GPS tracking system.
 | **iOS app** (`ios/`) | SwiftUI + CoreLocation + CoreMotion + raw sqlite3 | record GPS points for walking, cycling, or motorized transport (activityType hint swapped at runtime via `CMMotionActivityManager`), store locally, sync in **Wi-Fi-only** batches; optional second channel (`fix_diagnostics`, off by default since 1.2.10) uploads raw CLLocation diagnostics for post-hoc anomaly analysis; opt-in Auto Wake via SLC (1.2.12) with a unified home-zone anchor (1.2.13) and a gap clause on the persist gate (1.2.14) so the anchor silences overnight wake-up phantoms and indoor-jitter writes without downsampling continuous walks |
 | **Backend** (`backend/`) | Node.js 20 + Express 4 + pg | accept point batches and diagnostic batches, query points by time range |
 | **DB** | PostgreSQL 16 | two tables: `points` (the visible trace) and `fix_diagnostics` (raw CLLocation fields + filter decision, opt-in since 1.2.10 — iOS only writes + uploads when `syncDiagnosticsEnabled` is flipped on) |
-| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance and elapsed time from start (1.4.1); dark/light/system theme support with FOUC prevention (1.6.0); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0) |
+| **Frontend** (`frontend/`) | Vite + React 18 + TypeScript + react-leaflet | visualize a route as a uniform-color polyline with per-point address + cumulative distance and elapsed time from start (1.4.1); dark/light/system theme support with FOUC prevention (1.6.0); 0.25-step fractional zoom + default `from` = today 00:00 local (1.4.2); auto-visualize on reload when a device_id is already stored (1.4.3); Google-Photos-style minimap with draggable viewport + zoom slider, snappy trackpad zoom, poles-fit min-zoom floor (1.5.0); zoom-aware direction arrows that hold constant on-screen spacing across zoom levels, paired with server-side sampling so long time ranges render the full trace without the 10 k truncation cap (1.7.0) |
 | **Docker** (`docker-compose.yml`) | docker-compose | one-command backend + DB bring-up |
 
 ## Data contract
@@ -132,14 +132,26 @@ silently skipped). No GET — reads go straight to Postgres.
 
 `device_id` is **required** — the endpoint is always scoped to one device so an
 unauthenticated caller cannot enumerate the full dataset. `from` and `to` are
-optional. Returns an array **sorted ASC by `created_at`**:
+optional. Returns an envelope with the matching fixes **sorted ASC by
+`created_at`**:
 
 ```json
-[
-  { "id": 1, "latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00.000Z" },
-  ...
-]
+{
+  "data": [
+    { "id": 1, "latitude": 37.7749, "longitude": -122.4194, "created_at": "2024-01-01T12:00:00.000Z" },
+    ...
+  ],
+  "sampled": false,
+  "total": 1234
+}
 ```
+
+`total` is the full count of matching fixes in the DB. When `total` exceeds
+the server-side sample target (50 000), the endpoint returns an
+evenly-spaced stride of the trace instead of every fix (`sampled: true`).
+The first and last fixes are always preserved so the Start/End markers
+land on the real endpoints; the route shape is intact at lower fidelity.
+Narrow the time range to recover full detail.
 
 ### Schema
 
@@ -898,10 +910,15 @@ flowchart LR
   both write endpoints. `ON CONFLICT DO NOTHING` on the natural
   idempotency keys turns retried-after-lost-response batches into
   no-ops (see migration `004_idempotency.sql`).
-- Range query is a single `SELECT … WHERE device_id = ? AND created_at
-  BETWEEN` against the composite `(device_id, created_at)` index.
-  Results are capped at 10 001 rows and the response includes a
-  `truncated` flag so the client can narrow the range.
+- Range query is a `COUNT(*)` against the composite `(device_id,
+  created_at)` index followed by a strided `SELECT` (window function
+  `ROW_NUMBER()` filtered modulo `ceil(total / target)`). When the
+  matching count is at or under the target (50 000) the SELECT is a
+  plain `WHERE … ORDER BY` and every fix is returned; above the target,
+  an evenly-spaced sample is returned with the first and last fixes
+  always preserved. The response envelope (`data`, `sampled`, `total`)
+  tells the client whether downsampling was applied so the UI can hint
+  at narrowing the range for full detail.
 - Structured logging via `pino` with per-request correlation IDs:
   inbound `X-Request-ID` is honored if present, else a UUID v4 is
   minted and echoed back on the response. Every downstream log line
@@ -912,9 +929,10 @@ flowchart LR
 - No `GET /diagnostics` — diagnostics are read via psql / a DB browser
   against Postgres directly, not through the API, because they're a
   debug/observability channel and the frontend never displays them.
-- Pure-function input validators with a dedicated unit-test suite
-  (35 tests covering `validateBatch`, `validateDiagnosticsBatch`, and
-  `validateRange`).
+- Pure-function input validators and a pure-function `computeStride`
+  helper with a dedicated unit-test suite (40 tests covering
+  `validateBatch`, `validateDiagnosticsBatch`, `validateRange`, and the
+  downsampling stride math).
 
 ### Frontend — visualization
 
@@ -976,7 +994,9 @@ flowchart LR
   are more than **5 minutes** apart, so unrelated trips (or power-off
   periods) never get bridged by a straight "teleport" line.
 - Downsamples each group with a shared global budget of ≤ 4000 points
-  total, always preserving the first and last fix of each group.
+  total, always preserving the first and last fix of each group. (Server
+  may have already downsampled to ~50 000 for long ranges (1.7.0); the
+  client's stride composes on top.)
 - Groups of ≥ 2 points render as a halo + route polyline; groups of a
   single point render as standalone `CircleMarker`s (1.2.4) so an
   isolated fix in a sparse tracking window doesn't silently disappear
@@ -1013,13 +1033,20 @@ flowchart LR
   on the free tier). Native form controls follow `color-scheme` for
   proper OS-level dark rendering (date pickers use the system accent
   color, which cannot be overridden via CSS).
-- **Direction-of-travel arrows** (1.3.1): a small semi-transparent
-  chevron every ~150 m along each polyline group, oriented to the
+- **Direction-of-travel arrows** (1.3.1, zoom-aware in 1.7.0): a small
+  semi-transparent chevron along each polyline group, oriented to the
   segment's bearing, so direction reads instantly at any zoom.
-  Computed in meters along the geodesic (`route.arrowsAlong`) so
-  spacing is zoom-invariant; the first and last arrows keep a
-  half-interval clear of the endpoints so they don't collide with the
-  Start / End markers. Rendered via `L.divIcon` SVG with
+  Initially placed every ~150 m unconditionally; since 1.7.0 the
+  metric interval is recomputed from the current zoom and the median
+  route latitude (`arrowIntervalForZoom` → `arrowsAlong`) so the
+  *on-screen* spacing stays roughly constant — sparse km-apart markers
+  at z=11, every few dozen meters at z=18 — which prevents the
+  "braid" pattern dense urban traces produced when fixed metric
+  spacing piled multiple arrows on top of each other at low zoom. The
+  first and last arrows keep a half-interval clear of the endpoints
+  so they don't collide with the Start / End markers; a
+  `MAX_ARROWS_PER_GROUP` cap remains as a guardrail against
+  pathological inputs. Rendered via `L.divIcon` SVG with
   `pointer-events: none` so clicks flow through to the polyline.
 - **Start / End markers** (1.3.1): green "S" and red "E" pins on
   distinct circular badges with drop-shadow, plus `Start` / `End`
@@ -1042,11 +1069,13 @@ flowchart LR
 ## Tests
 
 ```bash
-# backend unit tests (35 cases: validateBatch + validateDiagnosticsBatch + validateRange)
+# backend unit tests (40 cases: validateBatch + validateDiagnosticsBatch
+# + validateRange + computeStride downsampling math)
 cd backend && node --test test/
 
-# frontend unit tests (29 cases covering splitByTimeGaps, downsampleGroups,
-# gradientColor, buildSegments, and arrowsAlong — the pure functions
+# frontend unit tests (48 cases covering splitByTimeGaps, downsampleGroups,
+# buildRenderData, arrowsAlong, and the zoom-aware arrow spacing helpers
+# `metersPerPixel` + `arrowIntervalForZoom` — the pure functions
 # behind the route view)
 cd frontend && npm test
 

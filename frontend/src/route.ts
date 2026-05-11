@@ -21,8 +21,37 @@ export const MAX_POINTS = 4000;
 /// across unrelated locations (car trips, power-off periods, etc.).
 export const GAP_MS = 5 * 60 * 1000;
 
-/// Spacing between direction arrows along a rendered polyline, in meters.
+/// Fallback metric spacing between direction arrows. Used when zoom-aware
+/// spacing is unavailable (e.g., the initial render before the map has
+/// emitted its first `zoomend`). Live placement is computed per-zoom by
+/// `arrowIntervalForZoom` so the on-screen density of arrows stays roughly
+/// constant whatever the user's current zoom level is.
 export const ARROW_INTERVAL_METERS = 150;
+
+/// Maximum number of direction arrows per polyline group. With zoom-aware
+/// spacing the per-group budget rarely binds in practice, but it remains a
+/// hard guardrail against pathological inputs (e.g. a 10 km segment viewed
+/// at street zoom, where the screen-space target would otherwise emit
+/// hundreds of arrows over the visible portion of the line).
+export const MAX_ARROWS_PER_GROUP = 24;
+
+/// Target on-screen spacing between consecutive direction arrows, in CSS
+/// pixels. Picked empirically — at ~140 px arrows are clearly individual
+/// glyphs without crowding when the route doubles back on itself (the
+/// "braid" pattern that appears on multi-pass urban traces).
+export const ARROW_TARGET_PIXELS = 140;
+
+/// Floor on metric arrow spacing. At extremely high zoom the screen-space
+/// target maps to sub-meter intervals; clamping prevents the renderer from
+/// emitting an arrow on every polyline vertex (which `MAX_ARROWS_PER_GROUP`
+/// also catches, but the floor avoids paying for the arithmetic).
+export const ARROW_MIN_METERS = 30;
+
+/// Equatorial circumference of the WGS-84 ellipsoid (Leaflet's Web Mercator
+/// reference), in meters. `EARTH_CIRCUMFERENCE_M / (256 * 2^z)` gives the
+/// ground-distance-per-pixel at the equator for zoom `z`; multiply by
+/// `cos(lat)` for any other latitude.
+export const EARTH_CIRCUMFERENCE_M = 40_075_016.686;
 
 /// Single uniform color for the whole route — blue (215° hue). The map
 /// deliberately does not vary color by time, speed, or inferred movement
@@ -280,6 +309,31 @@ export function buildRenderData(points: Point[]): RenderData {
 // Direction arrows
 // --------------------------------------------------------------------------
 
+/// Web Mercator ground distance per CSS pixel, in meters. Equator value is
+/// scaled by `cos(latitude)` to compensate for the projection's poleward
+/// stretch — a pixel at 60° N covers roughly half the ground distance of
+/// a pixel at the equator at the same zoom.
+export function metersPerPixel(zoom: number, latitudeDeg: number): number {
+  if (!Number.isFinite(zoom) || !Number.isFinite(latitudeDeg)) return NaN;
+  const latRad = (latitudeDeg * Math.PI) / 180;
+  return (EARTH_CIRCUMFERENCE_M * Math.cos(latRad)) / (256 * Math.pow(2, zoom));
+}
+
+/// Metric spacing between direction arrows for the current zoom, anchored
+/// at `latitudeDeg`. Targets a constant on-screen pixel gap so the map
+/// reads the same at z=11 (regional) and z=18 (street). Falls back to
+/// `ARROW_INTERVAL_METERS` for non-finite inputs.
+export function arrowIntervalForZoom(
+  zoom: number,
+  latitudeDeg: number,
+  targetPixels: number = ARROW_TARGET_PIXELS,
+  minMeters: number = ARROW_MIN_METERS,
+): number {
+  const mpp = metersPerPixel(zoom, latitudeDeg);
+  if (!Number.isFinite(mpp) || mpp <= 0) return ARROW_INTERVAL_METERS;
+  return Math.max(minMeters, targetPixels * mpp);
+}
+
 /// Place direction-of-travel arrows at fixed metric intervals along a
 /// polyline. Half-interval padding at both ends keeps them clear of the
 /// Start / End markers. Returns empty for traces shorter than one
@@ -288,17 +342,20 @@ export function buildRenderData(points: Point[]): RenderData {
 export function arrowsAlong(
   positions: { latitude: number; longitude: number }[],
   intervalMeters: number = ARROW_INTERVAL_METERS,
+  maxArrows: number = MAX_ARROWS_PER_GROUP,
 ): DirectionArrow[] {
-  if (positions.length < 2 || intervalMeters <= 0) return [];
+  if (positions.length < 2 || intervalMeters <= 0 || maxArrows <= 0) return [];
 
   let total = 0;
   for (let i = 1; i < positions.length; i++) {
     total += haversineMeters(positions[i - 1], positions[i]);
   }
-  if (total < intervalMeters) return [];
+
+  const effectiveInterval = Math.max(intervalMeters, total / maxArrows);
+  if (total < effectiveInterval) return [];
 
   const arrows: DirectionArrow[] = [];
-  const halfInterval = intervalMeters / 2;
+  const halfInterval = effectiveInterval / 2;
   const lastPos = total - halfInterval;
   let covered = 0;
   let next = halfInterval;
@@ -315,7 +372,7 @@ export function arrowsAlong(
         longitude: a.longitude + (b.longitude - a.longitude) * t,
         bearing: bearingDeg(a, b),
       });
-      next += intervalMeters;
+      next += effectiveInterval;
     }
     covered += seg;
   }

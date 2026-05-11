@@ -17,7 +17,13 @@ const BASE = (import.meta.env.VITE_API_URL ?? 'http://localhost:3000').replace(/
 
 export interface FetchResult {
   data: Point[];
-  truncated: boolean;
+  /// True when the server returned an evenly-spaced sample of the full
+  /// route rather than every fix. The route shape is preserved at lower
+  /// fidelity; narrow the time range to recover full detail.
+  sampled: boolean;
+  /// Total number of fixes the server has stored for the requested range,
+  /// regardless of whether `data` was downsampled.
+  total: number;
 }
 
 export async function fetchPoints(

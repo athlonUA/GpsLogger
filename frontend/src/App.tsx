@@ -157,7 +157,8 @@ export default function App() {
   const [from, setFrom] = useState(toLocalInputValue(initialFrom));
   const [to, setTo] = useState(toLocalInputValue(initialTo));
   const [points, setPoints] = useState<Point[]>([]);
-  const [truncated, setTruncated] = useState(false);
+  const [sampled, setSampled] = useState(false);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasQueried, setHasQueried] = useState(false);
@@ -216,12 +217,14 @@ export default function App() {
       const result = await fetchPoints(deviceId, new Date(from), new Date(to), ac.signal);
       const safe = Array.isArray(result?.data) ? result.data : [];
       setPoints(safe);
-      setTruncated(result?.truncated === true);
+      setSampled(result?.sampled === true);
+      setTotal(Number.isFinite(result?.total) ? result.total : safe.length);
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
       setError(e instanceof Error ? e.message : String(e));
       setPoints([]);
-      setTruncated(false);
+      setSampled(false);
+      setTotal(0);
     } finally {
       setLoading(false);
     }
@@ -245,6 +248,8 @@ export default function App() {
     setPoints([]);
     setError(null);
     setHasQueried(false);
+    setSampled(false);
+    setTotal(0);
     setFrom(toLocalInputValue(defaultFrom));
     setTo(toLocalInputValue(defaultTo));
     // Clear query params too, so the refreshed URL reflects the logged-out
@@ -262,8 +267,8 @@ export default function App() {
     }
   }, [defaultFrom, defaultTo]);
 
-  const pointsLabel = truncated
-    ? `${points.length.toLocaleString()} points (truncated — narrow the time range)`
+  const pointsLabel = sampled
+    ? `${points.length.toLocaleString()} of ${total.toLocaleString()} points (downsampled — narrow the range for full detail)`
     : `${points.length.toLocaleString()} points`;
 
   const status = error

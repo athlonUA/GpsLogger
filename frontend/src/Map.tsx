@@ -10,7 +10,12 @@ import {
 } from 'react-leaflet';
 import L from 'leaflet';
 import type { Point } from './api';
-import { arrowsAlong, buildRenderData, ROUTE_COLOR } from './route';
+import {
+  arrowIntervalForZoom,
+  arrowsAlong,
+  buildRenderData,
+  ROUTE_COLOR,
+} from './route';
 
 const MAX_ZOOM = 20;
 
@@ -745,28 +750,6 @@ export default function MapView({ points }: { points: Point[] }) {
     [groups],
   );
 
-  // Direction-of-travel arrows along each polyline group, computed in
-  // meters along the geodesic so spacing is zoom-invariant.
-  const directionArrows = useMemo(() => {
-    const out: {
-      key: string;
-      latitude: number;
-      longitude: number;
-      bearing: number;
-    }[] = [];
-    groups.forEach((group, gi) => {
-      if (group.length < 2) return;
-      const positions = group.map((p) => ({
-        latitude: p.latitude,
-        longitude: p.longitude,
-      }));
-      arrowsAlong(positions).forEach((a, ai) => {
-        out.push({ key: `arrow-${gi}-${ai}`, ...a });
-      });
-    });
-    return out;
-  }, [groups]);
-
   // DivIcon factories. `L.divIcon` must be called after Leaflet has
   // finished loading, so they live inside `useMemo` rather than module
   // scope. The Start / End icons are static (no state).
@@ -803,6 +786,64 @@ export default function MapView({ points }: { points: Point[] }) {
   const abortRef = useRef<AbortController | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const [mainMap, setMainMap] = useState<L.Map | null>(null);
+
+  // Track the main map's zoom so direction arrows can resize their metric
+  // spacing in screen-pixel terms (see `arrowIntervalForZoom`). We only
+  // listen to `zoomend` — recomputing arrows during a zoom animation would
+  // re-render the entire arrow layer every frame for no visible benefit,
+  // since the user can't perceive the spacing change until the snap lands.
+  const [mapZoom, setMapZoom] = useState<number | null>(null);
+  useEffect(() => {
+    if (!mainMap) return;
+    setMapZoom(mainMap.getZoom());
+    const update = () => setMapZoom(mainMap.getZoom());
+    mainMap.on('zoomend', update);
+    return () => {
+      mainMap.off('zoomend', update);
+    };
+  }, [mainMap]);
+
+  // Median latitude across all sampled points. Used as the anchor for the
+  // Mercator stretch in `arrowIntervalForZoom`. Median (not mean) keeps the
+  // anchor stable when a route legitimately spans multiple latitude bands
+  // (e.g., a future cross-country trip would skew a mean toward whichever
+  // end has more fixes); for the current single-city case both are
+  // identical to the centimeter.
+  const anchorLatitude = useMemo(() => {
+    if (sampled.length === 0) return 0;
+    const lats = sampled.map((p) => p.latitude).sort((a, b) => a - b);
+    return lats[Math.floor(lats.length / 2)];
+  }, [sampled]);
+
+  // Direction-of-travel arrows along each polyline group. The metric
+  // interval is recomputed from the current zoom so the on-screen spacing
+  // stays roughly constant — at z=11 arrows are sparse km-apart markers,
+  // at z=18 they sit every few dozen meters. `mapZoom` is `null` on the
+  // very first render (before the map mounts); in that case we let
+  // `arrowsAlong` use its default interval.
+  const directionArrows = useMemo(() => {
+    const intervalMeters =
+      mapZoom == null
+        ? undefined
+        : arrowIntervalForZoom(mapZoom, anchorLatitude);
+    const out: {
+      key: string;
+      latitude: number;
+      longitude: number;
+      bearing: number;
+    }[] = [];
+    groups.forEach((group, gi) => {
+      if (group.length < 2) return;
+      const positions = group.map((p) => ({
+        latitude: p.latitude,
+        longitude: p.longitude,
+      }));
+      arrowsAlong(positions, intervalMeters).forEach((a, ai) => {
+        out.push({ key: `arrow-${gi}-${ai}`, ...a });
+      });
+    });
+    return out;
+  }, [groups, mapZoom, anchorLatitude]);
 
   // Reset selection when the underlying points change (new query).
   useEffect(() => {
