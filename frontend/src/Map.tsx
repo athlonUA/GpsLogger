@@ -988,7 +988,7 @@ export default function MapView({ points }: { points: Point[] }) {
             positions={s.positions}
             pathOptions={{
               color: ROUTE_COLOR,
-              weight: 5,
+              weight: 2.5,
               opacity: 0.95,
               lineCap: 'round',
               lineJoin: 'round',
