@@ -14,6 +14,8 @@ import {
   arrowIntervalForZoom,
   arrowsAlong,
   buildRenderData,
+  haversineMeters,
+  MAX_TOTAL_ARROWS,
   ROUTE_COLOR,
 } from './route';
 
@@ -818,14 +820,33 @@ export default function MapView({ points }: { points: Point[] }) {
   // Direction-of-travel arrows along each polyline group. The metric
   // interval is recomputed from the current zoom so the on-screen spacing
   // stays roughly constant — at z=11 arrows are sparse km-apart markers,
-  // at z=18 they sit every few dozen meters. `mapZoom` is `null` on the
-  // very first render (before the map mounts); in that case we let
-  // `arrowsAlong` use its default interval.
+  // at z=18 they sit every few dozen meters. A global density cap (see
+  // MAX_TOTAL_ARROWS) prevents many time-gap groups from each emitting
+  // their per-group budget independently — without it, 42 h tracks with
+  // dozens of stops would flood the map with hundreds of tiny glyphs.
   const directionArrows = useMemo(() => {
-    const intervalMeters =
-      mapZoom == null
-        ? undefined
-        : arrowIntervalForZoom(mapZoom, anchorLatitude);
+    // Defer arrow rendering until the zoom is known — the null-zoom fallback
+    // (150 m) produces a correct per-group count but can yield hundreds of
+    // tiny markers across many time-gap groups, which look like dense dots.
+    if (mapZoom == null) return [];
+
+    const zoomInterval = arrowIntervalForZoom(mapZoom, anchorLatitude);
+
+    // Enforce a global density cap: compute the total route length across
+    // all groups, then derive a shared minimum interval so all groups together
+    // emit at most MAX_TOTAL_ARROWS markers. Without this cap a 42-hour track
+    // with many time-gap groups (each earning up to MAX_ARROWS_PER_GROUP
+    // arrows independently) floods the map with hundreds of tiny glyphs.
+    let totalRouteLength = 0;
+    groups.forEach((group) => {
+      for (let i = 1; i < group.length; i++) {
+        totalRouteLength += haversineMeters(group[i - 1], group[i]);
+      }
+    });
+    const globalMinInterval =
+      totalRouteLength > 0 ? totalRouteLength / MAX_TOTAL_ARROWS : zoomInterval;
+    const intervalMeters = Math.max(zoomInterval, globalMinInterval);
+
     const out: {
       key: string;
       latitude: number;

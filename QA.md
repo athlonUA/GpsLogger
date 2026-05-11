@@ -383,6 +383,17 @@ placement along a polyline group:
 - the `ARROW_INTERVAL_METERS` default is honoured: arrow density on a
   10 km trace tracks the constant within a ±30 m tolerance
 
+**`MAX_TOTAL_ARROWS` global cap (2 cases)** — verifies the
+Map.tsx arrow-placement logic that prevents flooded routes when a
+trace contains many time-gap groups:
+
+- 20 short groups (1 km each) at street zoom z=14 — even though each
+  group could earn up to `MAX_ARROWS_PER_GROUP` arrows independently,
+  the shared interval derived from the total length keeps the global
+  count ≤ `MAX_TOTAL_ARROWS`
+- one 60 km group at z=12 — confirms the cap also binds for single
+  long groups whose zoom-based interval is short
+
 ### Smoke tests (after `docker-compose up`)
 
 ```bash

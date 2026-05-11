@@ -16,6 +16,7 @@ import {
   haversineMeters,
   MAX_ARROWS_PER_GROUP,
   MAX_POINTS,
+  MAX_TOTAL_ARROWS,
   metersPerPixel,
   segmentLengths,
   splitByTimeGaps,
@@ -539,5 +540,56 @@ describe('arrowsAlong + arrowIntervalForZoom integration', () => {
     // Per-group cap still binds when the screen-space target would
     // otherwise emit more than MAX_ARROWS_PER_GROUP markers.
     expect(dense.length).toBeLessThanOrEqual(MAX_ARROWS_PER_GROUP);
+  });
+});
+
+describe('MAX_TOTAL_ARROWS global cap (Map.tsx logic)', () => {
+  // Simulate the Map.tsx arrow-placement logic: compute a shared minimum
+  // interval from the total route length, then call arrowsAlong per group.
+  // This is a white-box test of the invariant, not of Map.tsx itself (which
+  // touches React/Leaflet and cannot run in the Node test env).
+  const step = (fromLat: number, metersNorth: number) => ({
+    latitude: fromLat + metersNorth / METERS_PER_DEG,
+    longitude: 0,
+  });
+
+  function simulateArrows(
+    groups: { latitude: number; longitude: number }[][],
+    zoom: number,
+    lat: number,
+  ) {
+    const zoomInterval = arrowIntervalForZoom(zoom, lat);
+    let totalLength = 0;
+    groups.forEach((g) => {
+      for (let i = 1; i < g.length; i++) {
+        totalLength += haversineMeters(g[i - 1], g[i]);
+      }
+    });
+    const globalMinInterval =
+      totalLength > 0 ? totalLength / MAX_TOTAL_ARROWS : zoomInterval;
+    const intervalMeters = Math.max(zoomInterval, globalMinInterval);
+
+    let count = 0;
+    groups.forEach((g) => {
+      count += arrowsAlong(g, intervalMeters).length;
+    });
+    return count;
+  }
+
+  it('never exceeds MAX_TOTAL_ARROWS across many short groups', () => {
+    // 20 groups of 1 km each (total 20 km), zoomed in to z=14 where the
+    // per-group zoom interval would otherwise allow many arrows per group.
+    const groups = Array.from({ length: 20 }, (_, gi) => [
+      step(gi * 0.01, 0),
+      step(gi * 0.01, 1_000),
+    ]);
+    const count = simulateArrows(groups, 14, 39.5);
+    expect(count).toBeLessThanOrEqual(MAX_TOTAL_ARROWS);
+  });
+
+  it('never exceeds MAX_TOTAL_ARROWS for a single long group', () => {
+    const group = [step(0, 0), step(0, 60_000)];
+    const count = simulateArrows([group], 12, 39.5);
+    expect(count).toBeLessThanOrEqual(MAX_TOTAL_ARROWS);
   });
 });

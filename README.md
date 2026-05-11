@@ -1044,10 +1044,13 @@ flowchart LR
   "braid" pattern dense urban traces produced when fixed metric
   spacing piled multiple arrows on top of each other at low zoom. The
   first and last arrows keep a half-interval clear of the endpoints
-  so they don't collide with the Start / End markers; a
-  `MAX_ARROWS_PER_GROUP` cap remains as a guardrail against
-  pathological inputs. Rendered via `L.divIcon` SVG with
-  `pointer-events: none` so clicks flow through to the polyline.
+  so they don't collide with the Start / End markers. A
+  `MAX_TOTAL_ARROWS` global cap derives a shared minimum interval
+  from the total route length, so long traces with many time-gap
+  groups don't multiply per-group budgets into hundreds of tiny
+  glyphs that read as dots at low zoom; `MAX_ARROWS_PER_GROUP`
+  remains as a per-group guardrail. Rendered via `L.divIcon` SVG
+  with `pointer-events: none` so clicks flow through to the polyline.
 - **Start / End markers** (1.3.1): green "S" and red "E" pins on
   distinct circular badges with drop-shadow, plus `Start` / `End`
   tooltips, replacing the earlier same-shape white-filled circles.

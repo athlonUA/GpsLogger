@@ -35,6 +35,14 @@ export const ARROW_INTERVAL_METERS = 150;
 /// hundreds of arrows over the visible portion of the line).
 export const MAX_ARROWS_PER_GROUP = 24;
 
+/// Global cap on the total number of direction arrows across all polyline
+/// groups. Routes with many time-gap groups (e.g. 42 h of tracking with
+/// numerous stops) would otherwise emit up to MAX_ARROWS_PER_GROUP arrows
+/// per group — hundreds of tiny glyphs that look like dots at low zoom.
+/// The cap is enforced by computing a shared metric interval from the total
+/// route length so that all groups together produce at most this many arrows.
+export const MAX_TOTAL_ARROWS = 12;
+
 /// Target on-screen spacing between consecutive direction arrows, in CSS
 /// pixels. Picked empirically — at ~140 px arrows are clearly individual
 /// glyphs without crowding when the route doubles back on itself (the
