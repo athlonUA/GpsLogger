@@ -2,6 +2,7 @@
   "name": "gpslogger-backend",
   "version": "1.7.0",
   "description": "Minimal GPS points ingestion + query API",
+  "license": "MIT",
   "type": "module",
   "main": "src/index.js",
   "engines": {

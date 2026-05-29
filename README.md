@@ -1157,3 +1157,8 @@ GpsLogger/
         ├── AutoWakeSettingsTests.swift      8 cases for the 1.2.12 Auto Wake kill switch (default-off, persistence, @Published mirror, data-safety)
         └── HomeZoneTests.swift             24 cases for the 1.2.13 unified home-zone anchor + 1.2.14 gap clause (round-trip + freshness + decision matrix + wake-fix evaluation + persist gate with gap discriminator + continuous-walk regression + flag-clear contract + WhenInUse invariants)
 ```
+
+## License
+
+This project is licensed under the MIT License.  
+You are free to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the software, including for commercial purposes. See the [LICENSE](./LICENSE) file for details.
